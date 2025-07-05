@@ -22,9 +22,60 @@ As long as you have a PC running Windows 7 or higher, an internet connection and
 
 In order to use Thrive Messenger, you will need a Thrive Messenger account created by a server admin. All you need for an account is a username, which will be used to add you as a contact, and a strong password that nobody can guess.
 
-### Launch and login
+### Running from source
 
-To launch Thrive Messenger, simply run the file named tmsg.exe, or just tmsg if you have file extensions hidden. From there, logging into your Thrive Messenger account is as simple as logging into your computer's user account.
+Note: these instructions are for running Thrive Messenger on Windows.
+
+1. Make sure you have [Git for Windows](https://gitforwindows.org) and [Python](https://www.python.org/downloads/windows/) installed.
+2. Press Windows + R, type cmd, and press Enter.
+3. Clone the GitHub repository.
+```
+git clone https://github.com/G4p-Studios/ThriveMessenger.git
+```
+4. navigate to the ThriveMessenger directory.
+```
+cd ThriveMessenger
+```
+5. Create a Python virtual environment. This gives you an isolated workspace for installing the libraries Thrive Messenger needs without affecting your main Python install.
+```
+python -m venv venv
+```
+6. activate the virtual environment.
+```
+venv\scripts\activate
+```
+7. To avoid errors when installing libraries, update pip, setuptools and wheel.
+```
+python -m pip install --upgrade pip setuptools wheel
+```
+8. Install the required libraries.
+```
+pip install -r requirements.txt
+```
+9. Finally, run the tmsg.py file. If all is well, you should see the Thrive Messenger login screen.
+`
+python tmsg.py
+```
+
+### Compiling
+
+If you wish to compile a binary, with your virtual environment activated, run the compile script.
+```
+compile.cmd
+```
+
+### Running compiled
+
+If you don't feel like fighting with Git and Python, a pre-compiled release is provided.
+
+1. [Download the latest Thrive Messenger release](https://github.com/G4p-Studios/ThriveMessenger/releases/latest/download/thrive_messenger.zip)
+2. Extract the zip file to a location of your choice.
+3. Navigate to where you extracted the zip file and run tmsg.exe. If your system isn't set up to show file extensions, the filename will just show as tmsg.
+
+
+### Login
+
+Logging into your Thrive Messenger account is as simple as logging into your computer's user account.
 
 1.  Enter your username at the Thrive Messenger login screen.
 2.  Tab to the password field and enter your Thrive Messenger password.
