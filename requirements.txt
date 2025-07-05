@@ -1,0 +1,3 @@
+wxpython
+pyinstaller
+pyinstaller_versionfile
