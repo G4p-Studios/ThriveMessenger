@@ -10,12 +10,6 @@ Thrive Messenger is open source, meaning anyone is free to download, view and mo
 
 * * *
 
-## System Requirements
-
-As long as you have a PC running Windows 7 or higher, an internet connection and a working sound card, Thrive Messenger will work just fine.
-
-* * *
-
 ## How to use Thrive Messenger
 
 ### Accounts
@@ -31,31 +25,24 @@ Note: these instructions are for running Thrive Messenger on Windows.
 3. Clone the GitHub repository.
 ```
 git clone https://github.com/G4p-Studios/ThriveMessenger.git
-```
 4. navigate to the ThriveMessenger directory.
 ```
 cd ThriveMessenger
-```
 5. Create a Python virtual environment. This gives you an isolated workspace for installing the libraries Thrive Messenger needs without affecting your main Python install.
 ```
 python -m venv venv
-```
 6. activate the virtual environment.
 ```
 venv\scripts\activate
-```
 7. To avoid errors when installing libraries, update pip, setuptools and wheel.
 ```
 python -m pip install --upgrade pip setuptools wheel
-```
 8. Install the required libraries.
 ```
 pip install -r requirements.txt
-```
 9. Finally, run the tmsg.py file. If all is well, you should see the Thrive Messenger login screen.
 `
 python tmsg.py
-```
 
 ### Compiling
 
@@ -63,7 +50,6 @@ If you wish to compile a binary, with your virtual environment activated, run th
 
 ```
 compile.cmd
-```
 
 ### Running compiled
 
