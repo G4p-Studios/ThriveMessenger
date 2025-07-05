@@ -6,7 +6,7 @@ Thrive Messenger is an instant messaging service that aims to bring back the spe
 
 Part of the Thrive Essentials suite of software from G4p Studios, Thrive Messenger features a simplistic, accessible user interface that is easy to navigate and use for those who rely on screen readers such as [NVDA](https://nvaccess.org) and [JAWS](https://www.freedomscientific.com/products/software/jaws/). It achieves this with clear labels for UI elements, buttons, text fields, checkboxes etc, and keyboard friendly navigation, allowing the user to use their arrow keys and the tab key to move around menus and other parts of the UI.
 
-Thrive Messenger is open source, meaning anyone is free to download, view and modify the source code, and decentralised, meaning anyone can host their own Thrive Messenger Server. This is the client readme, however, so hosting servers won't be discussed here.
+Thrive Messenger is open source, meaning anyone is free to download, view and modify the source code, and decentralised, meaning anyone can host their own Thrive Messenger Server. This is the client readme, however, so hosting servers won't be discussed here. Server code and readme is coming soon.
 
 * * *
 
@@ -60,6 +60,7 @@ python tmsg.py
 ### Compiling
 
 If you wish to compile a binary, with your virtual environment activated, run the compile script.
+
 ```
 compile.cmd
 ```
