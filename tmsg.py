@@ -1,6 +1,6 @@
 import wx, socket, json, threading, datetime, wx.adv, configparser, ssl, sys, base64
 
-# ... (Code before LoginDialog is unchanged) ...
+# ... (All code before MainFrame is unchanged) ...
 def load_server_config():
     config = configparser.ConfigParser(); config.read('srv.conf')
     return {'host': config.get('server', 'host', fallback='localhost'),'port': config.getint('server', 'port', fallback=5005),'cafile': config.get('server', 'cafile', fallback=None),}
@@ -21,7 +21,7 @@ def save_user_config(settings):
 SERVER_CONFIG = load_server_config(); ADDR = (SERVER_CONFIG['host'], SERVER_CONFIG['port'])
 class ThriveTaskBarIcon(wx.adv.TaskBarIcon):
     def __init__(self, frame): super().__init__(); self.frame = frame; icon = wx.Icon(wx.ArtProvider.GetIcon(wx.ART_INFORMATION, wx.ART_OTHER, (16, 16))); self.SetIcon(icon, "Thrive Messenger"); self.Bind(wx.adv.EVT_TASKBAR_LEFT_DCLICK, self.on_restore); self.Bind(wx.EVT_MENU, self.on_restore, id=1); self.Bind(wx.EVT_MENU, self.on_exit, id=2)
-    def CreatePopupMenu(self): menu = wx.Menu(); menu.Append(1, "&Restore"); menu.Append(2, "E&xit"); return menu # Added accelerators here too
+    def CreatePopupMenu(self): menu = wx.Menu(); menu.Append(1, "&Restore"); menu.Append(2, "E&xit"); return menu
     def on_restore(self, event): self.frame.restore_from_tray()
     def on_exit(self, event): self.frame.on_exit(None)
 class ClientApp(wx.App):
@@ -34,22 +34,23 @@ class ClientApp(wx.App):
             else: wx.MessageBox(f"Auto-login failed: {reason}", "Login Failed", wx.ICON_ERROR); self.user_config['autologin'] = False; save_user_config(self.user_config)
         return self.show_login_dialog()
     def show_login_dialog(self):
-        dlg = LoginDialog(None, self.user_config)
-        if dlg.ShowModal() == wx.ID_OK:
+        while True:
+            dlg = LoginDialog(None, self.user_config)
+            if dlg.ShowModal() != wx.ID_OK: return False
             success, sock, _ = self.perform_login(dlg.username, dlg.password)
             if success:
                 if dlg.remember_checked: self.user_config = {'username': dlg.username, 'password': dlg.password, 'remember': True, 'autologin': dlg.autologin_checked}
                 else: self.user_config = {}
                 save_user_config(self.user_config); self.start_main_session(dlg.username, sock); return True
-        return False
     def perform_login(self, username, password):
         try:
             context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=SERVER_CONFIG['cafile']); context.check_hostname = True; context.verify_mode = ssl.CERT_REQUIRED
             sock = socket.create_connection(ADDR); ssock = context.wrap_socket(sock, server_hostname=SERVER_CONFIG['host'])
             ssock.sendall(json.dumps({"action":"login","user":username,"pass":password}).encode()+b"\n"); resp = json.loads(ssock.makefile().readline() or "{}")
             if resp.get("status") == "ok": return True, ssock, "Success"
-            else: reason = resp.get("reason", "Unknown error"); ssock.close(); return False, None, reason
-        except Exception as e: return False, None, str(e)
+            else:
+                reason = resp.get("reason", "Unknown error"); wx.MessageBox("Login failed: " + reason, "Login Failed", wx.ICON_ERROR); ssock.close(); return False, None, reason
+        except Exception as e: wx.MessageBox(f"A connection error occurred: {e}", "Connection Error", wx.ICON_ERROR); return False, None, str(e)
     def start_main_session(self, username, sock):
         self.username = username; self.sock = sock; self.frame = MainFrame(self.username, self.sock); self.frame.Show()
         wx.adv.Sound.PlaySound("login.wav", wx.adv.SOUND_ASYNC); threading.Thread(target=self.listen_loop, daemon=True).start()
@@ -61,139 +62,96 @@ class ClientApp(wx.App):
                 elif act == "contact_status": wx.CallAfter(self.frame.update_contact_status, msg["user"], msg["online"])
                 elif act == "msg": wx.CallAfter(self.frame.receive_message, msg)
                 elif act == "msg_failed": wx.CallAfter(self.frame.on_message_failed, msg["to"], msg["reason"])
+                elif act == "add_contact_failed": wx.CallAfter(self.frame.on_add_contact_failed, msg["reason"])
+                elif act == "add_contact_success": wx.CallAfter(self.frame.on_add_contact_success, msg["contact"])
                 elif act == "admin_response": wx.CallAfter(self.frame.on_admin_response, msg["response"])
                 elif act == "admin_status_change": wx.CallAfter(self.frame.on_admin_status_change, msg["user"], msg["is_admin"])
                 elif act == "banned_kick": wx.CallAfter(self.on_banned); break
         except (IOError, json.JSONDecodeError, ValueError): print("Disconnected from server."); wx.CallAfter(self.on_server_disconnect)
-    def on_banned(self): wx.MessageBox("You have been banned...", "Banned", wx.ICON_ERROR); self.frame.on_exit(None)
+    def on_banned(self):
+        wx.MessageBox("You have been banned...", "Banned", wx.ICON_ERROR)
+        if hasattr(self, 'frame'): self.frame.on_exit(None)
     def on_server_disconnect(self):
         if hasattr(self, 'frame') and self.frame.IsShown(): wx.MessageBox("Connection lost...", "Connection Lost", wx.ICON_ERROR)
         if hasattr(self, 'frame') and self.frame: self.frame.is_exiting = True; self.frame.Close()
         self.show_login_dialog()
-
 class LoginDialog(wx.Dialog):
     def __init__(self, parent, user_config):
-        super().__init__(parent, title="Login", size=(300, 280))
-        self.user_config = user_config
-        
-        panel = wx.Panel(self)
-        s = wx.BoxSizer(wx.VERTICAL)
-
-        # --- MODIFIED: Add '&' for accelerators ---
-        user_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "&Username")
-        self.u = wx.TextCtrl(user_box.GetStaticBox())
-        user_box.Add(self.u, 0, wx.EXPAND | wx.ALL, 5)
-
-        pass_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "&Password")
-        self.p = wx.TextCtrl(pass_box.GetStaticBox(), style=wx.TE_PASSWORD | wx.TE_PROCESS_ENTER)
-        pass_box.Add(self.p, 0, wx.EXPAND | wx.ALL, 5)
-        
-        self.u.SetValue(self.user_config.get('username', ''))
-        if self.user_config.get('remember'):
-            self.p.SetValue(self.user_config.get('password', ''))
-
-        s.Add(user_box, 0, wx.EXPAND | wx.ALL, 5)
-        s.Add(pass_box, 0, wx.EXPAND | wx.ALL, 5)
-        
-        self.remember_cb = wx.CheckBox(panel, label="&Remember me")
-        self.autologin_cb = wx.CheckBox(panel, label="Log in &automatically")
-        
-        self.remember_cb.SetValue(self.user_config.get('remember', False))
-        self.autologin_cb.SetValue(self.user_config.get('autologin', False))
-
-        self.remember_cb.Bind(wx.EVT_CHECKBOX, self.on_check_remember)
-        
-        s.Add(self.remember_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
-        s.Add(self.autologin_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
-
-        btn = wx.Button(panel, label="&Login")
-        btn.Bind(wx.EVT_BUTTON, self.on_login)
-        self.p.Bind(wx.EVT_TEXT_ENTER, self.on_login)
-        s.Add(btn, 0, wx.CENTER | wx.ALL, 5)
-        
-        panel.SetSizer(s)
-        self.on_check_remember(None)
-
-    def on_check_remember(self, event): # Unchanged
+        super().__init__(parent, title="Login", size=(300, 280)); self.user_config = user_config
+        panel = wx.Panel(self); s = wx.BoxSizer(wx.VERTICAL); user_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "&Username")
+        self.u = wx.TextCtrl(user_box.GetStaticBox()); user_box.Add(self.u, 0, wx.EXPAND | wx.ALL, 5)
+        pass_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "&Password"); self.p = wx.TextCtrl(pass_box.GetStaticBox(), style=wx.TE_PASSWORD | wx.TE_PROCESS_ENTER)
+        pass_box.Add(self.p, 0, wx.EXPAND | wx.ALL, 5); self.u.SetValue(self.user_config.get('username', ''));
+        if self.user_config.get('remember'): self.p.SetValue(self.user_config.get('password', ''))
+        s.Add(user_box, 0, wx.EXPAND | wx.ALL, 5); s.Add(pass_box, 0, wx.EXPAND | wx.ALL, 5); self.remember_cb = wx.CheckBox(panel, label="&Remember me")
+        self.autologin_cb = wx.CheckBox(panel, label="Log in &automatically"); self.remember_cb.SetValue(self.user_config.get('remember', False))
+        self.autologin_cb.SetValue(self.user_config.get('autologin', False)); self.remember_cb.Bind(wx.EVT_CHECKBOX, self.on_check_remember)
+        s.Add(self.remember_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10); s.Add(self.autologin_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        btn = wx.Button(panel, label="&Login"); btn.Bind(wx.EVT_BUTTON, self.on_login); self.p.Bind(wx.EVT_TEXT_ENTER, self.on_login); s.Add(btn, 0, wx.CENTER | wx.ALL, 5)
+        panel.SetSizer(s); self.on_check_remember(None)
+    def on_check_remember(self, event):
         if self.remember_cb.IsChecked(): self.autologin_cb.Enable()
         else: self.autologin_cb.SetValue(False); self.autologin_cb.Disable()
-
-    def on_login(self, _): # Unchanged
+    def on_login(self, _):
         u, p = self.u.GetValue(), self.p.GetValue()
         if not u or not p: wx.MessageBox("Username and password cannot be empty.", "Login Error", wx.ICON_ERROR); return
-        self.username = u; self.password = p
-        self.remember_checked = self.remember_cb.IsChecked(); self.autologin_checked = self.autologin_cb.IsChecked()
-        self.EndModal(wx.ID_OK)
+        self.username = u; self.password = p; self.remember_checked = self.remember_cb.IsChecked(); self.autologin_checked = self.autologin_cb.IsChecked(); self.EndModal(wx.ID_OK)
 
 class MainFrame(wx.Frame):
     def __init__(self, user, sock):
-        super().__init__(None, title=f"Thrive Messenger – {user}", size=(400,380))
-        self.user, self.sock = user, sock; self.task_bar_icon = None; self.is_exiting = False
-        
-        self.Bind(wx.EVT_CLOSE, self.on_close_window)
-        panel = wx.Panel(self)
-        box_contacts = wx.StaticBoxSizer(wx.VERTICAL, panel, "&Contacts") # Added accelerator
-        self.lv = wx.ListCtrl(box_contacts.GetStaticBox(), style=wx.LC_REPORT)
-        self.lv.InsertColumn(0, "Username", width=120)
-        self.lv.InsertColumn(1, "Status", width=100)
-        
-        self.lv.Bind(wx.EVT_CHAR_HOOK, self.on_key)
-        self.lv.Bind(wx.EVT_LIST_ITEM_SELECTED, self.update_button_states)
-        self.lv.Bind(wx.EVT_LIST_ITEM_DESELECTED, self.update_button_states)
-        
-        box_contacts.Add(self.lv, 1, wx.EXPAND|wx.ALL, 5)
-
-        # --- MODIFIED: Added '&' for accelerators ---
-        self.btn_block = wx.Button(panel, label="&Block") # Label is updated dynamically
-        self.btn_add = wx.Button(panel, label="&Add Contact")
-        self.btn_send = wx.Button(panel, label="&Start Chat")
-        self.btn_delete = wx.Button(panel, label="&Delete Contact")
-        self.btn_admin = wx.Button(panel, label="Use Ser&ver Side Commands")
-        self.btn_logout = wx.Button(panel, label="L&ogout")
-        self.btn_exit = wx.Button(panel, label="E&xit")
-        
-        # Bind handlers
-        self.btn_block.Bind(wx.EVT_BUTTON, self.on_block_toggle)
-        self.btn_add.Bind(wx.EVT_BUTTON, self.on_add)
-        self.btn_send.Bind(wx.EVT_BUTTON, self.on_send)
-        self.btn_delete.Bind(wx.EVT_BUTTON, self.on_delete)
-        self.btn_admin.Bind(wx.EVT_BUTTON, self.on_admin)
-        self.btn_logout.Bind(wx.EVT_BUTTON, self.on_logout)
-        self.btn_exit.Bind(wx.EVT_BUTTON, self.on_exit)
-        
-        # Layout
-        gs_main = wx.GridSizer(1, 4, 5, 5)
-        gs_main.Add(self.btn_block, 0, wx.EXPAND)
-        gs_main.Add(self.btn_add, 0, wx.EXPAND)
-        gs_main.Add(self.btn_send, 0, wx.EXPAND)
-        gs_main.Add(self.btn_delete, 0, wx.EXPAND)
-        
-        gs_util = wx.GridSizer(1, 3, 5, 5)
-        gs_util.Add(self.btn_admin, 0, wx.EXPAND)
-        gs_util.Add(self.btn_logout, 0, wx.EXPAND)
-        gs_util.Add(self.btn_exit, 0, wx.EXPAND)
-        
-        s = wx.BoxSizer(wx.VERTICAL)
-        s.Add(box_contacts, 1, wx.EXPAND|wx.ALL, 5)
-        s.Add(gs_main, 0, wx.CENTER|wx.ALL, 5)
-        s.Add(gs_util, 0, wx.CENTER|wx.ALL, 5)
-        panel.SetSizer(s)
-        
+        super().__init__(None, title=f"Thrive Messenger – {user}", size=(400,380)); self.user, self.sock = user, sock; self.task_bar_icon = None; self.is_exiting = False
+        self.Bind(wx.EVT_CLOSE, self.on_close_window); panel = wx.Panel(self); box_contacts = wx.StaticBoxSizer(wx.VERTICAL, panel, "&Contacts")
+        self.lv = wx.ListCtrl(box_contacts.GetStaticBox(), style=wx.LC_REPORT); self.lv.InsertColumn(0, "Username", width=120); self.lv.InsertColumn(1, "Status", width=100)
+        self.lv.Bind(wx.EVT_CHAR_HOOK, self.on_key); self.lv.Bind(wx.EVT_LIST_ITEM_SELECTED, self.update_button_states); self.lv.Bind(wx.EVT_LIST_ITEM_DESELECTED, self.update_button_states); box_contacts.Add(self.lv, 1, wx.EXPAND|wx.ALL, 5)
+        self.btn_block = wx.Button(panel, label="&Block"); self.btn_add = wx.Button(panel, label="&Add Contact"); self.btn_send = wx.Button(panel, label="&Start Chat"); self.btn_delete = wx.Button(panel, label="&Delete Contact")
+        self.btn_admin = wx.Button(panel, label="Use Ser&ver Side Commands"); self.btn_logout = wx.Button(panel, label="L&ogout"); self.btn_exit = wx.Button(panel, label="E&xit")
+        self.btn_block.Bind(wx.EVT_BUTTON, self.on_block_toggle); self.btn_add.Bind(wx.EVT_BUTTON, self.on_add); self.btn_send.Bind(wx.EVT_BUTTON, self.on_send); self.btn_delete.Bind(wx.EVT_BUTTON, self.on_delete)
+        self.btn_admin.Bind(wx.EVT_BUTTON, self.on_admin); self.btn_logout.Bind(wx.EVT_BUTTON, self.on_logout); self.btn_exit.Bind(wx.EVT_BUTTON, self.on_exit)
+        accel_entries = [(wx.ACCEL_ALT, ord('B'), self.btn_block.GetId()), (wx.ACCEL_ALT, ord('A'), self.btn_add.GetId()), (wx.ACCEL_ALT, ord('S'), self.btn_send.GetId()), (wx.ACCEL_ALT, ord('D'), self.btn_delete.GetId()), (wx.ACCEL_ALT, ord('V'), self.btn_admin.GetId()), (wx.ACCEL_ALT, ord('O'), self.btn_logout.GetId()), (wx.ACCEL_ALT, ord('X'), self.btn_exit.GetId()),]
+        accel_tbl = wx.AcceleratorTable(accel_entries); self.SetAcceleratorTable(accel_tbl)
+        gs_main = wx.GridSizer(1, 4, 5, 5); gs_main.Add(self.btn_block, 0, wx.EXPAND); gs_main.Add(self.btn_add, 0, wx.EXPAND); gs_main.Add(self.btn_send, 0, wx.EXPAND); gs_main.Add(self.btn_delete, 0, wx.EXPAND)
+        gs_util = wx.GridSizer(1, 3, 5, 5); gs_util.Add(self.btn_admin, 0, wx.EXPAND); gs_util.Add(self.btn_logout, 0, wx.EXPAND); gs_util.Add(self.btn_exit, 0, wx.EXPAND)
+        s = wx.BoxSizer(wx.VERTICAL); s.Add(box_contacts, 1, wx.EXPAND|wx.ALL, 5); s.Add(gs_main, 0, wx.CENTER|wx.ALL, 5); s.Add(gs_util, 0, wx.CENTER|wx.ALL, 5); panel.SetSizer(s)
         self.update_button_states()
 
-    def update_button_states(self, event=None): # Unchanged
+    def update_button_states(self, event=None):
         is_selection = self.lv.GetSelectedItemCount() > 0
         self.btn_send.Enable(is_selection); self.btn_delete.Enable(is_selection); self.btn_block.Enable(is_selection)
         if is_selection:
             sel_idx = self.lv.GetFirstSelected(); contact_name = self.lv.GetItemText(sel_idx)
-            is_blocked = self.contact_states.get(contact_name, 0); 
-            # --- MODIFIED: Add accelerator to dynamic label ---
-            self.btn_block.SetLabel("&Unblock" if is_blocked else "&Block")
-        else: 
-            self.btn_block.SetLabel("&Block")
+            is_blocked = self.contact_states.get(contact_name, 0); self.btn_block.SetLabel("&Unblock" if is_blocked else "&Block")
+        else: self.btn_block.SetLabel("&Block")
         if event: event.Skip()
 
-    # ... (Rest of MainFrame is unchanged) ...
+    def on_add_contact_failed(self, reason):
+        wx.MessageBox(reason, "Add Contact Failed", wx.ICON_ERROR)
+
+    def on_add_contact_success(self, contact_data):
+        c = contact_data; self.contact_states[c["user"]] = c["blocked"]; idx = self.lv.InsertItem(self.lv.GetItemCount(), c["user"])
+        status = "online" if c["online"] and not c["blocked"] else "offline"
+        if c.get("is_admin"): status += " (Admin)"
+        self.lv.SetItem(idx, 1, status)
+        if c["blocked"]: self.lv.SetItemTextColour(idx, wx.Colour(150,150,150))
+        self.update_button_states()
+
+    def on_add(self, _):
+        # --- MODIFIED: Use wx.TextEntryDialog directly for better control ---
+        with wx.TextEntryDialog(self, "Enter the username of the contact you wish to add:", "Add Contact") as dlg:
+            # If user presses Escape or Cancel, the 'if' block is skipped.
+            if dlg.ShowModal() == wx.ID_OK:
+                c = dlg.GetValue().strip()
+                # Perform validation only if OK was pressed
+                if not c:
+                    wx.MessageBox("Username cannot be blank.", "Input Error", wx.ICON_ERROR)
+                    return
+                if c == self.user:
+                    wx.MessageBox("You cannot add yourself as a contact.", "Input Error", wx.ICON_ERROR)
+                    return
+                
+                self.sock.sendall(json.dumps({"action":"add_contact","to":c}).encode()+b"\n")
+    # --- END MODIFICATION ---
+
+    # ... (Rest of MainFrame and other classes are unchanged)
     def load_contacts(self, contacts):
         self.contact_states = {c["user"]: c["blocked"] for c in contacts}; self.lv.DeleteAllItems()
         for c in contacts:
@@ -244,7 +202,6 @@ class MainFrame(wx.Frame):
                 self.lv.SetItem(idx, 1, new_status)
                 if online: wx.adv.Sound.PlaySound("contact_online.wav", wx.adv.SOUND_ASYNC)
                 break
-    def on_add(self, _): c = wx.GetTextFromUser("Contact username?","Add Contact"); self.sock.sendall(json.dumps({"action":"add_contact","to":c}).encode()+b"\n"); self.contact_states[c] = 0; idx = self.lv.InsertItem(self.lv.GetItemCount(), c); self.lv.SetItem(idx, 1, "offline"); self.update_button_states()
     def on_block_toggle(self, _): 
         sel = self.lv.GetFirstSelected()
         if sel < 0: return
