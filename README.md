@@ -26,7 +26,7 @@ Note: these instructions are for running Thrive Messenger on Windows.
 	```
 	git clone https://github.com/G4p-Studios/ThriveMessenger.git
 	```
-	4. navigate to the ThriveMessenger directory.
+	4. Navigate to the ThriveMessenger directory.
 	```
 	cd ThriveMessenger
 	```
@@ -34,7 +34,7 @@ Note: these instructions are for running Thrive Messenger on Windows.
 	```
 	python -m venv venv
 	```
-	6. activate the virtual environment.
+	6. Activate the virtual environment.
 	```
 	venv\scripts\activate
 	```
@@ -47,7 +47,7 @@ Note: these instructions are for running Thrive Messenger on Windows.
 	pip install -r requirements.txt
 	```
 	9. Finally, run the tmsg.py file. If all is well, you should see the Thrive Messenger login screen.
-	`
+	```
 	python tmsg.py
 	```
 
