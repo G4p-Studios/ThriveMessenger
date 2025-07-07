@@ -123,8 +123,9 @@ Each server side command must start with a forward slash (/). The following serv
 *   /del user: Deletes the specified user's Thrive Messenger account from the server.
 *   /ban username date reason: Bans the specified user from Thrive Messenger until the specified date (in MM/DD/YYYY format) for the specified reason. Wanna ban someone permanently? Just do what they do on Xbox Live and ban them until December 31st, 9999! Ha ha ha!
 *   /unban username: Unbans the specified user.
-*   /exit: Shuts down the Thrive Messenger server.
 *   /unadmin username: Removes the specified user's admin so they can't run server side commands anymore.
+* /alert message: Sends a Windows Live style alert message to all online users. For example, /alert The server is about to be shut down for maintenance.
+*   /exit: Shuts down the Thrive Messenger server.
 
 Shift Tabbing once from the command input field will show a list of outputs for the commands you've run.
 
