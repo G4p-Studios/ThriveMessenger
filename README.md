@@ -14,7 +14,9 @@ Thrive Messenger is open source, meaning anyone is free to download, view and mo
 
 ### Accounts
 
-In order to use Thrive Messenger, you will need a Thrive Messenger account created by a server admin. All you need for an account is a username, which will be used to add you as a contact, and a strong password that nobody can guess.
+In order to use Thrive Messenger, you will need a Thrive Messenger account. All you need for an account is a username, which will be used to add you as a contact, and a strong password that nobody can guess.
+
+You can create an account from the Thrive Messenger login dialog, or a server admin can create an account for you.
 
 ### Running from source
 
