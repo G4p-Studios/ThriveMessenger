@@ -138,3 +138,33 @@ Those of you familiar with IRC will know that this feature was very much inspire
 The srv.conf file controls what server and port the Thrive Messenger client connects to. If you have your own Thrive Messenger server up, or you have one that you like to use, you can simply open srv.conf in your text editor of choice, such as Notepad++, and modify the server hostname and port to point to your desired server.
 
 The default server is msg.thecubed.cc, running on port 2005.
+
+* * *
+
+## Sound packs
+
+Sound packs allow you to customise the various sounds Thrive Messenger uses for its events, such as sending and receiving messages, contacts coming online, and logging into the server.
+Thrive Messenger ships with 2 sound packs by default.
+
+* Default: contains the Galaxia sounds used in the [Thrive Mastodon client](https://github.com/G4p-Studios/Thrive).
+* Skype: contains sounds from Skype versions 7 and earlier.
+
+### Creating sound packs
+
+Structurally, a sound pack is simply a folder with a collection of wave files inside of it. To create a sound pack, you will need the following 5 files:
+
+* contact_online.wav
+* login.wav
+* logout.wav
+* receive.wav
+* send.wav
+
+Make a folder inside Thrive Messenger's sounds folder and paste these files into that folder to create your custom sound pack.
+
+### Changing sound packs
+
+With the Thrive Messenger client open and logged in, follow these steps to change your sound pack.
+
+1. Press Alt + T to access the settings dialog.
+2. Choose a sound pack from the sound pack dropdown menu with the up and down arrow keys.
+3. Either press Enter or click the apply button to apply your settings.
