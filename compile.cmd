@@ -1,4 +1,6 @@
 @echo off
 python versionfile.py
 pyinstaller --windowed --version-file=vdata.txt --upx-dir=C:\UPX tmsg.py
-robocopy . dist\tmsg contact_online.wav login.wav logout.wav send.wav receive.wav srv.conf
+robocopy sounds\default dist\tmsg\sounds\default /E
+robocopy sounds\skype dist\tmsg\sounds\skype /E
+copy srv.conf dist\tmsg
