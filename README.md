@@ -108,7 +108,7 @@ Pressing Alt F4 will minimize the client to the system tray, ready for you to re
 
 ### Sending and receiving messages
 
-You can start an IM conversation with a contact simply by pressing Enter on them in the contact list. Once you do, you will land on a text field where you can type your message. Pressing Enter will send the message, and pressing Shift + Enter will type a new line. Pressing Shift + Tab once will take you to a list of all messages sent and received in the chat. Use the up and down arrow keys to navigate this list. To get out of the chat and go back to the main Thrive Messenger window, simply press the Escape key. Don't worry, your chat history will be saved. It will only be cleared when you log out or exit the program.
+You can start an IM conversation with a contact simply by pressing Enter on them in the contact list. Once you do, you will land on a text field where you can type your message. Pressing Enter will send the message, and pressing Shift + Enter will type a new line. Pressing Shift + Tab once will take you to a checkbox which will allow you to save a permanent log of your chat with the current contact, stored in Documents/ThriveMessenger/chats/<contact>. Pressing Shift + Tab again will show a list of all messages sent and received in the chat. Use the up and down arrow keys to navigate this list. To get out of the chat and go back to the main Thrive Messenger window, simply press the Escape key.
 
 * * *
 
@@ -144,9 +144,10 @@ The default server is msg.thecubed.cc, running on port 2005.
 ## Sound packs
 
 Sound packs allow you to customise the various sounds Thrive Messenger uses for its events, such as sending and receiving messages, contacts coming online, and logging into the server.
-Thrive Messenger ships with 2 sound packs by default.
+Thrive Messenger ships with 3 sound packs by default.
 
-* Default: contains the Galaxia sounds used in the [Thrive Mastodon client](https://github.com/G4p-Studios/Thrive).
+* Default: Contains a collection of sounds made by blind UK-based musician Andre Louis.
+* Galaxia: contains the Galaxia sounds used in the [Thrive Mastodon client](https://github.com/G4p-Studios/Thrive).
 * Skype: contains sounds from Skype versions 7 and earlier.
 
 ### Creating sound packs
@@ -168,3 +169,15 @@ With the Thrive Messenger client open and logged in, follow these steps to chang
 1. Press Alt + T to access the settings dialog.
 2. Choose a sound pack from the sound pack dropdown menu with the up and down arrow keys.
 3. Either press Enter or click the apply button to apply your settings.
+
+* * *
+
+## Credits
+
+Sounds in the default sound pack were created by Andre Louis.
+
+* [Andre Louis's website](http://www.andrelouis.com/)
+* [Check out Andre on YouTube](https://www.youtube.com/channel/UCqtMRZeGSGWMAy0AX31K0MQ)
+* Listen to the [StroongeCast podcast](http://www.andrelouis.com/stroongecast), hosted by Andre and his wife Kirsten Louis.
+* [Andre on Mastodon (personal)](https://universeodon.com/@FreakyFwoof)
+* [Andre on Mastodon (music)](https://mastodonmusic.social/@Onj)

@@ -1,3 +1,2 @@
 wxpython
-pyinstaller
-pyinstaller_versionfile
+nuitka

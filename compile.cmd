@@ -1,6 +1,2 @@
 @echo off
-python versionfile.py
-pyinstaller --windowed --version-file=vdata.txt --upx-dir=C:\UPX tmsg.py
-robocopy sounds\default dist\tmsg\sounds\default /E
-robocopy sounds\skype dist\tmsg\sounds\skype /E
-copy srv.conf dist\tmsg
+nuitka --standalone --windows-console-mode=disable --company-name="G4p Studios" --product-name="Thrive Messenger" --file-version=2025.0.5.5 --product-version=2025.0.5.5 --file-description="Thrive Messenger" --copyright="Copyright 2025 G4p Studios." tmsg.py
