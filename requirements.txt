@@ -1,2 +1,3 @@
 wxpython
 nuitka
+plyer

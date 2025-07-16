@@ -1,29 +1,12 @@
 import wx, socket, json, threading, datetime, wx.adv, configparser, ssl, sys, base64, os
-
-# --- RESTORED a few missing functions ---
-def get_day_with_suffix(d):
-    """Adds an ordinal suffix to a day of the month (e.g., 1st, 2nd, 3rd, 4th)."""
-    return str(d) + "th" if 11 <= d <= 13 else str(d) + {1: "st", 2: "nd", 3: "rd"}.get(d % 10, "th")
-
-def format_timestamp(iso_ts):
-    """Converts an ISO timestamp string to a friendly, readable format."""
-    try:
-        dt = datetime.datetime.fromisoformat(iso_ts)
-        day_with_suffix = get_day_with_suffix(dt.day)
-        formatted_hour = dt.strftime('%I:%M %p').lstrip('0')
-        return dt.strftime(f'%A, %B {day_with_suffix}, %Y at {formatted_hour}')
-    except (ValueError, TypeError):
-        return iso_ts # Fallback to original string if something goes wrong
-
+from plyer import notification
 def load_server_config():
     config = configparser.ConfigParser(); config.read('srv.conf')
     return {'host': config.get('server', 'host', fallback='localhost'),'port': config.getint('server', 'port', fallback=5005),'cafile': config.get('server', 'cafile', fallback=None),}
-# --- END RESTORED FUNCTIONS ---
-
 def load_user_config():
     config = configparser.ConfigParser()
     if not config.read('client.conf'): return {'remember': False, 'autologin': False, 'username': '', 'password': '', 'soundpack': 'default', 'chat_logging': {}}
-    settings = {'soundpack': 'default', 'chat_logging': {}} # Start with defaults
+    settings = {'soundpack': 'default', 'chat_logging': {}}
     if 'login' in config:
         settings['username'] = config.get('login', 'username', fallback='');
         try: encoded_pass = config.get('login', 'password', fallback=''); settings['password'] = base64.b64decode(encoded_pass.encode('utf-8')).decode('utf-8')
@@ -41,7 +24,6 @@ def save_user_config(settings):
     if chat_logging_settings:
         config['chat_logging'] = {k: str(v) for k, v in chat_logging_settings.items()}
     with open('client.conf', 'w') as configfile: config.write(configfile)
-
 SERVER_CONFIG = load_server_config(); ADDR = (SERVER_CONFIG['host'], SERVER_CONFIG['port'])
 class ThriveTaskBarIcon(wx.adv.TaskBarIcon):
     def __init__(self, frame):
@@ -183,9 +165,33 @@ class LoginDialog(wx.Dialog):
         u, p = self.u.GetValue(), self.p.GetValue()
         if not u or not p: wx.MessageBox("Username and password cannot be empty.", "Login Error", wx.ICON_ERROR); return
         self.username = u; self.password = p; self.remember_checked = self.remember_cb.IsChecked(); self.autologin_checked = self.autologin_cb.IsChecked(); self.EndModal(wx.ID_OK)
+
 class MainFrame(wx.Frame):
+    def update_contact_status(self, user, online):
+        for idx in range(self.lv.GetItemCount()):
+            if self.lv.GetItemText(idx) == user:
+                current_status = self.lv.GetItemText(idx, 1); is_admin = "(Admin)" in current_status
+                new_status = "online" if online else "offline"
+                if is_admin: new_status += " (Admin)"
+                self.lv.SetItem(idx, 1, new_status)
+                
+                if online:
+                    wx.GetApp().play_sound("contact_online.wav")
+                    try:
+                        notification.notify("Contact online", f"{user} has come online.", timeout=5)
+                    except Exception as e:
+                        print(f"Error showing notification: {e}")
+                else:
+                    wx.GetApp().play_sound("contact_offline.wav")
+                    try:
+                        notification.notify("Contact offline", f"{user} has gone offline.", timeout=5)
+                    except Exception as e:
+                        print(f"Error showing notification: {e}")
+                break
+
     def __init__(self, user, sock):
         super().__init__(None, title=f"Thrive Messenger – {user}", size=(400,380)); self.user, self.sock = user, sock; self.task_bar_icon = None; self.is_exiting = False
+        self.notifications = []
         self.Bind(wx.EVT_CLOSE, self.on_close_window); panel = wx.Panel(self); box_contacts = wx.StaticBoxSizer(wx.VERTICAL, panel, "&Contacts")
         self.lv = wx.ListCtrl(box_contacts.GetStaticBox(), style=wx.LC_REPORT); self.lv.InsertColumn(0, "Username", width=120); self.lv.InsertColumn(1, "Status", width=100)
         self.lv.Bind(wx.EVT_CHAR_HOOK, self.on_key); self.lv.Bind(wx.EVT_LIST_ITEM_SELECTED, self.update_button_states); self.lv.Bind(wx.EVT_LIST_ITEM_DESELECTED, self.update_button_states); box_contacts.Add(self.lv, 1, wx.EXPAND|wx.ALL, 5)
@@ -273,15 +279,6 @@ class MainFrame(wx.Frame):
     def on_key(self, evt):
         if evt.GetKeyCode() == wx.WXK_RETURN: self.on_send(None)
         else: evt.Skip()
-    def update_contact_status(self, user, online):
-        for idx in range(self.lv.GetItemCount()):
-            if self.lv.GetItemText(idx) == user:
-                current_status = self.lv.GetItemText(idx, 1); is_admin = "(Admin)" in current_status
-                new_status = "online" if online else "offline"
-                if is_admin: new_status += " (Admin)"
-                self.lv.SetItem(idx, 1, new_status)
-                if online: wx.GetApp().play_sound("contact_online.wav")
-                break
     def on_block_toggle(self, _): 
         sel = self.lv.GetFirstSelected()
         if sel < 0: return

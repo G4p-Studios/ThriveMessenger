@@ -152,9 +152,10 @@ Thrive Messenger ships with 3 sound packs by default.
 
 ### Creating sound packs
 
-Structurally, a sound pack is simply a folder with a collection of wave files inside of it. To create a sound pack, you will need the following 5 files:
+Structurally, a sound pack is simply a folder with a collection of wave files inside of it. To create a sound pack, you will need the following 6 files:
 
 * contact_online.wav
+* contact_offline.wav
 * login.wav
 * logout.wav
 * receive.wav
