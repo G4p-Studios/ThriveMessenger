@@ -196,7 +196,6 @@ class CreateAccountDialog(wx.Dialog):
         if dark_mode_on:
             for box in [user_box, pass_box, confirm_box]: box.GetStaticBox().SetForegroundColour(light_text_color)
             for ctrl in [self.u_text, self.p1_text, self.p2_text]: ctrl.SetBackgroundColour(dark_color); ctrl.SetForegroundColour(light_text_color)
-            self.autologin_cb.SetForegroundColour(light_text_color)
 
         s.Add(user_box, 0, wx.EXPAND | wx.ALL, 5); s.Add(pass_box, 0, wx.EXPAND | wx.ALL, 5); s.Add(confirm_box, 0, wx.EXPAND | wx.ALL, 5)
         s.Add(self.autologin_cb, 0, wx.ALL, 10)
@@ -229,7 +228,6 @@ class LoginDialog(wx.Dialog):
         if dark_mode_on:
             for box in [user_box, pass_box]: box.GetStaticBox().SetForegroundColour(light_text_color)
             for ctrl in [self.u, self.p]: ctrl.SetBackgroundColour(dark_color); ctrl.SetForegroundColour(light_text_color)
-            for cb in [self.remember_cb, self.autologin_cb]: cb.SetForegroundColour(light_text_color)
             
         s.Add(user_box, 0, wx.EXPAND | wx.ALL, 5); s.Add(pass_box, 0, wx.EXPAND | wx.ALL, 5)
         s.Add(self.remember_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10); s.Add(self.autologin_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
@@ -462,7 +460,6 @@ class ChatDialog(wx.Dialog):
         
         if dark_mode_on:
             self.hist.SetBackgroundColour(dark_color); self.hist.SetForegroundColour(light_text_color)
-            self.save_hist_cb.SetForegroundColour(light_text_color)
             box_msg.GetStaticBox().SetForegroundColour(light_text_color)
             self.input_ctrl.SetBackgroundColour(dark_color); self.input_ctrl.SetForegroundColour(light_text_color)
 
