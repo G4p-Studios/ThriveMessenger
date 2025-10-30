@@ -96,6 +96,7 @@ class SettingsDialog(wx.Dialog):
             dark_color = wx.Colour(40, 40, 40); light_text_color = wx.WHITE
             WxMswDarkMode().enable(self); self.SetBackgroundColour(dark_color); panel.SetBackgroundColour(dark_color)
             sound_box.GetStaticBox().SetForegroundColour(light_text_color)
+            sound_box.GetStaticBox().SetBackgroundColour(dark_color)
         
         sound_packs = ['default'];
         try:
@@ -106,11 +107,14 @@ class SettingsDialog(wx.Dialog):
         if current_pack in sound_packs: self.choice.SetStringSelection(current_pack)
         else: self.choice.SetSelection(0)
         
-        if dark_mode_on:
-            self.choice.SetBackgroundColour(dark_color); self.choice.SetForegroundColour(light_text_color)
-            
         sound_box.Add(self.choice, 0, wx.EXPAND | wx.ALL, 5); main_sizer.Add(sound_box, 0, wx.EXPAND | wx.ALL, 5); btn_sizer = wx.StdDialogButtonSizer()
         ok_btn = wx.Button(panel, wx.ID_OK, label="&Apply"); ok_btn.SetDefault(); cancel_btn = wx.Button(panel, wx.ID_CANCEL)
+        
+        if dark_mode_on:
+            self.choice.SetBackgroundColour(dark_color); self.choice.SetForegroundColour(light_text_color)
+            ok_btn.SetBackgroundColour(dark_color); ok_btn.SetForegroundColour(light_text_color)
+            cancel_btn.SetBackgroundColour(dark_color); cancel_btn.SetForegroundColour(light_text_color)
+            
         btn_sizer.AddButton(ok_btn); btn_sizer.AddButton(cancel_btn); btn_sizer.Realize(); main_sizer.Add(btn_sizer, 0, wx.ALIGN_CENTER | wx.ALL, 10); panel.SetSizer(main_sizer)
 class ClientApp(wx.App):
     def OnInit(self):
@@ -192,15 +196,20 @@ class CreateAccountDialog(wx.Dialog):
         pass_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "&Password"); self.p1_text = wx.TextCtrl(pass_box.GetStaticBox(), style=wx.TE_PASSWORD); pass_box.Add(self.p1_text, 0, wx.EXPAND | wx.ALL, 5)
         confirm_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "&Confirm Password"); self.p2_text = wx.TextCtrl(confirm_box.GetStaticBox(), style=wx.TE_PASSWORD); confirm_box.Add(self.p2_text, 0, wx.EXPAND | wx.ALL, 5)
         self.autologin_cb = wx.CheckBox(panel, label="&Log in automatically upon creation"); self.autologin_cb.SetValue(True)
+        btn_sizer = wx.StdDialogButtonSizer(); ok_btn = wx.Button(panel, wx.ID_OK, label="&Create"); ok_btn.SetDefault(); ok_btn.Bind(wx.EVT_BUTTON, self.on_create)
+        cancel_btn = wx.Button(panel, wx.ID_CANCEL)
 
         if dark_mode_on:
-            for box in [user_box, pass_box, confirm_box]: box.GetStaticBox().SetForegroundColour(light_text_color)
+            for box in [user_box, pass_box, confirm_box]:
+                box.GetStaticBox().SetForegroundColour(light_text_color)
+                box.GetStaticBox().SetBackgroundColour(dark_color)
             for ctrl in [self.u_text, self.p1_text, self.p2_text]: ctrl.SetBackgroundColour(dark_color); ctrl.SetForegroundColour(light_text_color)
+            ok_btn.SetBackgroundColour(dark_color); ok_btn.SetForegroundColour(light_text_color)
+            cancel_btn.SetBackgroundColour(dark_color); cancel_btn.SetForegroundColour(light_text_color)
 
         s.Add(user_box, 0, wx.EXPAND | wx.ALL, 5); s.Add(pass_box, 0, wx.EXPAND | wx.ALL, 5); s.Add(confirm_box, 0, wx.EXPAND | wx.ALL, 5)
         s.Add(self.autologin_cb, 0, wx.ALL, 10)
-        btn_sizer = wx.StdDialogButtonSizer(); ok_btn = wx.Button(panel, wx.ID_OK, label="&Create"); ok_btn.SetDefault(); ok_btn.Bind(wx.EVT_BUTTON, self.on_create)
-        cancel_btn = wx.Button(panel, wx.ID_CANCEL); btn_sizer.AddButton(ok_btn); btn_sizer.AddButton(cancel_btn); btn_sizer.Realize(); s.Add(btn_sizer, 0, wx.ALIGN_CENTER | wx.ALL, 5); panel.SetSizer(s)
+        btn_sizer.AddButton(ok_btn); btn_sizer.AddButton(cancel_btn); btn_sizer.Realize(); s.Add(btn_sizer, 0, wx.ALIGN_CENTER | wx.ALL, 5); panel.SetSizer(s)
     def on_create(self, event):
         u = self.u_text.GetValue().strip(); p1 = self.p1_text.GetValue(); p2 = self.p2_text.GetValue()
         if not u or not p1: wx.MessageBox("Username and password cannot be blank.", "Validation Error", wx.ICON_ERROR); return
@@ -224,15 +233,20 @@ class LoginDialog(wx.Dialog):
         self.remember_cb = wx.CheckBox(panel, label="&Remember me")
         self.autologin_cb = wx.CheckBox(panel, label="Log in &automatically"); self.remember_cb.SetValue(self.user_config.get('remember', False))
         self.autologin_cb.SetValue(self.user_config.get('autologin', False)); self.remember_cb.Bind(wx.EVT_CHECKBOX, self.on_check_remember)
+        login_btn = wx.Button(panel, label="&Login"); login_btn.Bind(wx.EVT_BUTTON, self.on_login)
+        create_btn = wx.Button(panel, label="&Create Account..."); create_btn.Bind(wx.EVT_BUTTON, self.on_create_account)
 
         if dark_mode_on:
-            for box in [user_box, pass_box]: box.GetStaticBox().SetForegroundColour(light_text_color)
+            for box in [user_box, pass_box]:
+                box.GetStaticBox().SetForegroundColour(light_text_color)
+                box.GetStaticBox().SetBackgroundColour(dark_color)
             for ctrl in [self.u, self.p]: ctrl.SetBackgroundColour(dark_color); ctrl.SetForegroundColour(light_text_color)
+            login_btn.SetBackgroundColour(dark_color); login_btn.SetForegroundColour(light_text_color)
+            create_btn.SetBackgroundColour(dark_color); create_btn.SetForegroundColour(light_text_color)
             
         s.Add(user_box, 0, wx.EXPAND | wx.ALL, 5); s.Add(pass_box, 0, wx.EXPAND | wx.ALL, 5)
         s.Add(self.remember_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10); s.Add(self.autologin_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
-        btn_sizer = wx.BoxSizer(wx.HORIZONTAL); login_btn = wx.Button(panel, label="&Login"); login_btn.Bind(wx.EVT_BUTTON, self.on_login)
-        create_btn = wx.Button(panel, label="&Create Account..."); create_btn.Bind(wx.EVT_BUTTON, self.on_create_account)
+        btn_sizer = wx.BoxSizer(wx.HORIZONTAL); 
         btn_sizer.Add(login_btn, 1, wx.EXPAND | wx.ALL, 2); btn_sizer.Add(create_btn, 1, wx.EXPAND | wx.ALL, 2); s.Add(btn_sizer, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         self.p.Bind(wx.EVT_TEXT_ENTER, self.on_login); panel.SetSizer(s); self.on_check_remember(None)
     def on_create_account(self, event):
@@ -290,12 +304,20 @@ class MainFrame(wx.Frame):
         
         if dark_mode_on:
             box_contacts.GetStaticBox().SetForegroundColour(light_text_color)
+            box_contacts.GetStaticBox().SetBackgroundColour(dark_color)
             self.lv.SetBackgroundColour(dark_color); self.lv.SetForegroundColour(light_text_color)
 
         box_contacts.Add(self.lv, 1, wx.EXPAND|wx.ALL, 5)
         self.btn_block = wx.Button(panel, label="&Block"); self.btn_add = wx.Button(panel, label="&Add Contact"); self.btn_send = wx.Button(panel, label="&Start Chat"); self.btn_delete = wx.Button(panel, label="&Delete Contact")
         self.btn_admin = wx.Button(panel, label="Use Ser&ver Side Commands"); self.btn_settings = wx.Button(panel, label="Se&ttings...")
         self.btn_logout = wx.Button(panel, label="L&ogout"); self.btn_exit = wx.Button(panel, label="E&xit")
+        
+        if dark_mode_on:
+            buttons = [self.btn_block, self.btn_add, self.btn_send, self.btn_delete, self.btn_admin, self.btn_settings, self.btn_logout, self.btn_exit]
+            for btn in buttons:
+                btn.SetBackgroundColour(dark_color)
+                btn.SetForegroundColour(light_text_color)
+                
         self.btn_block.Bind(wx.EVT_BUTTON, self.on_block_toggle); self.btn_add.Bind(wx.EVT_BUTTON, self.on_add); self.btn_send.Bind(wx.EVT_BUTTON, self.on_send); self.btn_delete.Bind(wx.EVT_BUTTON, self.on_delete)
         self.btn_admin.Bind(wx.EVT_BUTTON, self.on_admin); self.btn_settings.Bind(wx.EVT_BUTTON, self.on_settings)
         self.btn_logout.Bind(wx.EVT_BUTTON, self.on_logout); self.btn_exit.Bind(wx.EVT_BUTTON, self.on_exit)
@@ -420,14 +442,17 @@ class AdminDialog(wx.Dialog):
         self.hist = wx.ListCtrl(self, style=wx.LC_REPORT)
         self.hist.InsertColumn(0, "Server Response", width=200); self.hist.InsertColumn(1, "Time", width=220)
         box_msg = wx.StaticBoxSizer(wx.VERTICAL, self, "&Enter command (e.g., /create user pass)"); self.input_ctrl = wx.TextCtrl(box_msg.GetStaticBox(), style=wx.TE_PROCESS_ENTER)
+        btn = wx.Button(self, label="&Send Command")
         
         if dark_mode_on:
             self.hist.SetBackgroundColour(dark_color); self.hist.SetForegroundColour(light_text_color)
             box_msg.GetStaticBox().SetForegroundColour(light_text_color)
+            box_msg.GetStaticBox().SetBackgroundColour(dark_color)
             self.input_ctrl.SetBackgroundColour(dark_color); self.input_ctrl.SetForegroundColour(light_text_color)
+            btn.SetBackgroundColour(dark_color); btn.SetForegroundColour(light_text_color)
             
         s.Add(self.hist, 1, wx.EXPAND|wx.ALL, 5); self.input_ctrl.Bind(wx.EVT_TEXT_ENTER, self.on_send); box_msg.Add(self.input_ctrl, 0, wx.EXPAND|wx.ALL, 5)
-        s.Add(box_msg, 0, wx.EXPAND|wx.ALL, 5); btn = wx.Button(self, label="&Send Command"); btn.Bind(wx.EVT_BUTTON, self.on_send); s.Add(btn, 0, wx.CENTER|wx.ALL, 5); self.SetSizer(s)
+        s.Add(box_msg, 0, wx.EXPAND|wx.ALL, 5); btn.Bind(wx.EVT_BUTTON, self.on_send); s.Add(btn, 0, wx.CENTER|wx.ALL, 5); self.SetSizer(s)
     def on_key(self, event):
         if event.GetKeyCode() == wx.WXK_ESCAPE: self.Close()
         else: event.Skip()
@@ -457,11 +482,14 @@ class ChatDialog(wx.Dialog):
         self.save_hist_cb.SetValue(logging_enabled); self.save_hist_cb.Bind(wx.EVT_CHECKBOX, self.on_toggle_save)
         box_msg = wx.StaticBoxSizer(wx.VERTICAL, self, "Type &message (Shift+Enter for newline)")
         self.input_ctrl = wx.TextCtrl(box_msg.GetStaticBox(), style=wx.TE_MULTILINE)
+        btn = wx.Button(self, label="&Send")
         
         if dark_mode_on:
             self.hist.SetBackgroundColour(dark_color); self.hist.SetForegroundColour(light_text_color)
             box_msg.GetStaticBox().SetForegroundColour(light_text_color)
+            box_msg.GetStaticBox().SetBackgroundColour(dark_color)
             self.input_ctrl.SetBackgroundColour(dark_color); self.input_ctrl.SetForegroundColour(light_text_color)
+            btn.SetBackgroundColour(dark_color); btn.SetForegroundColour(light_text_color)
 
         s.Add(self.hist, 1, wx.EXPAND|wx.ALL, 5)
         s.Add(self.save_hist_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
@@ -469,7 +497,6 @@ class ChatDialog(wx.Dialog):
         box_msg.Add(self.input_ctrl, 1, wx.EXPAND|wx.ALL, 5)
         s.Add(box_msg, 1, wx.EXPAND|wx.ALL, 5)
         
-        btn = wx.Button(self, label="&Send")
         btn.Bind(wx.EVT_BUTTON, self.on_send)
         s.Add(btn, 0, wx.CENTER|wx.ALL, 5)
         self.SetSizer(s)
