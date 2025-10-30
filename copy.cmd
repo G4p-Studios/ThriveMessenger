@@ -1,5 +1,5 @@
 @echo off
-robocopy sounds\default tmsg.dist\sounds\default /E
-robocopy sounds\galaxia tmsg.dist\sounds\galaxia /E
-robocopy sounds\skype tmsg.dist\sounds\skype /E
-copy srv.conf tmsg.dist
+robocopy sounds\default dist\tmsg\sounds\default /E
+robocopy sounds\galaxia dist\tmsg\sounds\galaxia /E
+robocopy sounds\skype dist\tmsg\sounds\skype /E
+copy srv.conf dist\tmsg
