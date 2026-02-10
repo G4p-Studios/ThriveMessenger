@@ -18,65 +18,64 @@ In order to use Thrive Messenger, you will need a Thrive Messenger account. All 
 
 You can create an account from the Thrive Messenger login dialog, or a server admin can create an account for you.
 
-### Running from source
+### Running the client from source
 
 Note: these instructions are for running Thrive Messenger on Windows.
+The Thrive Messenger client uses UV for dependency management. UV is a fast and reliable dependency and virtual environment manager for Python written in Rust. If you're a rust programmer or if you've ever compiled a Rust program, UV is basically Cargo for Python. It can even install Python for you if you don't have it already.
 
-1. Make sure you have [Git for Windows](https://gitforwindows.org) and [Python](https://www.python.org/downloads/windows/) installed.
-2. Press Windows + R, type cmd, and press Enter.
-3. Clone the GitHub repository.
+1. Make sure you have [Git for Windows](https://gitforwindows.org) installed.
+2. Press Windows + R, type powershell, and press Enter.
+3. Run the following command in PowerShell to install UV.
+
+    ```
+    powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+    ```
+
+4. Optionally, use UV to install Python.
+
+    ```
+    uv python install 3.13
+    ```
+5. Clone the GitHub repository.
 
     ```
     git clone https://github.com/G4p-Studios/ThriveMessenger.git
     ```
 
-4. Navigate to the ThriveMessenger directory.
+6. Navigate to the ThriveMessenger directory.
 
     ```
     cd ThriveMessenger
     ```
 
-5. Create a Python virtual environment. This gives you an isolated workspace for installing the libraries Thrive Messenger needs without affecting your main Python install.
+7. Run install.cmd to install the required libraries.
 
     ```
-    python -m venv venv
+    .\install.cmd
     ```
 
-6. Activate the virtual environment.
+9. Finally, run the program. If all is well, you should see the Thrive Messenger login screen.
 
     ```
-    venv\scripts\activate
+    .\run.cmd
     ```
-
-7. To avoid errors when installing libraries, update pip, setuptools and wheel.
-
-    ```
-    python -m pip install --upgrade pip setuptools wheel
-    ```
-
-8. Install the required libraries.
-
-    ```
-    pip install -r requirements.txt
-    ```
-
-9. Finally, run the tmsg.py file. If all is well, you should see the Thrive Messenger login screen.
-
-    ```
-    python tmsg.py
-    ```
+Note: you can also navigate to the ThriveMessenger folder in Windows Explorer and double click or press Enter on the install.cmd and run.cmd files to run them.
 
 ### Compiling
 
-If you wish to compile a binary, with your virtual environment activated, run the compile script.
+If you wish to compile a binary, run the appropriate compile script. Thrive Messenger can either be compiled with nuitka or PyInstaller.
 
-```
-compile.cmd
-```
+    ```
+    compile_nuitka.cmd
+    ```
+
+    ```
+    compile_pyinstaller.cmd
+    ```
 
 ### Running compiled
 
-If you don't feel like fighting with Git and Python, a pre-compiled release is provided.
+If you don't feel like fighting with UV and Python, a pre-compiled release is provided.
 
 1. [Download the latest Thrive Messenger release](https://github.com/G4p-Studios/ThriveMessenger/releases/latest/download/thrive_messenger.zip)
 2. Extract the zip file to a location of your choice.

@@ -1,0 +1,13 @@
+[project]
+name = "thrivemessenger"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "nuitka>=4.0",
+    "plyer>=2.1.0",
+    "pyinstaller>=6.18.0",
+    "pyinstaller-versionfile>=3.0.1",
+    "wxpython>=4.2.5",
+]
