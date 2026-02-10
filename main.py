@@ -8,18 +8,12 @@ try:
     import winreg
 
     class WxMswDarkMode:
-        """
-        Manages dark mode for top-level windows on Microsoft Windows.
-        Uses undocumented APIs for immersive dark mode, so it may break.
-        """
         _instance = None
-
         def __new__(cls):
             if cls._instance is None:
                 cls._instance = super(WxMswDarkMode, cls).__new__(cls)
                 try:
                     cls.dwmapi = ctypes.WinDLL("dwmapi")
-                    # DWMWA_USE_IMMERSIVE_DARK_MODE is 20 in recent SDKs
                     cls.DWMWA_USE_IMMERSIVE_DARK_MODE = 20
                 except (AttributeError, OSError):
                     cls.dwmapi = None
@@ -38,10 +32,6 @@ try:
             except Exception: return False
 
     def is_windows_dark_mode():
-        """
-        Checks the Windows Registry to determine if dark mode for apps is enabled.
-        Returns True if dark mode is enabled, False otherwise.
-        """
         try:
             key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Software\Microsoft\Windows\CurrentVersion\Themes\Personalize')
             value, _ = winreg.QueryValueEx(key, 'AppsUseLightTheme')
@@ -80,12 +70,14 @@ def save_user_config(settings):
         config['chat_logging'] = {k: str(v) for k, v in chat_logging_settings.items()}
     with open('client.conf', 'w') as configfile: config.write(configfile)
 SERVER_CONFIG = load_server_config(); ADDR = (SERVER_CONFIG['host'], SERVER_CONFIG['port'])
+
 class ThriveTaskBarIcon(wx.adv.TaskBarIcon):
     def __init__(self, frame):
         super().__init__(); self.frame = frame; icon = wx.Icon(wx.ArtProvider.GetIcon(wx.ART_INFORMATION, wx.ART_OTHER, (16, 16))); self.SetIcon(icon, "Thrive Messenger"); self.Bind(wx.adv.EVT_TASKBAR_LEFT_DCLICK, self.on_restore); self.Bind(wx.EVT_MENU, self.on_restore, id=1); self.Bind(wx.EVT_MENU, self.on_exit, id=2)
     def CreatePopupMenu(self): menu = wx.Menu(); menu.Append(1, "&Restore"); menu.Append(2, "E&xit"); return menu
     def on_restore(self, event): self.frame.restore_from_tray()
     def on_exit(self, event): self.frame.on_exit(None)
+
 class SettingsDialog(wx.Dialog):
     def __init__(self, parent, current_config):
         super().__init__(parent, title="Settings", size=(300, 150)); self.config = current_config
@@ -116,6 +108,48 @@ class SettingsDialog(wx.Dialog):
             cancel_btn.SetBackgroundColour(dark_color); cancel_btn.SetForegroundColour(light_text_color)
             
         btn_sizer.AddButton(ok_btn); btn_sizer.AddButton(cancel_btn); btn_sizer.Realize(); main_sizer.Add(btn_sizer, 0, wx.ALIGN_CENTER | wx.ALL, 10); panel.SetSizer(main_sizer)
+
+# --- HELPER: Intelligent SSL Logic ---
+def create_secure_socket():
+    """
+    1. Try SSL with verification (CA file OR System Defaults).
+    2. If verification fails (e.g. self-signed cert or missing intermediate), try Unverified SSL.
+    3. If SSL fails (protocol error), fallback to Plaintext.
+    """
+    sock = socket.create_connection(ADDR)
+    
+    # 1. Setup Context for VERIFIED SSL
+    if SERVER_CONFIG['cafile'] and os.path.exists(SERVER_CONFIG['cafile']):
+        # User has specific CA
+        context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=SERVER_CONFIG['cafile'])
+    else:
+        # Use OS Default Trust Store (Like a Browser)
+        context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+
+    try:
+        # Attempt Strict SSL
+        # Note: If SERVER_CONFIG['host'] is an IP, hostname verification will fail for Let's Encrypt certs.
+        ssock = context.wrap_socket(sock, server_hostname=SERVER_CONFIG['host'])
+        return ssock
+    except ssl.SSLCertVerificationError as e:
+        print(f"SSL Verification Failed: {e}")
+        print("Tip: If using Let's Encrypt, ensure server uses 'fullchain.pem', not 'cert.pem'.")
+        print("Retrying with Unverified SSL...")
+        sock.close()
+        
+        # 2. Retry with UNVERIFIED SSL (Encrypted but not trusted)
+        sock = socket.create_connection(ADDR)
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        return context.wrap_socket(sock, server_hostname=SERVER_CONFIG['host'])
+    except (ssl.SSLError, OSError) as e:
+        print(f"SSL Handshake failed ({e}). Retrying with Plaintext...")
+        sock.close()
+        
+        # 3. Fallback to Plaintext
+        return socket.create_connection(ADDR)
+
 class ClientApp(wx.App):
     def OnInit(self):
         self.user_config = load_user_config()
@@ -125,6 +159,7 @@ class ClientApp(wx.App):
             if success: self.start_main_session(self.user_config['username'], sock); return True
             else: wx.MessageBox(f"Auto-login failed: {reason}", "Login Failed", wx.ICON_ERROR); self.user_config['autologin'] = False; save_user_config(self.user_config)
         return self.show_login_dialog()
+    
     def show_login_dialog(self):
         while True:
             dlg = LoginDialog(None, self.user_config)
@@ -141,18 +176,23 @@ class ClientApp(wx.App):
                     self.user_config = {'username': dlg.new_username, 'password': dlg.new_password, 'remember': True, 'autologin': True, 'soundpack': 'default', 'chat_logging': {}}
                     save_user_config(self.user_config); self.start_main_session(dlg.new_username, sock); return True
             else: return False
+    
     def perform_login(self, username, password):
         try:
-            context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=SERVER_CONFIG['cafile']); context.check_hostname = True; context.verify_mode = ssl.CERT_REQUIRED
-            sock = socket.create_connection(ADDR); ssock = context.wrap_socket(sock, server_hostname=SERVER_CONFIG['host'])
-            ssock.sendall(json.dumps({"action":"login","user":username,"pass":password}).encode()+b"\n"); resp = json.loads(ssock.makefile().readline() or "{}")
+            # Use the intelligent connection helper
+            ssock = create_secure_socket()
+            
+            ssock.sendall(json.dumps({"action":"login","user":username,"pass":password}).encode()+b"\n")
+            resp = json.loads(ssock.makefile().readline() or "{}")
             if resp.get("status") == "ok": return True, ssock, "Success"
             else:
                 reason = resp.get("reason", "Unknown error"); wx.MessageBox("Login failed: " + reason, "Login Failed", wx.ICON_ERROR); ssock.close(); return False, None, reason
         except Exception as e: wx.MessageBox(f"A connection error occurred: {e}", "Connection Error", wx.ICON_ERROR); return False, None, str(e)
+    
     def start_main_session(self, username, sock):
         self.username = username; self.sock = sock; self.frame = MainFrame(self.username, self.sock); self.frame.Show()
         self.play_sound("login.wav"); threading.Thread(target=self.listen_loop, daemon=True).start()
+    
     def play_sound(self, sound_file):
         pack = self.user_config.get('soundpack', 'default')
         path = os.path.join('sounds', pack, sound_file)
@@ -161,6 +201,7 @@ class ClientApp(wx.App):
             default_path = os.path.join('sounds', 'default', sound_file)
             if os.path.exists(default_path): wx.adv.Sound.PlaySound(default_path, wx.adv.SOUND_ASYNC)
             else: print(f"Warning: Sound file '{sound_file}' not found in '{pack}' or 'default' pack.")
+    
     def listen_loop(self):
         try:
             for line in self.sock.makefile():
@@ -176,13 +217,16 @@ class ClientApp(wx.App):
                 elif act == "server_alert": wx.CallAfter(self.frame.on_server_alert, msg["message"])
                 elif act == "banned_kick": wx.CallAfter(self.on_banned); break
         except (IOError, json.JSONDecodeError, ValueError): print("Disconnected from server."); wx.CallAfter(self.on_server_disconnect)
+    
     def on_banned(self):
         wx.MessageBox("You have been banned...", "Banned", wx.ICON_ERROR)
         if hasattr(self, 'frame'): self.frame.on_exit(None)
+    
     def on_server_disconnect(self):
         if hasattr(self, 'frame') and self.frame.IsShown(): wx.MessageBox("Connection lost...", "Connection Lost", wx.ICON_ERROR)
         if hasattr(self, 'frame') and self.frame: self.frame.is_exiting = True; self.frame.Close()
         self.show_login_dialog()
+
 class CreateAccountDialog(wx.Dialog):
     def __init__(self, parent):
         super().__init__(parent, title="Create New Account", size=(300, 280)); panel = wx.Panel(self); s = wx.BoxSizer(wx.VERTICAL)
@@ -210,11 +254,13 @@ class CreateAccountDialog(wx.Dialog):
         s.Add(user_box, 0, wx.EXPAND | wx.ALL, 5); s.Add(pass_box, 0, wx.EXPAND | wx.ALL, 5); s.Add(confirm_box, 0, wx.EXPAND | wx.ALL, 5)
         s.Add(self.autologin_cb, 0, wx.ALL, 10)
         btn_sizer.AddButton(ok_btn); btn_sizer.AddButton(cancel_btn); btn_sizer.Realize(); s.Add(btn_sizer, 0, wx.ALIGN_CENTER | wx.ALL, 5); panel.SetSizer(s)
+    
     def on_create(self, event):
         u = self.u_text.GetValue().strip(); p1 = self.p1_text.GetValue(); p2 = self.p2_text.GetValue()
         if not u or not p1: wx.MessageBox("Username and password cannot be blank.", "Validation Error", wx.ICON_ERROR); return
         if p1 != p2: wx.MessageBox("Passwords do not match.", "Validation Error", wx.ICON_ERROR); return
         self.EndModal(wx.ID_OK)
+
 class LoginDialog(wx.Dialog):
     def __init__(self, parent, user_config):
         super().__init__(parent, title="Login", size=(300, 320)); self.user_config = user_config
@@ -249,23 +295,29 @@ class LoginDialog(wx.Dialog):
         btn_sizer = wx.BoxSizer(wx.HORIZONTAL); 
         btn_sizer.Add(login_btn, 1, wx.EXPAND | wx.ALL, 2); btn_sizer.Add(create_btn, 1, wx.EXPAND | wx.ALL, 2); s.Add(btn_sizer, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         self.p.Bind(wx.EVT_TEXT_ENTER, self.on_login); panel.SetSizer(s); self.on_check_remember(None)
+    
     def on_create_account(self, event):
         with CreateAccountDialog(self) as dlg:
             if dlg.ShowModal() == wx.ID_OK:
                 u, p, auto = dlg.u_text.GetValue(), dlg.p1_text.GetValue(), dlg.autologin_cb.IsChecked()
                 try:
-                    context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=SERVER_CONFIG['cafile']); context.check_hostname = True; context.verify_mode = ssl.CERT_REQUIRED
-                    sock = socket.create_connection(ADDR); ssock = context.wrap_socket(sock, server_hostname=SERVER_CONFIG['host'])
-                    ssock.sendall(json.dumps({"action":"create_account","user":u,"pass":p}).encode()+b"\n"); resp = json.loads(ssock.makefile().readline() or "{}"); ssock.close()
+                    # Use intelligent connection helper
+                    ssock = create_secure_socket()
+
+                    ssock.sendall(json.dumps({"action":"create_account","user":u,"pass":p}).encode()+b"\n")
+                    resp = json.loads(ssock.makefile().readline() or "{}")
+                    ssock.close()
                     if resp.get("action") == "create_account_success":
                         wx.MessageBox("Account created successfully!", "Success", wx.OK | wx.ICON_INFORMATION)
                         if auto: self.new_username = u; self.new_password = p; self.EndModal(wx.ID_ABORT)
                         else: self.u.SetValue(u); self.p.SetValue("")
                     else: wx.MessageBox("Failed to create account: " + resp.get("reason", "Unknown error"), "Creation Failed", wx.ICON_ERROR)
                 except Exception as e: wx.MessageBox(f"A connection error occurred: {e}", "Connection Error", wx.ICON_ERROR)
+    
     def on_check_remember(self, event):
         if self.remember_cb.IsChecked(): self.autologin_cb.Enable()
         else: self.autologin_cb.SetValue(False); self.autologin_cb.Disable()
+    
     def on_login(self, _):
         u, p = self.u.GetValue(), self.p.GetValue()
         if not u or not p: wx.MessageBox("Username and password cannot be empty.", "Login Error", wx.ICON_ERROR); return
@@ -424,12 +476,14 @@ class MainFrame(wx.Frame):
         for child in self.GetChildren():
             if isinstance(child, ChatDialog) and child.contact == contact: return child
         return None
+
 def get_day_with_suffix(d): return str(d) + "th" if 11 <= d <= 13 else str(d) + {1: "st", 2: "nd", 3: "rd"}.get(d % 10, "th")
 def format_timestamp(iso_ts):
     try:
         dt = datetime.datetime.fromisoformat(iso_ts); day_with_suffix = get_day_with_suffix(dt.day)
         formatted_hour = dt.strftime('%I:%M %p').lstrip('0'); return dt.strftime(f'%A, %B {day_with_suffix}, %Y at {formatted_hour}')
     except (ValueError, TypeError): return iso_ts
+
 class AdminDialog(wx.Dialog):
     def __init__(self, parent, sock):
         super().__init__(parent, title="Server Side Commands", size=(450, 300)); self.sock = sock; self.Bind(wx.EVT_CHAR_HOOK, self.on_key); s = wx.BoxSizer(wx.VERTICAL)
@@ -464,6 +518,7 @@ class AdminDialog(wx.Dialog):
     def append_response(self, text):
         ts = datetime.datetime.now().isoformat(); idx = self.hist.GetItemCount(); self.hist.InsertItem(idx, text); self.hist.SetItem(idx, 1, format_timestamp(ts))
         if text.lower().startswith('error'): self.hist.SetItemTextColour(idx, wx.RED)
+
 class ChatDialog(wx.Dialog):
     def __init__(self, parent, contact, sock, user, logging_enabled=False):
         super().__init__(parent, title=f"Chat with {contact}", size=(450, 450))
@@ -543,6 +598,7 @@ class ChatDialog(wx.Dialog):
         ts = datetime.datetime.now().isoformat()
         self.append(reason, "System", ts, is_error=True)
         self.input_ctrl.SetFocus()
+
 def main():
     app = ClientApp(False); app.MainLoop()
 

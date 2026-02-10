@@ -6,11 +6,11 @@ Thrive Messenger is an instant messaging service that aims to bring back the spe
 
 Part of the Thrive Essentials suite of software from G4p Studios, Thrive Messenger features a simplistic, accessible user interface that is easy to navigate and use for those who rely on screen readers such as [NVDA](https://nvaccess.org) and [JAWS](https://www.freedomscientific.com/products/software/jaws/). It achieves this with clear labels for UI elements, buttons, text fields, checkboxes etc, and keyboard friendly navigation, allowing the user to use their arrow keys and the tab key to move around menus and other parts of the UI.
 
-Thrive Messenger is open source, meaning anyone is free to download, view and modify the source code, and decentralised, meaning anyone can host their own Thrive Messenger Server. This is the client readme, however, so hosting servers won't be discussed here. Server code and readme is coming soon.
+Thrive Messenger is open source, meaning anyone is free to download, view and modify the source code, and decentralised, meaning anyone can host their own Thrive Messenger Server.
 
 * * *
 
-## How to use Thrive Messenger
+## Client usage
 
 ### Accounts
 
@@ -18,7 +18,7 @@ In order to use Thrive Messenger, you will need a Thrive Messenger account. All 
 
 You can create an account from the Thrive Messenger login dialog, or a server admin can create an account for you.
 
-### Running the client from source
+### Running from source
 
 Note: these instructions are for running Thrive Messenger on Windows.
 The Thrive Messenger client uses UV for dependency management. UV is a fast and reliable dependency and virtual environment manager for Python written in Rust. If you're a rust programmer or if you've ever compiled a Rust program, UV is basically Cargo for Python. It can even install Python for you if you don't have it already.
@@ -90,7 +90,7 @@ Logging into your Thrive Messenger account is as simple as logging into your com
 1.  Enter your username at the Thrive Messenger login screen.
 2.  Tab to the password field and enter your Thrive Messenger password.
 3.  Optionally, check the boxes to remember your credentials and log in automatically.
-4.  Press Enter to log into Thrive Messenger. A sound will play to tell you that you're logged in.
+4.  Click Login or Press Alt + L to log into Thrive Messenger. A sound will play to tell you that you're logged in.
 
 ### The Thrive Messenger UI
 
@@ -110,6 +110,76 @@ Pressing Alt F4 will minimize the client to the system tray, ready for you to re
 You can start an IM conversation with a contact simply by pressing Enter on them in the contact list. Once you do, you will land on a text field where you can type your message. Pressing Enter will send the message, and pressing Shift + Enter will type a new line. Pressing Shift + Tab once will take you to a checkbox which will allow you to save a permanent log of your chat with the current contact, stored in Documents/ThriveMessenger/chats/<contact>. Pressing Shift + Tab again will show a list of all messages sent and received in the chat. Use the up and down arrow keys to navigate this list. To get out of the chat and go back to the main Thrive Messenger window, simply press the Escape key.
 
 * * *
+
+## Server usage
+
+### Running the server
+
+The Thrive Messenger server is also written in Python, but it is standard library, meaning it does not require any external dependencies to run.
+Note: the server will technically run on both Windows and Linux, but the following instructions are optimised for Linux, so you will need a Linux machine either in the cloud or on your local network.
+
+1. If for some reason git is not installed on your machine, install it with these commands, substituting apt for your distro's package manager.
+
+    ```
+    sudo apt update
+    sudo apt install git
+    ```
+
+2. Clone this repository.
+
+    ```
+    git clone https://github.com/G4p-Studios/ThriveMessenger
+    ```
+
+3. Navigate to the srv directory inside the repo.
+
+    ```
+    cd ThriveMessenger/srv
+    ```
+
+4. Make a screen session so you're not constantly tied to the terminal when running the server.
+
+    ```
+    screen -S thrive
+    ```
+
+5. Ensure the server's port is allowed through the firewall.
+
+    ```
+    sudo ufw allow 2005
+    ```
+
+
+6. Finally, runn the server.
+
+    ```
+    python3 server.py
+    ```
+
+6. Detach yourself from the screen session by pressing Control + A, then press D.
+
+Please note: the server will run in unencrypted mode by default, meaning data sent from the client will be sent in plain text. This should only be used for testing servers. In a production environment, you must use valid SSL certificates from a trusted certificate authority such as Let's Encrypt.
+
+### Encrypting the server
+
+Assuming you have a domain or hostname, do the following to enable SSL on your Thrive Messenger server.
+
+1. Use a tool like Certbot to generate your Let's Encrypt certificates. [This guide from the Electronic Frontier Foundation](https://certbot.eff.org/instructions?ws=other&os=pip) should help with this.
+2. In the srv directory of the Thrive Messenger repo, run this command to edit the server's srv.conf file.
+
+    ```
+    nano srv.conf
+    ```
+
+3. Add these lines to the end of the file, replacing example.com with your actual domain name.
+
+    ```
+    certfile=/etc/letsencrypt/live/example.com/fullchain.pem
+    keyfile=/etc/letsencrypt/live/example.com/privkey.pem
+    ```
+
+4. Start the server. It should now say that there's a secure server listening on port <port>.
+
 
 ## Server side commands
 
@@ -132,7 +202,7 @@ Those of you familiar with IRC will know that this feature was very much inspire
 
 * * *
 
-## The srv.conf file
+## The client's srv.conf file
 
 The srv.conf file controls what server and port the Thrive Messenger client connects to. If you have your own Thrive Messenger server up, or you have one that you like to use, you can simply open srv.conf in your text editor of choice, such as Notepad++, and modify the server hostname and port to point to your desired server.
 
