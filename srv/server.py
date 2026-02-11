@@ -1,9 +1,35 @@
 import sqlite3, threading, socket, json, datetime, sys, configparser, ssl, os
+import smtplib, random, string
+from email.mime.text import MIMEText
 
 DB = 'thrive.db'
 ADMIN_FILE = 'admins.txt'
 clients = {}
 lock = threading.Lock()
+smtp_config = {}
+
+class EmailManager:
+    @staticmethod
+    def send_email(to_email, subject, body):
+        if not smtp_config.get('enabled', False): return False
+        try:
+            msg = MIMEText(body)
+            msg['Subject'] = subject
+            msg['From'] = smtp_config['email']
+            msg['To'] = to_email
+            
+            with smtplib.SMTP(smtp_config['server'], smtp_config['port']) as server:
+                server.starttls()
+                server.login(smtp_config['email'], smtp_config['password'])
+                server.send_message(msg)
+            return True
+        except Exception as e:
+            print(f"Failed to send email to {to_email}: {e}")
+            return False
+
+    @staticmethod
+    def generate_code(length=6):
+        return ''.join(random.choices(string.digits, k=length))
 
 def get_admins():
     try:
@@ -45,8 +71,17 @@ def broadcast_alert(message):
             except: pass
 
 def load_config():
-    config = configparser.ConfigParser()
+    # Fix: interpolation=None prevents % characters in password from breaking the parser
+    config = configparser.ConfigParser(interpolation=None)
     config.read('srv.conf')
+    global smtp_config
+    smtp_config = {
+        'enabled': config.getboolean('smtp', 'enabled', fallback=False),
+        'server': config.get('smtp', 'server', fallback=''),
+        'port': config.getint('smtp', 'port', fallback=587),
+        'email': config.get('smtp', 'email', fallback=''),
+        'password': config.get('smtp', 'password', fallback='')
+    }
     return {
         'port': config.getint('server', 'port', fallback=5005),
         'certfile': config.get('server', 'certfile', fallback='server.crt'),
@@ -56,7 +91,16 @@ def load_config():
 def init_db():
     conn = sqlite3.connect(DB)
     cur = conn.cursor()
+    # Check for columns and add if missing (Migration)
     cur.execute('''CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, password TEXT, banned_until TEXT, ban_reason TEXT)''')
+    
+    # Add new columns for email features if they don't exist
+    existing_cols = [row[1] for row in cur.execute("PRAGMA table_info(users)")]
+    if 'email' not in existing_cols: cur.execute("ALTER TABLE users ADD COLUMN email TEXT")
+    if 'verification_code' not in existing_cols: cur.execute("ALTER TABLE users ADD COLUMN verification_code TEXT")
+    if 'is_verified' not in existing_cols: cur.execute("ALTER TABLE users ADD COLUMN is_verified INTEGER DEFAULT 1") # Default 1 for old users
+    if 'reset_code' not in existing_cols: cur.execute("ALTER TABLE users ADD COLUMN reset_code TEXT")
+
     cur.execute('''CREATE TABLE IF NOT EXISTS contacts (owner TEXT, contact TEXT, blocked INTEGER DEFAULT 0, PRIMARY KEY(owner, contact))''')
     conn.commit()
     conn.close()
@@ -86,37 +130,105 @@ def handle_client(cs, addr):
     f = sock.makefile("r")
     user = None
     try:
-        # --- MODIFIED: Robust reading to handle SSL-to-Plaintext mismatches ---
         try:
             line = f.readline()
-            if not line: return # Connection closed
+            if not line: return 
             req = json.loads(line)
-        except UnicodeDecodeError:
-            # This happens when an SSL client connects to a Plaintext server
-            # The server receives binary TLS headers (byte 0xfc etc) instead of text.
-            print(f"Ignored invalid data from {addr} (likely an SSL handshake attempt on a plaintext port).")
-            return
-        except json.JSONDecodeError:
-            return
-        # -----------------------------------------------------------------------
+        except (UnicodeDecodeError, json.JSONDecodeError): return
 
         action = req.get("action")
         
+        # --- Create Account ---
         if action == "create_account":
             new_user = req.get("user")
             new_pass = req.get("pass")
+            email = req.get("email", "")
             if not new_user or not new_pass: 
-                sock.sendall((json.dumps({"action": "create_account_failed", "reason": "Username and password cannot be empty."}) + "\n").encode())
+                sock.sendall((json.dumps({"action": "create_account_failed", "reason": "Missing fields."}) + "\n").encode())
                 return
+            
             con = sqlite3.connect(DB)
-            exists = con.execute("SELECT 1 FROM users WHERE username=?", (new_user,)).fetchone()
-            if exists: 
+            row = con.execute("SELECT is_verified FROM users WHERE username=?", (new_user,)).fetchone()
+            
+            # Allow overwriting unverified users
+            if row and (row[0] == 1 or not smtp_config['enabled']):
                 sock.sendall((json.dumps({"action": "create_account_failed", "reason": "Username is already taken."}) + "\n").encode())
-            else: 
-                con.execute("INSERT INTO users(username, password) VALUES(?,?)", (new_user, new_pass))
-                con.commit()
-                sock.sendall((json.dumps({"action": "create_account_success"}) + "\n").encode())
+                con.close(); return
+            
+            # Logic: If SMTP is on, set verified=0, gen code, send email. Else verified=1.
+            verified = 1 if not smtp_config['enabled'] else 0
+            code = EmailManager.generate_code() if not verified else None
+            
+            if row: # Overwriting unverified
+                con.execute("UPDATE users SET password=?, email=?, verification_code=?, is_verified=? WHERE username=?", (new_pass, email, code, verified, new_user))
+            else:
+                con.execute("INSERT INTO users(username, password, email, verification_code, is_verified) VALUES(?,?,?,?,?)", (new_user, new_pass, email, code, verified))
+            con.commit()
             con.close()
+
+            if not verified:
+                if EmailManager.send_email(email, "Thrive Messenger - Verify Account", f"Your verification code is: {code}"):
+                    sock.sendall((json.dumps({"action": "verify_pending"}) + "\n").encode())
+                else:
+                    # Fallback if email fails? For now just say success but maybe log it.
+                    print("Failed to send verification email.")
+                    sock.sendall((json.dumps({"action": "create_account_failed", "reason": "Could not send verification email."}) + "\n").encode())
+            else:
+                sock.sendall((json.dumps({"action": "create_account_success"}) + "\n").encode())
+            return
+
+        # --- Verify Account ---
+        if action == "verify_account":
+            u_ver = req.get("user")
+            code_ver = req.get("code")
+            con = sqlite3.connect(DB)
+            row = con.execute("SELECT verification_code FROM users WHERE username=?", (u_ver,)).fetchone()
+            if row and row[0] == code_ver:
+                con.execute("UPDATE users SET is_verified=1, verification_code=NULL WHERE username=?", (u_ver,))
+                con.commit(); con.close()
+                sock.sendall(json.dumps({"status": "ok"}).encode() + b"\n")
+            else:
+                con.close()
+                sock.sendall(json.dumps({"status": "error", "reason": "Invalid code"}).encode() + b"\n")
+            return
+
+        # --- Request Password Reset ---
+        if action == "request_reset":
+            ident = req.get("identifier")
+            con = sqlite3.connect(DB)
+            # Find user by email or username
+            row = con.execute("SELECT username, email FROM users WHERE username=? OR email=?", (ident, ident)).fetchone()
+            if row:
+                t_user, t_email = row
+                if t_email:
+                    code = EmailManager.generate_code()
+                    con.execute("UPDATE users SET reset_code=? WHERE username=?", (code, t_user))
+                    con.commit()
+                    EmailManager.send_email(t_email, "Thrive Messenger - Password Reset", f"Your password reset code is: {code}")
+                    # Return OK even if email fails to prevent enumeration, mostly.
+                    sock.sendall(json.dumps({"status": "ok", "user": t_user}).encode() + b"\n")
+                else:
+                    sock.sendall(json.dumps({"status": "error", "reason": "No email on file."}).encode() + b"\n")
+            else:
+                # Security: Don't reveal user existence? For this app, we'll just say ok to pretend.
+                sock.sendall(json.dumps({"status": "ok"}).encode() + b"\n")
+            con.close()
+            return
+
+        # --- Perform Password Reset ---
+        if action == "reset_password":
+            t_user = req.get("user")
+            t_code = req.get("code")
+            new_p = req.get("new_pass")
+            con = sqlite3.connect(DB)
+            row = con.execute("SELECT reset_code FROM users WHERE username=?", (t_user,)).fetchone()
+            if row and row[0] == t_code and t_code:
+                con.execute("UPDATE users SET password=?, reset_code=NULL WHERE username=?", (new_p, t_user))
+                con.commit(); con.close()
+                sock.sendall(json.dumps({"status": "ok"}).encode() + b"\n")
+            else:
+                con.close()
+                sock.sendall(json.dumps({"status": "error", "reason": "Invalid code"}).encode() + b"\n")
             return
 
         if action != "login": 
@@ -125,7 +237,7 @@ def handle_client(cs, addr):
 
         db = sqlite3.connect(DB)
         cur = db.cursor()
-        cur.execute("SELECT password,banned_until,ban_reason FROM users WHERE username=?", (req["user"],))
+        cur.execute("SELECT password,banned_until,ban_reason,is_verified FROM users WHERE username=?", (req["user"],))
         row = cur.fetchone()
         
         if not row or row[0] != req["pass"]: 
@@ -133,7 +245,13 @@ def handle_client(cs, addr):
             db.close()
             return
             
-        bi, br = row[1], row[2]
+        bi, br, verified = row[1], row[2], row[3]
+        
+        if smtp_config['enabled'] and verified == 0:
+            sock.sendall(b'{"status":"error","reason":"Account not verified. Please recreate account to verify."}\n')
+            db.close()
+            return
+
         if bi:
             until = datetime.datetime.strptime(bi, "%Y-%m-%d")
             if until > datetime.datetime.now(): 
@@ -261,7 +379,6 @@ def serve_loop(config):
     context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
     use_ssl = False
     
-    # --- MODIFIED: Print current path to help debug file not found errors ---
     print(f"Server Current Working Directory: {os.getcwd()}")
     try:
         context.load_cert_chain(certfile=config['certfile'], keyfile=config['keyfile'])
@@ -301,7 +418,8 @@ def serve_loop(config):
 
 def handle_create(user, password):
     con = sqlite3.connect(DB)
-    con.execute("INSERT OR IGNORE INTO users(username,password) VALUES(?,?)",(user, password))
+    # Admin console creation defaults to verified
+    con.execute("INSERT OR IGNORE INTO users(username,password,is_verified) VALUES(?,?,1)",(user, password))
     con.commit()
     con.close()
     print(f"User '{user}' created or already exists.")

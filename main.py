@@ -46,10 +46,12 @@ except (ImportError, ModuleNotFoundError):
 # --- End of Dark Mode Logic ---
 
 def load_server_config():
-    config = configparser.ConfigParser(); config.read('srv.conf')
+    # Fix: interpolation=None prevents % characters in config from breaking the parser
+    config = configparser.ConfigParser(interpolation=None); config.read('srv.conf')
     return {'host': config.get('server', 'host', fallback='localhost'),'port': config.getint('server', 'port', fallback=5005),'cafile': config.get('server', 'cafile', fallback=None),}
 def load_user_config():
-    config = configparser.ConfigParser()
+    # Fix: interpolation=None
+    config = configparser.ConfigParser(interpolation=None)
     if not config.read('client.conf'): return {'remember': False, 'autologin': False, 'username': '', 'password': '', 'soundpack': 'default', 'chat_logging': {}}
     settings = {'soundpack': 'default', 'chat_logging': {}}
     if 'login' in config:
@@ -63,7 +65,8 @@ def load_user_config():
             settings['chat_logging'][contact] = (enabled.lower() == 'true')
     return settings
 def save_user_config(settings):
-    config = configparser.ConfigParser(); encoded_pass = base64.b64encode(settings.get('password', '').encode('utf-8')).decode('utf-8')
+    # Fix: interpolation=None
+    config = configparser.ConfigParser(interpolation=None); encoded_pass = base64.b64encode(settings.get('password', '').encode('utf-8')).decode('utf-8')
     config['login'] = {'username': settings.get('username', ''),'password': encoded_pass,'remember': str(settings.get('remember', False)),'autologin': str(settings.get('autologin', False)), 'soundpack': settings.get('soundpack', 'default')}
     chat_logging_settings = settings.get('chat_logging', {})
     if chat_logging_settings:
@@ -109,46 +112,18 @@ class SettingsDialog(wx.Dialog):
             
         btn_sizer.AddButton(ok_btn); btn_sizer.AddButton(cancel_btn); btn_sizer.Realize(); main_sizer.Add(btn_sizer, 0, wx.ALIGN_CENTER | wx.ALL, 10); panel.SetSizer(main_sizer)
 
-# --- HELPER: Intelligent SSL Logic ---
 def create_secure_socket():
-    """
-    1. Try SSL with verification (CA file OR System Defaults).
-    2. If verification fails (e.g. self-signed cert or missing intermediate), try Unverified SSL.
-    3. If SSL fails (protocol error), fallback to Plaintext.
-    """
     sock = socket.create_connection(ADDR)
-    
-    # 1. Setup Context for VERIFIED SSL
     if SERVER_CONFIG['cafile'] and os.path.exists(SERVER_CONFIG['cafile']):
-        # User has specific CA
         context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=SERVER_CONFIG['cafile'])
-    else:
-        # Use OS Default Trust Store (Like a Browser)
-        context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
-
-    try:
-        # Attempt Strict SSL
-        # Note: If SERVER_CONFIG['host'] is an IP, hostname verification will fail for Let's Encrypt certs.
-        ssock = context.wrap_socket(sock, server_hostname=SERVER_CONFIG['host'])
-        return ssock
-    except ssl.SSLCertVerificationError as e:
-        print(f"SSL Verification Failed: {e}")
-        print("Tip: If using Let's Encrypt, ensure server uses 'fullchain.pem', not 'cert.pem'.")
-        print("Retrying with Unverified SSL...")
-        sock.close()
-        
-        # 2. Retry with UNVERIFIED SSL (Encrypted but not trusted)
-        sock = socket.create_connection(ADDR)
-        context = ssl.create_default_context()
-        context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE
+    else: context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+    try: return context.wrap_socket(sock, server_hostname=SERVER_CONFIG['host'])
+    except ssl.SSLCertVerificationError:
+        sock.close(); sock = socket.create_connection(ADDR)
+        context = ssl.create_default_context(); context.check_hostname = False; context.verify_mode = ssl.CERT_NONE
         return context.wrap_socket(sock, server_hostname=SERVER_CONFIG['host'])
-    except (ssl.SSLError, OSError) as e:
-        print(f"SSL Handshake failed ({e}). Retrying with Plaintext...")
-        sock.close()
-        
-        # 3. Fallback to Plaintext
-        return socket.create_connection(ADDR)
+    except (ssl.SSLError, OSError):
+        sock.close(); return socket.create_connection(ADDR)
 
 class ClientApp(wx.App):
     def OnInit(self):
@@ -179,9 +154,7 @@ class ClientApp(wx.App):
     
     def perform_login(self, username, password):
         try:
-            # Use the intelligent connection helper
             ssock = create_secure_socket()
-            
             ssock.sendall(json.dumps({"action":"login","user":username,"pass":password}).encode()+b"\n")
             resp = json.loads(ssock.makefile().readline() or "{}")
             if resp.get("status") == "ok": return True, ssock, "Success"
@@ -200,7 +173,6 @@ class ClientApp(wx.App):
         else:
             default_path = os.path.join('sounds', 'default', sound_file)
             if os.path.exists(default_path): wx.adv.Sound.PlaySound(default_path, wx.adv.SOUND_ASYNC)
-            else: print(f"Warning: Sound file '{sound_file}' not found in '{pack}' or 'default' pack.")
     
     def listen_loop(self):
         try:
@@ -227,9 +199,85 @@ class ClientApp(wx.App):
         if hasattr(self, 'frame') and self.frame: self.frame.is_exiting = True; self.frame.Close()
         self.show_login_dialog()
 
+class VerificationDialog(wx.Dialog):
+    def __init__(self, parent, username):
+        super().__init__(parent, title="Account Verification", size=(300, 180)); self.username = username
+        panel = wx.Panel(self); s = wx.BoxSizer(wx.VERTICAL)
+        dark_mode_on = is_windows_dark_mode()
+        if dark_mode_on:
+            dark_color = wx.Colour(40, 40, 40); light_text_color = wx.WHITE
+            WxMswDarkMode().enable(self); self.SetBackgroundColour(dark_color); panel.SetBackgroundColour(dark_color)
+        
+        lbl = wx.StaticText(panel, label=f"Enter the code sent to your email:"); s.Add(lbl, 0, wx.ALL, 10)
+        self.code_txt = wx.TextCtrl(panel); s.Add(self.code_txt, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
+        btn_sizer = wx.StdDialogButtonSizer(); ok_btn = wx.Button(panel, wx.ID_OK, label="&Verify"); ok_btn.SetDefault(); cancel_btn = wx.Button(panel, wx.ID_CANCEL)
+        
+        if dark_mode_on:
+            lbl.SetForegroundColour(light_text_color); self.code_txt.SetBackgroundColour(dark_color); self.code_txt.SetForegroundColour(light_text_color)
+            ok_btn.SetBackgroundColour(dark_color); ok_btn.SetForegroundColour(light_text_color); cancel_btn.SetBackgroundColour(dark_color); cancel_btn.SetForegroundColour(light_text_color)
+            
+        btn_sizer.AddButton(ok_btn); btn_sizer.AddButton(cancel_btn); btn_sizer.Realize(); s.Add(btn_sizer, 0, wx.ALIGN_CENTER | wx.ALL, 10); panel.SetSizer(s)
+
+class ForgotPasswordDialog(wx.Dialog):
+    def __init__(self, parent):
+        super().__init__(parent, title="Reset Password", size=(350, 250)); panel = wx.Panel(self); self.sizer = wx.BoxSizer(wx.VERTICAL)
+        self.panel = panel
+        self.dark_mode_on = is_windows_dark_mode()
+        if self.dark_mode_on:
+            self.dark_color = wx.Colour(40, 40, 40); self.light_text_color = wx.WHITE
+            WxMswDarkMode().enable(self); self.SetBackgroundColour(self.dark_color); panel.SetBackgroundColour(self.dark_color)
+        
+        self.step1_sizer = wx.BoxSizer(wx.VERTICAL)
+        lbl1 = wx.StaticText(panel, label="Enter your registered Email or Username:"); self.email_txt = wx.TextCtrl(panel)
+        btn_req = wx.Button(panel, label="Request Reset Code"); btn_req.Bind(wx.EVT_BUTTON, self.on_request)
+        self.step1_sizer.Add(lbl1, 0, wx.ALL, 5); self.step1_sizer.Add(self.email_txt, 0, wx.EXPAND | wx.ALL, 5); self.step1_sizer.Add(btn_req, 0, wx.ALIGN_CENTER | wx.ALL, 5)
+        
+        self.step2_sizer = wx.BoxSizer(wx.VERTICAL)
+        lbl2 = wx.StaticText(panel, label="Enter Reset Code:"); self.code_txt = wx.TextCtrl(panel)
+        lbl3 = wx.StaticText(panel, label="New Password:"); self.pass_txt = wx.TextCtrl(panel, style=wx.TE_PASSWORD)
+        btn_reset = wx.Button(panel, label="Change Password"); btn_reset.Bind(wx.EVT_BUTTON, self.on_reset)
+        self.step2_sizer.Add(lbl2, 0, wx.ALL, 5); self.step2_sizer.Add(self.code_txt, 0, wx.EXPAND | wx.ALL, 5)
+        self.step2_sizer.Add(lbl3, 0, wx.ALL, 5); self.step2_sizer.Add(self.pass_txt, 0, wx.EXPAND | wx.ALL, 5)
+        self.step2_sizer.Add(btn_reset, 0, wx.ALIGN_CENTER | wx.ALL, 5)
+        
+        self.sizer.Add(self.step1_sizer, 1, wx.EXPAND | wx.ALL, 5); self.sizer.Add(self.step2_sizer, 1, wx.EXPAND | wx.ALL, 5)
+        self.sizer.Hide(self.step2_sizer)
+        
+        if self.dark_mode_on:
+            for c in [lbl1, lbl2, lbl3, self.email_txt, self.code_txt, self.pass_txt, btn_req, btn_reset]:
+                c.SetForegroundColour(self.light_text_color); 
+                if isinstance(c, (wx.TextCtrl, wx.Button)): c.SetBackgroundColour(self.dark_color)
+
+        panel.SetSizer(self.sizer)
+
+    def on_request(self, e):
+        ident = self.email_txt.GetValue().strip()
+        if not ident: wx.MessageBox("Please enter email or username.", "Error"); return
+        try:
+            sock = create_secure_socket()
+            sock.sendall(json.dumps({"action":"request_reset", "identifier":ident}).encode()+b"\n")
+            resp = json.loads(sock.makefile().readline() or "{}"); sock.close()
+            if resp.get("status") == "ok":
+                wx.MessageBox("If that account exists, a code has been sent.", "Code Sent", wx.ICON_INFORMATION)
+                self.username_cache = resp.get("user", ident) 
+                self.sizer.Hide(self.step1_sizer); self.sizer.Show(self.step2_sizer); self.panel.Layout()
+            else: wx.MessageBox(resp.get("reason", "Error"), "Failed", wx.ICON_ERROR)
+        except Exception as ex: wx.MessageBox(str(ex), "Connection Error")
+
+    def on_reset(self, e):
+        code = self.code_txt.GetValue().strip(); new_p = self.pass_txt.GetValue()
+        if not code or not new_p: return
+        try:
+            sock = create_secure_socket()
+            sock.sendall(json.dumps({"action":"reset_password", "user": self.username_cache, "code": code, "new_pass": new_p}).encode()+b"\n")
+            resp = json.loads(sock.makefile().readline() or "{}"); sock.close()
+            if resp.get("status") == "ok": wx.MessageBox("Password changed successfully!", "Success"); self.EndModal(wx.ID_OK)
+            else: wx.MessageBox(resp.get("reason", "Error"), "Failed", wx.ICON_ERROR)
+        except Exception as ex: wx.MessageBox(str(ex), "Connection Error")
+
 class CreateAccountDialog(wx.Dialog):
     def __init__(self, parent):
-        super().__init__(parent, title="Create New Account", size=(300, 280)); panel = wx.Panel(self); s = wx.BoxSizer(wx.VERTICAL)
+        super().__init__(parent, title="Create New Account", size=(300, 330)); panel = wx.Panel(self); s = wx.BoxSizer(wx.VERTICAL)
 
         dark_mode_on = is_windows_dark_mode()
         if dark_mode_on:
@@ -237,6 +285,7 @@ class CreateAccountDialog(wx.Dialog):
             WxMswDarkMode().enable(self); self.SetBackgroundColour(dark_color); panel.SetBackgroundColour(dark_color)
 
         user_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "&Username"); self.u_text = wx.TextCtrl(user_box.GetStaticBox()); user_box.Add(self.u_text, 0, wx.EXPAND | wx.ALL, 5)
+        email_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "&Email (Optional but recommended)"); self.e_text = wx.TextCtrl(email_box.GetStaticBox()); email_box.Add(self.e_text, 0, wx.EXPAND | wx.ALL, 5)
         pass_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "&Password"); self.p1_text = wx.TextCtrl(pass_box.GetStaticBox(), style=wx.TE_PASSWORD); pass_box.Add(self.p1_text, 0, wx.EXPAND | wx.ALL, 5)
         confirm_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "&Confirm Password"); self.p2_text = wx.TextCtrl(confirm_box.GetStaticBox(), style=wx.TE_PASSWORD); confirm_box.Add(self.p2_text, 0, wx.EXPAND | wx.ALL, 5)
         self.autologin_cb = wx.CheckBox(panel, label="&Log in automatically upon creation"); self.autologin_cb.SetValue(True)
@@ -244,14 +293,15 @@ class CreateAccountDialog(wx.Dialog):
         cancel_btn = wx.Button(panel, wx.ID_CANCEL)
 
         if dark_mode_on:
-            for box in [user_box, pass_box, confirm_box]:
+            for box in [user_box, email_box, pass_box, confirm_box]:
                 box.GetStaticBox().SetForegroundColour(light_text_color)
                 box.GetStaticBox().SetBackgroundColour(dark_color)
-            for ctrl in [self.u_text, self.p1_text, self.p2_text]: ctrl.SetBackgroundColour(dark_color); ctrl.SetForegroundColour(light_text_color)
+            for ctrl in [self.u_text, self.e_text, self.p1_text, self.p2_text]: ctrl.SetBackgroundColour(dark_color); ctrl.SetForegroundColour(light_text_color)
             ok_btn.SetBackgroundColour(dark_color); ok_btn.SetForegroundColour(light_text_color)
             cancel_btn.SetBackgroundColour(dark_color); cancel_btn.SetForegroundColour(light_text_color)
+            self.autologin_cb.SetForegroundColour(light_text_color)
 
-        s.Add(user_box, 0, wx.EXPAND | wx.ALL, 5); s.Add(pass_box, 0, wx.EXPAND | wx.ALL, 5); s.Add(confirm_box, 0, wx.EXPAND | wx.ALL, 5)
+        s.Add(user_box, 0, wx.EXPAND | wx.ALL, 5); s.Add(email_box, 0, wx.EXPAND | wx.ALL, 5); s.Add(pass_box, 0, wx.EXPAND | wx.ALL, 5); s.Add(confirm_box, 0, wx.EXPAND | wx.ALL, 5)
         s.Add(self.autologin_cb, 0, wx.ALL, 10)
         btn_sizer.AddButton(ok_btn); btn_sizer.AddButton(cancel_btn); btn_sizer.Realize(); s.Add(btn_sizer, 0, wx.ALIGN_CENTER | wx.ALL, 5); panel.SetSizer(s)
     
@@ -263,7 +313,7 @@ class CreateAccountDialog(wx.Dialog):
 
 class LoginDialog(wx.Dialog):
     def __init__(self, parent, user_config):
-        super().__init__(parent, title="Login", size=(300, 320)); self.user_config = user_config
+        super().__init__(parent, title="Login", size=(300, 350)); self.user_config = user_config
         panel = wx.Panel(self); s = wx.BoxSizer(wx.VERTICAL)
         
         dark_mode_on = is_windows_dark_mode()
@@ -279,35 +329,54 @@ class LoginDialog(wx.Dialog):
         self.remember_cb = wx.CheckBox(panel, label="&Remember me")
         self.autologin_cb = wx.CheckBox(panel, label="Log in &automatically"); self.remember_cb.SetValue(self.user_config.get('remember', False))
         self.autologin_cb.SetValue(self.user_config.get('autologin', False)); self.remember_cb.Bind(wx.EVT_CHECKBOX, self.on_check_remember)
+        
         login_btn = wx.Button(panel, label="&Login"); login_btn.Bind(wx.EVT_BUTTON, self.on_login)
         create_btn = wx.Button(panel, label="&Create Account..."); create_btn.Bind(wx.EVT_BUTTON, self.on_create_account)
+        forgot_btn = wx.Button(panel, label="&Forgot Password?"); forgot_btn.Bind(wx.EVT_BUTTON, self.on_forgot)
 
         if dark_mode_on:
             for box in [user_box, pass_box]:
                 box.GetStaticBox().SetForegroundColour(light_text_color)
                 box.GetStaticBox().SetBackgroundColour(dark_color)
             for ctrl in [self.u, self.p]: ctrl.SetBackgroundColour(dark_color); ctrl.SetForegroundColour(light_text_color)
-            login_btn.SetBackgroundColour(dark_color); login_btn.SetForegroundColour(light_text_color)
-            create_btn.SetBackgroundColour(dark_color); create_btn.SetForegroundColour(light_text_color)
+            for btn in [login_btn, create_btn, forgot_btn]: btn.SetBackgroundColour(dark_color); btn.SetForegroundColour(light_text_color)
+            self.remember_cb.SetForegroundColour(light_text_color); self.autologin_cb.SetForegroundColour(light_text_color)
             
         s.Add(user_box, 0, wx.EXPAND | wx.ALL, 5); s.Add(pass_box, 0, wx.EXPAND | wx.ALL, 5)
         s.Add(self.remember_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10); s.Add(self.autologin_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         btn_sizer = wx.BoxSizer(wx.HORIZONTAL); 
-        btn_sizer.Add(login_btn, 1, wx.EXPAND | wx.ALL, 2); btn_sizer.Add(create_btn, 1, wx.EXPAND | wx.ALL, 2); s.Add(btn_sizer, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        btn_sizer.Add(login_btn, 1, wx.EXPAND | wx.ALL, 2); btn_sizer.Add(create_btn, 1, wx.EXPAND | wx.ALL, 2)
+        s.Add(btn_sizer, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 5)
+        s.Add(forgot_btn, 0, wx.ALIGN_CENTER | wx.ALL, 5)
         self.p.Bind(wx.EVT_TEXT_ENTER, self.on_login); panel.SetSizer(s); self.on_check_remember(None)
     
+    def on_forgot(self, event):
+        with ForgotPasswordDialog(self) as dlg: dlg.ShowModal()
+
     def on_create_account(self, event):
         with CreateAccountDialog(self) as dlg:
             if dlg.ShowModal() == wx.ID_OK:
-                u, p, auto = dlg.u_text.GetValue(), dlg.p1_text.GetValue(), dlg.autologin_cb.IsChecked()
+                u, p, em, auto = dlg.u_text.GetValue(), dlg.p1_text.GetValue(), dlg.e_text.GetValue(), dlg.autologin_cb.IsChecked()
                 try:
-                    # Use intelligent connection helper
                     ssock = create_secure_socket()
-
-                    ssock.sendall(json.dumps({"action":"create_account","user":u,"pass":p}).encode()+b"\n")
+                    ssock.sendall(json.dumps({"action":"create_account","user":u,"pass":p,"email":em}).encode()+b"\n")
                     resp = json.loads(ssock.makefile().readline() or "{}")
                     ssock.close()
-                    if resp.get("action") == "create_account_success":
+                    
+                    if resp.get("action") == "verify_pending":
+                        # Account created but needs verification
+                        wx.MessageBox("A verification code has been sent to your email.", "Verification Required", wx.ICON_INFORMATION)
+                        with VerificationDialog(self, u) as vdlg:
+                            if vdlg.ShowModal() == wx.ID_OK:
+                                code = vdlg.code_txt.GetValue().strip()
+                                sock2 = create_secure_socket()
+                                sock2.sendall(json.dumps({"action":"verify_account", "user":u, "code":code}).encode()+b"\n")
+                                vresp = json.loads(sock2.makefile().readline() or "{}"); sock2.close()
+                                if vresp.get("status") == "ok":
+                                    wx.MessageBox("Account verified!", "Success")
+                                    if auto: self.new_username = u; self.new_password = p; self.EndModal(wx.ID_ABORT)
+                                else: wx.MessageBox("Verification failed: " + vresp.get("reason"), "Error", wx.ICON_ERROR)
+                    elif resp.get("action") == "create_account_success":
                         wx.MessageBox("Account created successfully!", "Success", wx.OK | wx.ICON_INFORMATION)
                         if auto: self.new_username = u; self.new_password = p; self.EndModal(wx.ID_ABORT)
                         else: self.u.SetValue(u); self.p.SetValue("")

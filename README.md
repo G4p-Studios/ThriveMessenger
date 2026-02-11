@@ -14,9 +14,11 @@ Thrive Messenger is open source, meaning anyone is free to download, view and mo
 
 ### Accounts
 
-In order to use Thrive Messenger, you will need a Thrive Messenger account. All you need for an account is a username, which will be used to add you as a contact, and a strong password that nobody can guess.
+In order to use Thrive Messenger, you will need a Thrive Messenger account. All you need for an account is a username which will be used to add you as a contact, an optional email address, and a strong password that nobody can guess.
 
 You can create an account from the Thrive Messenger login dialog, or a server admin can create an account for you.
+
+Please note: for both security and convenience, if the server you're using has SMTP enabled (see below), you are required to enter a valid email address when creating an account. This is so your account can be verified by email and you can easily reset your password if you forget it.
 
 ### Running from source
 
@@ -180,6 +182,19 @@ Assuming you have a domain or hostname, do the following to enable SSL on your T
 
 4. Start the server. It should now say that there's a secure server listening on port <port>.
 
+### Allowing your server to send emails
+
+You can optionally enable SMTP on your Thrive Messenger server to allow account verification and password reset codes to be sent to users by email. Users that create accounts on SMTP-enabled servers are required to supply a valid email address for these features to work.
+To allow your server to send emails, simply add these files to the end of your server's srv.conf file, replacing values with those given to you by your email provider.
+
+    ```
+    [smtp]
+    enabled=true
+    server=host.tld
+    port=587
+    email=your_username@host.tld
+    password=your_password
+    ```
 
 ## Server side commands
 
