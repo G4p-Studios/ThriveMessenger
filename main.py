@@ -1,4 +1,5 @@
-import wx, socket, json, threading, datetime, wx.adv, configparser, ssl, sys, base64, os
+import wx, socket, json, threading, datetime, wx.adv, configparser, ssl, sys, os
+import keyring
 from plyer import notification
 
 # --- Dark Mode for MSW ---
@@ -46,33 +47,85 @@ except (ImportError, ModuleNotFoundError):
 # --- End of Dark Mode Logic ---
 
 def load_server_config():
-    # Fix: interpolation=None prevents % characters in config from breaking the parser
-    config = configparser.ConfigParser(interpolation=None); config.read('srv.conf')
-    return {'host': config.get('server', 'host', fallback='localhost'),'port': config.getint('server', 'port', fallback=5005),'cafile': config.get('server', 'cafile', fallback=None),}
-def load_user_config():
-    # Fix: interpolation=None
+    # Now reading connection details from client.conf instead of srv.conf
     config = configparser.ConfigParser(interpolation=None)
-    if not config.read('client.conf'): return {'remember': False, 'autologin': False, 'username': '', 'password': '', 'soundpack': 'default', 'chat_logging': {}}
-    settings = {'soundpack': 'default', 'chat_logging': {}}
-    if 'login' in config:
-        settings['username'] = config.get('login', 'username', fallback='');
-        try: encoded_pass = config.get('login', 'password', fallback=''); settings['password'] = base64.b64decode(encoded_pass.encode('utf-8')).decode('utf-8')
-        except (base64.binascii.Error, UnicodeDecodeError): settings['password'] = ''
-        settings['remember'] = config.getboolean('login', 'remember', fallback=False); settings['autologin'] = config.getboolean('login', 'autologin', fallback=False)
-        settings['soundpack'] = config.get('login', 'soundpack', fallback='default')
-    if 'chat_logging' in config:
-        for contact, enabled in config.items('chat_logging'):
-            settings['chat_logging'][contact] = (enabled.lower() == 'true')
+    config.read('client.conf')
+    return {
+        'host': config.get('server', 'host', fallback='msg.thecubed.cc'),
+        'port': config.getint('server', 'port', fallback=2005),
+        'cafile': config.get('server', 'cafile', fallback=None),
+    }
+
+def load_user_config():
+    """
+    Loads user preferences from user_settings.json and password from OS Keyring.
+    """
+    settings = {
+        'remember': False, 
+        'autologin': False, 
+        'username': '', 
+        'password': '', 
+        'soundpack': 'default', 
+        'chat_logging': {}
+    }
+    
+    # 1. Load non-sensitive preferences from JSON
+    if os.path.exists('user_settings.json'):
+        try:
+            with open('user_settings.json', 'r') as f:
+                data = json.load(f)
+                settings.update(data)
+        except (json.JSONDecodeError, OSError):
+            print("Could not load user_settings.json, using defaults.")
+
+    # 2. Load password from Keyring if "Remember me" is active
+    if settings.get('username') and settings.get('remember'):
+        try:
+            stored_pass = keyring.get_password("ThriveMessenger", settings['username'])
+            if stored_pass:
+                settings['password'] = stored_pass
+        except Exception as e:
+            print(f"Keyring error (load): {e}")
+            
     return settings
+
 def save_user_config(settings):
-    # Fix: interpolation=None
-    config = configparser.ConfigParser(interpolation=None); encoded_pass = base64.b64encode(settings.get('password', '').encode('utf-8')).decode('utf-8')
-    config['login'] = {'username': settings.get('username', ''),'password': encoded_pass,'remember': str(settings.get('remember', False)),'autologin': str(settings.get('autologin', False)), 'soundpack': settings.get('soundpack', 'default')}
-    chat_logging_settings = settings.get('chat_logging', {})
-    if chat_logging_settings:
-        config['chat_logging'] = {k: str(v) for k, v in chat_logging_settings.items()}
-    with open('client.conf', 'w') as configfile: config.write(configfile)
-SERVER_CONFIG = load_server_config(); ADDR = (SERVER_CONFIG['host'], SERVER_CONFIG['port'])
+    """
+    Saves user preferences to user_settings.json and password to OS Keyring.
+    """
+    username = settings.get('username', '')
+    password = settings.get('password', '')
+    remember = settings.get('remember', False)
+    
+    # 1. Save non-sensitive data to JSON
+    data_to_save = settings.copy()
+    if 'password' in data_to_save: 
+        del data_to_save['password'] # Never save password to file
+        
+    try:
+        with open('user_settings.json', 'w') as f:
+            json.dump(data_to_save, f, indent=4)
+    except Exception as e:
+        print(f"Error saving settings file: {e}")
+
+    # 2. Manage Keyring
+    if username:
+        if remember and password:
+            try:
+                keyring.set_password("ThriveMessenger", username, password)
+            except Exception as e:
+                print(f"Keyring error (save): {e}")
+        else:
+            # If remember is False, ensure we remove the credential from the OS manager
+            try:
+                if keyring.get_password("ThriveMessenger", username):
+                    keyring.delete_password("ThriveMessenger", username)
+            except Exception as e:
+                # Password might not exist, ignore
+                pass
+
+SERVER_CONFIG = load_server_config()
+ADDR = (SERVER_CONFIG['host'], SERVER_CONFIG['port'])
 
 class ThriveTaskBarIcon(wx.adv.TaskBarIcon):
     def __init__(self, frame):
@@ -128,7 +181,7 @@ def create_secure_socket():
 class ClientApp(wx.App):
     def OnInit(self):
         self.user_config = load_user_config()
-        if self.user_config.get('autologin') and self.user_config.get('username'):
+        if self.user_config.get('autologin') and self.user_config.get('username') and self.user_config.get('password'):
             print("Attempting auto-login...")
             success, sock, reason = self.perform_login(self.user_config['username'], self.user_config['password'])
             if success: self.start_main_session(self.user_config['username'], sock); return True
@@ -142,9 +195,18 @@ class ClientApp(wx.App):
             if result == wx.ID_OK:
                 success, sock, _ = self.perform_login(dlg.username, dlg.password)
                 if success:
-                    if dlg.remember_checked: self.user_config['username'] = dlg.username; self.user_config['password'] = dlg.password; self.user_config['remember'] = True; self.user_config['autologin'] = dlg.autologin_checked
-                    else: self.user_config = {'soundpack': self.user_config.get('soundpack', 'default'), 'chat_logging': self.user_config.get('chat_logging', {})}
-                    save_user_config(self.user_config); self.start_main_session(dlg.username, sock); return True
+                    if dlg.remember_checked: 
+                        self.user_config['username'] = dlg.username
+                        self.user_config['password'] = dlg.password
+                        self.user_config['remember'] = True
+                        self.user_config['autologin'] = dlg.autologin_checked
+                    else: 
+                        # Clear sensitive data but keep generic settings
+                        self.user_config.update({'username': '', 'password': '', 'remember': False, 'autologin': False})
+                    
+                    save_user_config(self.user_config)
+                    self.start_main_session(dlg.username, sock)
+                    return True
             elif result == wx.ID_ABORT:
                 success, sock, _ = self.perform_login(dlg.new_username, dlg.new_password)
                 if success:
@@ -364,7 +426,6 @@ class LoginDialog(wx.Dialog):
                     ssock.close()
                     
                     if resp.get("action") == "verify_pending":
-                        # Account created but needs verification
                         wx.MessageBox("A verification code has been sent to your email.", "Verification Required", wx.ICON_INFORMATION)
                         with VerificationDialog(self, u) as vdlg:
                             if vdlg.ShowModal() == wx.ID_OK:

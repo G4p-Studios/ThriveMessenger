@@ -217,9 +217,9 @@ Those of you familiar with IRC will know that this feature was very much inspire
 
 * * *
 
-## The client's srv.conf file
+## The client.conf file
 
-The srv.conf file controls what server and port the Thrive Messenger client connects to. If you have your own Thrive Messenger server up, or you have one that you like to use, you can simply open srv.conf in your text editor of choice, such as Notepad++, and modify the server hostname and port to point to your desired server.
+The client.conf file controls what server and port the Thrive Messenger client connects to. If you have your own Thrive Messenger server up, or you have one that you like to use, you can simply open client.conf in your text editor of choice, such as Notepad++, and modify the server hostname and port to point to your desired server.
 
 The default server is msg.thecubed.cc, running on port 2005.
 
