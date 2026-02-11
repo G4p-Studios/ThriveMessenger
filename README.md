@@ -83,6 +83,8 @@ If you don't feel like fighting with UV and Python, a pre-compiled release is pr
 2. Extract the zip file to a location of your choice.
 3. Navigate to where you extracted the zip file and run tmsg.exe. If your system isn't set up to show file extensions, the filename will just show as tmsg.
 
+Alternatively, you can [download the Thrive Messenger installer](https://github.com/G4p-Studios/ThriveMessenger/releases/latest/download/thrive_messenger_installer.exe) and run through the on-screen prompts to install the program.
+
 As long as you have a PC with Windows 7 or higher, an internet connection and a working sound card, this release should work just fine.
 
 ### Login
