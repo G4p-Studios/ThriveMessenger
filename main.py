@@ -250,8 +250,13 @@ class ClientApp(wx.App):
         if hasattr(self, 'frame') and self.frame:
             if not self.frame.IsShown():
                 self.frame.restore_from_tray()
-            self.frame.Raise()
-            self.frame.SetFocus()
+            if sys.platform == 'win32':
+                hwnd = self.frame.GetHandle()
+                ctypes.windll.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+                ctypes.windll.user32.SetForegroundWindow(hwnd)
+            else:
+                self.frame.Raise()
+                self.frame.SetFocus()
 
     def show_login_dialog(self):
         while True:
