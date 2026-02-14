@@ -56,23 +56,51 @@ def load_server_config():
         'cafile': config.get('server', 'cafile', fallback=None),
     }
 
+def get_config_dir():
+    if sys.platform == 'win32':
+        base = os.environ.get('APPDATA', os.path.expanduser('~'))
+    elif sys.platform == 'darwin':
+        base = os.path.join(os.path.expanduser('~'), 'Library', 'Application Support')
+    else:
+        base = os.environ.get('XDG_CONFIG_HOME', os.path.join(os.path.expanduser('~'), '.config'))
+    config_dir = os.path.join(base, 'ThriveMessenger')
+    os.makedirs(config_dir, exist_ok=True)
+    return config_dir
+
+def get_settings_path():
+    return os.path.join(get_config_dir(), 'user_settings.json')
+
+def _migrate_settings():
+    old_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'user_settings.json')
+    new_path = get_settings_path()
+    if os.path.exists(old_path) and not os.path.exists(new_path):
+        try:
+            import shutil
+            shutil.move(old_path, new_path)
+            print(f"Migrated user_settings.json to {new_path}")
+        except Exception as e:
+            print(f"Could not migrate settings: {e}")
+
+_migrate_settings()
+
 def load_user_config():
     """
     Loads user preferences from user_settings.json and password from OS Keyring.
     """
     settings = {
-        'remember': False, 
-        'autologin': False, 
-        'username': '', 
-        'password': '', 
-        'soundpack': 'default', 
+        'remember': False,
+        'autologin': False,
+        'username': '',
+        'password': '',
+        'soundpack': 'default',
         'chat_logging': {}
     }
-    
+
     # 1. Load non-sensitive preferences from JSON
-    if os.path.exists('user_settings.json'):
+    settings_path = get_settings_path()
+    if os.path.exists(settings_path):
         try:
-            with open('user_settings.json', 'r') as f:
+            with open(settings_path, 'r') as f:
                 data = json.load(f)
                 settings.update(data)
         except (json.JSONDecodeError, OSError):
@@ -99,11 +127,11 @@ def save_user_config(settings):
     
     # 1. Save non-sensitive data to JSON
     data_to_save = settings.copy()
-    if 'password' in data_to_save: 
+    if 'password' in data_to_save:
         del data_to_save['password'] # Never save password to file
-        
+
     try:
-        with open('user_settings.json', 'w') as f:
+        with open(get_settings_path(), 'w') as f:
             json.dump(data_to_save, f, indent=4)
     except Exception as e:
         print(f"Error saving settings file: {e}")
