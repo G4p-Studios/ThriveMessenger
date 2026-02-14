@@ -103,9 +103,11 @@ When you log into Thrive Messenger, you will land on your contact list. Of cours
 *   The block button, accessible with Alt + B, lets you block the focused contact in the list so they can't message you. This is useful if they are being spammy or abusive.
 *   The add Contact button, Alt + A, will let you add a new contact. Simply click this button, enter the username of the contact you wish to add, then press Enter.
 *   You can either focus on a contact in the list and press Enter to start a chat with them, or tab to and click the Start Chat (Alt + S) button.
+* Alt + F will allow you to send a file to the focused contact.
 *   You can delete the focused contact with the Delete button or Alt + D.
 *   The Use Server Side Commands (Alt + V) button will allow you to perform various server side commands; more on these later.
 *   The logout (Alt + O) and exit (Alt + X) buttons are self explanatory.
+* The server info button (Alt + I) will show information about the server you're currently logged into.
 
 Pressing Alt F4 will minimize the client to the system tray, ready for you to receive messages. Simply double click or press Enter on the Thrive Messenger system tray item to bring it back up.
 

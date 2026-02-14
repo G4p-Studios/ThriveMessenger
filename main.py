@@ -762,6 +762,7 @@ class MainFrame(wx.Frame):
         app.show_login_dialog()
     def on_key(self, evt):
         if evt.GetKeyCode() == wx.WXK_RETURN: self.on_send(None)
+        elif evt.GetKeyCode() == wx.WXK_DELETE: self.on_delete(None)
         else: evt.Skip()
     def on_block_toggle(self, _): 
         sel = self.lv.GetFirstSelected()
