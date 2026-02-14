@@ -113,6 +113,71 @@ Pressing Alt F4 will minimize the client to the system tray, ready for you to re
 
 You can start an IM conversation with a contact simply by pressing Enter on them in the contact list. Once you do, you will land on a text field where you can type your message. Pressing Enter will send the message, and pressing Shift + Enter will type a new line. Pressing Shift + Tab once will take you to a checkbox which will allow you to save a permanent log of your chat with the current contact, stored in Documents/ThriveMessenger/chats/<contact>. Pressing Shift + Tab again will show a list of all messages sent and received in the chat. Use the up and down arrow keys to navigate this list. To get out of the chat and go back to the main Thrive Messenger window, simply press the Escape key.
 
+### File transfer
+
+As well as sending standard text messages, users can also send files to each other. To send a file, simply highlight the contact you want to send the file to and press Alt + F or click the send file button. A dialog will open where you can choose the file you wish to send. Once you choose your file, the receiving user will get a pop-up message asking if they want to accept the file. Your file will begin sending as soon as the receiver hits yes.
+Note: server owners might place file size limits and certain file type restrictions on users; see below on how to do this yourself.
+
+### Server side commands
+
+If you see (Admin) beside a contact's online status, it means they are classed as a server admin and can perform server side commands from the client. This is what the aforementioned Use Server Side Commands button is for. Clicking the button will bring up a dialog much like the one that appears when you start a chat with a contact. You will auto focus on the command input field. To run a command, simply type it into the field and press Enter.
+
+Each server side command must start with a forward slash (/). The following server side commands are available.
+
+*   /admin username: makes the specified user an admin.
+*   /unadmin username: takes the admin user's powers away.
+*   /create username password: creates a user account with the specified username and password.
+*   /del user: deletes the specified user's account from the server.
+*   /ban username date reason: bans the specified user from the server until the specified date (in MM/DD/YYYY format) for the specified reason. Wanna ban someone permanently? Just do what they do on Xbox Live and ban them until December 31st, 9999! Ha ha ha!
+*   /unban username: Unbans the specified user.
+* /banfile username type date reason: bans the user from sending a certain type of file until a given date. For example, /banfile doglover05 exe 12/31/9999 sending malware. Using a star (*) in the type argument will ban the user from sending files altogether.
+* /unbanfile username type: Lifts the user's file ban for the given type. If no type is given, all file bans for the user will be lifted.
+* /alert message: Sends a Windows Live style alert message to all online users. For example, /alert The server is about to be shut down for maintenance.
+*   /exit: Shuts down the Thrive Messenger server.
+
+Shift Tabbing once from the command input field will show a list of outputs for the commands you've run.
+
+Those of you familiar with IRC will know that this feature was very much inspired by the concept of server and channel operator commands.
+
+### Sound packs
+
+Sound packs allow you to customise the various sounds Thrive Messenger uses for its events, such as sending and receiving messages, contacts coming online, and logging into the server.
+Thrive Messenger ships with 3 sound packs by default.
+
+* Default: Contains a collection of sounds made by blind UK-based musician Andre Louis.
+* Galaxia: contains the Galaxia sounds used in the [Thrive Mastodon client](https://github.com/G4p-Studios/Thrive).
+* Skype: contains sounds from Skype versions 7 and earlier.
+
+#### Creating sound packs
+
+Structurally, a sound pack is simply a folder with a collection of wave files inside it. To create a sound pack, you will need the following 9 files:
+
+* contact_online
+* contact_offline
+* login
+* logout
+* receive
+* send
+* file_receive
+* file_send
+* file_error
+
+Make a folder inside Thrive Messenger's sounds folder and paste these files into that folder to create your custom sound pack.
+
+#### Changing sound packs
+
+With the Thrive Messenger client open and logged in, follow these steps to change your sound pack.
+
+1. Press Alt + T to access the settings dialog.
+2. Choose a sound pack from the sound pack dropdown menu with the up and down arrow keys.
+3. Either press Enter or click the apply button to apply your settings.
+
+### The client.conf file
+
+The client.conf file controls what server and port the Thrive Messenger client connects to. If you have your own Thrive Messenger server up, or you have one that you like to use, you can simply open client.conf in your text editor of choice, such as Notepad++, and modify the server hostname and port to point to your desired server.
+
+The default server is msg.thecubed.cc, running on port 2005.
+
 * * *
 
 ## Server usage
@@ -198,64 +263,25 @@ To allow your server to send emails, simply add these files to the end of your s
     password=your_password
     ```
 
-## Server side commands
+### File transfer limits
 
-If you see (Admin) beside a contact's online status, it means they are classed as a server admin and can perform server side commands from the client. This is what the aforementioned Use Server Side Commands button is for. Clicking the button will bring up a dialog much like the one that appears when you start a chat with a contact. You will auto focus on the command input field. To run a command, simply type it into the field and press Enter.
+There are 2 config options available for customising file transfer restrictions for users.
 
-Each server side command must start with a forward slash (/). The following server side commands are available.
+* size_limit (bites): files larger than this size cannot be sent. For example, to set the size limit to 2GB, you would do
 
-*   /admin username: Makes the specified user an admin.
-*   /create username password: Creates a user account with the specified username and password.
-*   /del user: Deletes the specified user's Thrive Messenger account from the server.
-*   /ban username date reason: Bans the specified user from Thrive Messenger until the specified date (in MM/DD/YYYY format) for the specified reason. Wanna ban someone permanently? Just do what they do on Xbox Live and ban them until December 31st, 9999! Ha ha ha!
-*   /unban username: Unbans the specified user.
-*   /unadmin username: Removes the specified user's admin so they can't run server side commands anymore.
-* /alert message: Sends a Windows Live style alert message to all online users. For example, /alert The server is about to be shut down for maintenance.
-*   /exit: Shuts down the Thrive Messenger server.
+    ```
+    size_limit=2000000000
+    ```
+.
 
-Shift Tabbing once from the command input field will show a list of outputs for the commands you've run.
+* blackfiles: a comma-separated blacklist of file extensions that are blocked from sending by default. For example:
 
-Those of you familiar with IRC will know that this feature was very much inspired by the concept of server and channel operator commands.
-
-* * *
-
-## The client.conf file
-
-The client.conf file controls what server and port the Thrive Messenger client connects to. If you have your own Thrive Messenger server up, or you have one that you like to use, you can simply open client.conf in your text editor of choice, such as Notepad++, and modify the server hostname and port to point to your desired server.
-
-The default server is msg.thecubed.cc, running on port 2005.
+    ```
+    blackfiles=exe,bat,cmd,app,vbs
+    ```
+.
 
 * * *
-
-## Sound packs
-
-Sound packs allow you to customise the various sounds Thrive Messenger uses for its events, such as sending and receiving messages, contacts coming online, and logging into the server.
-Thrive Messenger ships with 3 sound packs by default.
-
-* Default: Contains a collection of sounds made by blind UK-based musician Andre Louis.
-* Galaxia: contains the Galaxia sounds used in the [Thrive Mastodon client](https://github.com/G4p-Studios/Thrive).
-* Skype: contains sounds from Skype versions 7 and earlier.
-
-### Creating sound packs
-
-Structurally, a sound pack is simply a folder with a collection of wave files inside of it. To create a sound pack, you will need the following 6 files:
-
-* contact_online.wav
-* contact_offline.wav
-* login.wav
-* logout.wav
-* receive.wav
-* send.wav
-
-Make a folder inside Thrive Messenger's sounds folder and paste these files into that folder to create your custom sound pack.
-
-### Changing sound packs
-
-With the Thrive Messenger client open and logged in, follow these steps to change your sound pack.
-
-1. Press Alt + T to access the settings dialog.
-2. Choose a sound pack from the sound pack dropdown menu with the up and down arrow keys.
-3. Either press Enter or click the apply button to apply your settings.
 
 * * *
 

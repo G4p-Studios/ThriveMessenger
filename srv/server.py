@@ -1,4 +1,4 @@
-import sqlite3, threading, socket, json, datetime, sys, configparser, ssl, os
+import sqlite3, threading, socket, json, datetime, sys, configparser, ssl, os, uuid, base64, time
 import smtplib, random, string
 from email.mime.text import MIMEText
 
@@ -7,6 +7,10 @@ ADMIN_FILE = 'admins.txt'
 clients = {}
 lock = threading.Lock()
 smtp_config = {}
+file_config = {}
+shutdown_timeout = 5
+pending_transfers = {}
+transfer_lock = threading.Lock()
 
 class EmailManager:
     @staticmethod
@@ -82,6 +86,13 @@ def load_config():
         'email': config.get('smtp', 'email', fallback=''),
         'password': config.get('smtp', 'password', fallback='')
     }
+    global file_config
+    file_config = {
+        'size_limit': config.getint('server', 'size_limit', fallback=0),
+        'blackfiles': [ext.strip().lower() for ext in config.get('server', 'blackfiles', fallback='').split(',') if ext.strip()],
+    }
+    global shutdown_timeout
+    shutdown_timeout = config.getint('server', 'shutdown_timeout', fallback=5)
     return {
         'port': config.getint('server', 'port', fallback=5005),
         'certfile': config.get('server', 'certfile', fallback='server.crt'),
@@ -102,6 +113,12 @@ def init_db():
     if 'reset_code' not in existing_cols: cur.execute("ALTER TABLE users ADD COLUMN reset_code TEXT")
 
     cur.execute('''CREATE TABLE IF NOT EXISTS contacts (owner TEXT, contact TEXT, blocked INTEGER DEFAULT 0, PRIMARY KEY(owner, contact))''')
+    cur.execute('''CREATE TABLE IF NOT EXISTS file_bans (username TEXT, file_type TEXT, until_date TEXT, reason TEXT, PRIMARY KEY(username, file_type))''')
+    # Add file_type column if table was created with an older schema
+    fb_cols = [row[1] for row in cur.execute("PRAGMA table_info(file_bans)")]
+    if 'file_type' not in fb_cols: cur.execute("ALTER TABLE file_bans ADD COLUMN file_type TEXT")
+    if 'until_date' not in fb_cols: cur.execute("ALTER TABLE file_bans ADD COLUMN until_date TEXT")
+    if 'reason' not in fb_cols: cur.execute("ALTER TABLE file_bans ADD COLUMN reason TEXT")
     conn.commit()
     conn.close()
 
@@ -316,8 +333,17 @@ def handle_client(cs, addr):
                     command = cmd_parts[0].lower() if cmd_parts else ""
                     if command == "exit" and len(cmd_parts) == 1:
                         print(f"Shutdown initiated by admin: {user}")
-                        broadcast_alert("The server is shutting down now.")
+                        broadcast_alert(f"The server is shutting down in {shutdown_timeout} seconds.")
+                        time.sleep(shutdown_timeout)
                         os._exit(0)
+                    elif command == "restart" and len(cmd_parts) == 1:
+                        print(f"Restart initiated by admin: {user}")
+                        broadcast_alert(f"The server is restarting in {shutdown_timeout} seconds.")
+                        response = f"Server is restarting in {shutdown_timeout} seconds..."
+                        try: sock.sendall((json.dumps({"action":"admin_response", "response": response})+"\n").encode())
+                        except: pass
+                        time.sleep(shutdown_timeout)
+                        os.execv(sys.executable, [sys.executable] + sys.argv)
                     elif command == "alert" and len(cmd_parts) >= 2:
                         alert_message = " ".join(cmd_parts[1:])
                         broadcast_alert(alert_message)
@@ -337,10 +363,20 @@ def handle_client(cs, addr):
                     elif command == "admin" and len(cmd_parts) == 2: 
                         add_admin(cmd_parts[1])
                         response = f"User '{cmd_parts[1]}' is now an admin."
-                    elif command == "unadmin" and len(cmd_parts) == 2: 
+                    elif command == "unadmin" and len(cmd_parts) == 2:
                         remove_admin(cmd_parts[1])
                         response = f"User '{cmd_parts[1]}' is no longer an admin."
-                    else: 
+                    elif command == "banfile" and len(cmd_parts) >= 5:
+                        handle_banfile(cmd_parts[1], cmd_parts[2], cmd_parts[3], " ".join(cmd_parts[4:]))
+                        response = f"User '{cmd_parts[1]}' banned from sending '{cmd_parts[2]}' files."
+                    elif command == "unbanfile" and len(cmd_parts) >= 2:
+                        file_type = cmd_parts[2] if len(cmd_parts) >= 3 else None
+                        handle_unbanfile(cmd_parts[1], file_type)
+                        if file_type:
+                            response = f"User '{cmd_parts[1]}' file ban for '{file_type}' removed."
+                        else:
+                            response = f"All file bans for user '{cmd_parts[1]}' removed."
+                    else:
                         response = "Error: Unknown command or incorrect syntax."
                 try: sock.sendall((json.dumps({"action":"admin_response", "response": response})+"\n").encode())
                 except: pass
@@ -367,13 +403,127 @@ def handle_client(cs, addr):
                 if reason: 
                     sock.sendall(json.dumps({"action": "msg_failed", "to": to, "reason": reason}).encode() + b"\n")
                     
+            elif action == "file_offer":
+                to = msg["to"]
+                filename = msg["filename"]
+                size = msg.get("size", 0)
+                file_ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
+
+                # Check if recipient is online
+                with lock: sock_to = clients.get(to)
+                if not sock_to:
+                    sock.sendall((json.dumps({"action": "file_offer_failed", "to": to, "reason": f"{to} is offline."}) + "\n").encode())
+                    continue
+
+                # Check if recipient has blocked sender
+                con = sqlite3.connect(DB)
+                recipient_has_blocked = con.execute("SELECT blocked FROM contacts WHERE owner=? AND contact=?", (to, user)).fetchone()
+                con.close()
+                if recipient_has_blocked and recipient_has_blocked[0] == 1:
+                    sock.sendall((json.dumps({"action": "file_offer_failed", "to": to, "reason": f"{to} has you blocked."}) + "\n").encode())
+                    continue
+
+                # Check server file type blacklist
+                if file_ext in file_config.get('blackfiles', []):
+                    sock.sendall((json.dumps({"action": "file_offer_failed", "to": to, "reason": f"File type '.{file_ext}' is not allowed by the server."}) + "\n").encode())
+                    continue
+
+                # Check server size limit
+                limit = file_config.get('size_limit', 0)
+                if limit > 0 and size > limit:
+                    sock.sendall((json.dumps({"action": "file_offer_failed", "to": to, "reason": f"File exceeds server size limit of {limit} bytes."}) + "\n").encode())
+                    continue
+
+                # Check file bans for this user
+                ban_reason = check_file_ban(user, file_ext)
+                if ban_reason is None and file_ext:
+                    ban_reason = check_file_ban(user, '*')
+                if ban_reason:
+                    sock.sendall((json.dumps({"action": "file_offer_failed", "to": to, "reason": f"You are banned from sending this file type: {ban_reason}"}) + "\n").encode())
+                    continue
+
+                # All checks passed, create transfer and forward offer
+                transfer_id = msg.get("transfer_id", str(uuid.uuid4()))
+                with transfer_lock:
+                    pending_transfers[transfer_id] = {"from": user, "to": to, "filename": filename, "size": size}
+
+                try:
+                    sock_to.sendall((json.dumps({"action": "file_offer", "from": user, "filename": filename, "size": size, "transfer_id": transfer_id}) + "\n").encode())
+                except:
+                    sock.sendall((json.dumps({"action": "file_offer_failed", "to": to, "reason": f"Failed to send offer to {to}."}) + "\n").encode())
+                    with transfer_lock: pending_transfers.pop(transfer_id, None)
+
+            elif action == "file_accept":
+                transfer_id = msg["transfer_id"]
+                with transfer_lock: transfer = pending_transfers.get(transfer_id)
+                if not transfer: continue
+                sender = transfer["from"]
+                with lock: sock_sender = clients.get(sender)
+                if sock_sender:
+                    try: sock_sender.sendall((json.dumps({"action": "file_accepted", "transfer_id": transfer_id, "to": transfer["to"], "filename": transfer["filename"]}) + "\n").encode())
+                    except: pass
+
+            elif action == "file_decline":
+                transfer_id = msg["transfer_id"]
+                with transfer_lock: transfer = pending_transfers.pop(transfer_id, None)
+                if not transfer: continue
+                sender = transfer["from"]
+                with lock: sock_sender = clients.get(sender)
+                if sock_sender:
+                    try: sock_sender.sendall((json.dumps({"action": "file_declined", "transfer_id": transfer_id, "to": transfer["to"], "filename": transfer["filename"]}) + "\n").encode())
+                    except: pass
+
+            elif action == "file_data":
+                transfer_id = msg["transfer_id"]
+                with transfer_lock: transfer = pending_transfers.pop(transfer_id, None)
+                if not transfer: continue
+                recipient = transfer["to"]
+                with lock: sock_to = clients.get(recipient)
+                if sock_to:
+                    try: sock_to.sendall((json.dumps({"action": "file_data", "from": transfer["from"], "filename": transfer["filename"], "data": msg["data"]}) + "\n").encode())
+                    except: pass
+
             elif action == "logout": break
+    except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
+        pass
     finally:
         try: cs.close()
         except: pass
         with lock:
             if user in clients: del clients[user]
         if user: broadcast_contact_status(user, False)
+
+def check_file_ban(username, file_ext):
+    con = sqlite3.connect(DB)
+    row = con.execute("SELECT reason FROM file_bans WHERE username=? AND (file_type=? OR file_type='*') AND (until_date IS NULL OR until_date >= ?)",
+                       (username, file_ext.lower(), datetime.datetime.now().strftime("%Y-%m-%d"))).fetchone()
+    con.close()
+    return row[0] if row else None
+
+def handle_banfile(username, file_type, date_str, reason):
+    try:
+        until_date = datetime.datetime.strptime(date_str, "%m/%d/%Y").strftime("%Y-%m-%d")
+        con = sqlite3.connect(DB)
+        con.execute("INSERT OR REPLACE INTO file_bans(username, file_type, until_date, reason) VALUES(?,?,?,?)",
+                     (username, file_type.lower(), until_date, reason))
+        con.commit()
+        con.close()
+        print(f"User '{username}' banned from sending '{file_type}' files until {until_date}: {reason}")
+    except ValueError: print("Error: Date format must be mm/dd/yyyy")
+    except Exception as e: print(f"An error occurred: {e}")
+
+def handle_unbanfile(username, file_type=None):
+    con = sqlite3.connect(DB)
+    if file_type:
+        con.execute("DELETE FROM file_bans WHERE username=? AND file_type=?", (username, file_type.lower()))
+    else:
+        con.execute("DELETE FROM file_bans WHERE username=?", (username,))
+    con.commit()
+    con.close()
+    if file_type:
+        print(f"User '{username}' file ban for '{file_type}' removed.")
+    else:
+        print(f"All file bans for user '{username}' removed.")
 
 def serve_loop(config):
     context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
@@ -454,25 +604,34 @@ def handle_delete(user):
 
 def run_cli():
     print("Thrive Server Admin Console")
-    print("Available commands: create, ban, unban, del, admin, unadmin, alert, exit")
+    print("Available commands: create, ban, unban, del, admin, unadmin, alert, banfile, unbanfile, restart, exit")
     while True:
         try:
             cmd_line = input("> ").strip()
             parts = cmd_line.split()
             if not parts: continue
             command = parts[0].lower()
-            if command == "exit": 
-                print("Server shutting down by console command.")
+            if command == "exit":
+                broadcast_alert(f"The server is shutting down in {shutdown_timeout} seconds.")
+                print(f"Server shutting down in {shutdown_timeout} seconds...")
+                time.sleep(shutdown_timeout)
                 os._exit(0)
+            elif command == "restart":
+                broadcast_alert(f"The server is restarting in {shutdown_timeout} seconds.")
+                print(f"Server restarting in {shutdown_timeout} seconds...")
+                time.sleep(shutdown_timeout)
+                os.execv(sys.executable, [sys.executable] + sys.argv)
             elif command == "create" and len(parts)==3: handle_create(parts[1], parts[2])
             elif command == "ban" and len(parts)>=4: handle_ban(parts[1], parts[2], " ".join(parts[3:]))
             elif command == "unban" and len(parts)==2: handle_unban(parts[1])
             elif command == "del" and len(parts)==2: handle_delete(parts[1])
             elif command == "admin" and len(parts)==2: add_admin(parts[1])
             elif command == "unadmin" and len(parts)==2: remove_admin(parts[1])
-            elif command == "alert" and len(parts)>=2: 
+            elif command == "alert" and len(parts)>=2:
                 broadcast_alert(" ".join(parts[1:]))
                 print("Alert sent.")
+            elif command == "banfile" and len(parts)>=5: handle_banfile(parts[1], parts[2], parts[3], " ".join(parts[4:]))
+            elif command == "unbanfile" and len(parts)>=2: handle_unbanfile(parts[1], parts[2] if len(parts)>=3 else None)
             else: print(f"Unknown command or wrong number of arguments for: '{command}'")
         except (KeyboardInterrupt, EOFError): 
             print("\nExiting.")
