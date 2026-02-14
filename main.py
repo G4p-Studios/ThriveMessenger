@@ -154,6 +154,7 @@ def save_user_config(settings):
 
 SERVER_CONFIG = load_server_config()
 ADDR = (SERVER_CONFIG['host'], SERVER_CONFIG['port'])
+_IPC_PORT = 48951
 
 class ThriveTaskBarIcon(wx.adv.TaskBarIcon):
     def __init__(self, frame):
@@ -208,6 +209,24 @@ def create_secure_socket():
 
 class ClientApp(wx.App):
     def OnInit(self):
+        self.instance_checker = wx.SingleInstanceChecker("ThriveMessenger-%s" % wx.GetUserId())
+        if self.instance_checker.IsAnotherRunning():
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.connect(('127.0.0.1', _IPC_PORT))
+                s.sendall(b'restore')
+                s.close()
+            except Exception:
+                pass
+            return False
+        try:
+            self._ipc_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self._ipc_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._ipc_sock.bind(('127.0.0.1', _IPC_PORT))
+            self._ipc_sock.listen(1)
+            threading.Thread(target=self._ipc_listener, daemon=True).start()
+        except Exception:
+            self._ipc_sock = None
         self.user_config = load_user_config()
         if self.user_config.get('autologin') and self.user_config.get('username') and self.user_config.get('password'):
             print("Attempting auto-login...")
@@ -216,6 +235,24 @@ class ClientApp(wx.App):
             else: wx.MessageBox(f"Auto-login failed: {reason}", "Login Failed", wx.ICON_ERROR); self.user_config['autologin'] = False; save_user_config(self.user_config)
         return self.show_login_dialog()
     
+    def _ipc_listener(self):
+        while True:
+            try:
+                conn, _ = self._ipc_sock.accept()
+                data = conn.recv(1024)
+                conn.close()
+                if data == b'restore':
+                    wx.CallAfter(self._restore_window)
+            except Exception:
+                break
+
+    def _restore_window(self):
+        if hasattr(self, 'frame') and self.frame:
+            if not self.frame.IsShown():
+                self.frame.restore_from_tray()
+            self.frame.Raise()
+            self.frame.SetFocus()
+
     def show_login_dialog(self):
         while True:
             dlg = LoginDialog(None, self.user_config)
