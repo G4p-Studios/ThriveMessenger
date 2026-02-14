@@ -11,6 +11,8 @@ file_config = {}
 shutdown_timeout = 5
 pending_transfers = {}
 transfer_lock = threading.Lock()
+server_port = 0
+use_ssl = False
 
 class EmailManager:
     @staticmethod
@@ -366,9 +368,19 @@ def handle_client(cs, addr):
                     elif command == "unadmin" and len(cmd_parts) == 2:
                         remove_admin(cmd_parts[1])
                         response = f"User '{cmd_parts[1]}' is no longer an admin."
-                    elif command == "banfile" and len(cmd_parts) >= 5:
-                        handle_banfile(cmd_parts[1], cmd_parts[2], cmd_parts[3], " ".join(cmd_parts[4:]))
-                        response = f"User '{cmd_parts[1]}' banned from sending '{cmd_parts[2]}' files."
+                    elif command == "banfile" and len(cmd_parts) >= 4:
+                        date_str = None
+                        try:
+                            datetime.datetime.strptime(cmd_parts[3], "%m/%d/%Y")
+                            date_str = cmd_parts[3]
+                            reason = " ".join(cmd_parts[4:]) if len(cmd_parts) >= 5 else "No reason given"
+                        except (ValueError, IndexError):
+                            reason = " ".join(cmd_parts[3:])
+                        handle_banfile(cmd_parts[1], cmd_parts[2], date_str, reason)
+                        if date_str:
+                            response = f"User '{cmd_parts[1]}' banned from sending '{cmd_parts[2]}' files until {date_str}."
+                        else:
+                            response = f"User '{cmd_parts[1]}' permanently banned from sending '{cmd_parts[2]}' files."
                     elif command == "unbanfile" and len(cmd_parts) >= 2:
                         file_type = cmd_parts[2] if len(cmd_parts) >= 3 else None
                         handle_unbanfile(cmd_parts[1], file_type)
@@ -381,6 +393,15 @@ def handle_client(cs, addr):
                 try: sock.sendall((json.dumps({"action":"admin_response", "response": response})+"\n").encode())
                 except: pass
                 
+            elif action == "server_info":
+                con = sqlite3.connect(DB)
+                total_users = con.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+                con.close()
+                with lock: online_count = len(clients)
+                info = {"action": "server_info_response", "port": server_port, "ssl": use_ssl, "total_users": total_users, "online_users": online_count, "size_limit": file_config.get('size_limit', 0), "blackfiles": file_config.get('blackfiles', [])}
+                try: sock.sendall((json.dumps(info) + "\n").encode())
+                except: pass
+
             elif action == "msg":
                 to, frm = msg["to"], msg["from"]
                 con = sqlite3.connect(DB)
@@ -502,13 +523,18 @@ def check_file_ban(username, file_ext):
 
 def handle_banfile(username, file_type, date_str, reason):
     try:
-        until_date = datetime.datetime.strptime(date_str, "%m/%d/%Y").strftime("%Y-%m-%d")
+        until_date = None
+        if date_str:
+            until_date = datetime.datetime.strptime(date_str, "%m/%d/%Y").strftime("%Y-%m-%d")
         con = sqlite3.connect(DB)
         con.execute("INSERT OR REPLACE INTO file_bans(username, file_type, until_date, reason) VALUES(?,?,?,?)",
                      (username, file_type.lower(), until_date, reason))
         con.commit()
         con.close()
-        print(f"User '{username}' banned from sending '{file_type}' files until {until_date}: {reason}")
+        if until_date:
+            print(f"User '{username}' banned from sending '{file_type}' files until {until_date}: {reason}")
+        else:
+            print(f"User '{username}' permanently banned from sending '{file_type}' files: {reason}")
     except ValueError: print("Error: Date format must be mm/dd/yyyy")
     except Exception as e: print(f"An error occurred: {e}")
 
@@ -526,6 +552,7 @@ def handle_unbanfile(username, file_type=None):
         print(f"All file bans for user '{username}' removed.")
 
 def serve_loop(config):
+    global use_ssl
     context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
     use_ssl = False
     
@@ -630,7 +657,15 @@ def run_cli():
             elif command == "alert" and len(parts)>=2:
                 broadcast_alert(" ".join(parts[1:]))
                 print("Alert sent.")
-            elif command == "banfile" and len(parts)>=5: handle_banfile(parts[1], parts[2], parts[3], " ".join(parts[4:]))
+            elif command == "banfile" and len(parts)>=4:
+                date_str = None
+                try:
+                    datetime.datetime.strptime(parts[3], "%m/%d/%Y")
+                    date_str = parts[3]
+                    reason = " ".join(parts[4:]) if len(parts) >= 5 else "No reason given"
+                except (ValueError, IndexError):
+                    reason = " ".join(parts[3:])
+                handle_banfile(parts[1], parts[2], date_str, reason)
             elif command == "unbanfile" and len(parts)>=2: handle_unbanfile(parts[1], parts[2] if len(parts)>=3 else None)
             else: print(f"Unknown command or wrong number of arguments for: '{command}'")
         except (KeyboardInterrupt, EOFError): 
@@ -638,7 +673,9 @@ def run_cli():
             os._exit(0)
 
 def main():
+    global server_port
     config = load_config()
+    server_port = config['port']
     init_db()
     threading.Thread(target=serve_loop, args=(config,), daemon=True).start()
     run_cli()

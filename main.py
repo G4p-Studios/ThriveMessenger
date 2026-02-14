@@ -252,6 +252,7 @@ class ClientApp(wx.App):
                 elif act == "add_contact_failed": wx.CallAfter(self.frame.on_add_contact_failed, msg["reason"])
                 elif act == "add_contact_success": wx.CallAfter(self.frame.on_add_contact_success, msg["contact"])
                 elif act == "admin_response": wx.CallAfter(self.frame.on_admin_response, msg["response"])
+                elif act == "server_info_response": wx.CallAfter(self.frame.on_server_info_response, msg)
                 elif act == "admin_status_change": wx.CallAfter(self.frame.on_admin_status_change, msg["user"], msg["is_admin"])
                 elif act == "server_alert": wx.CallAfter(self.frame.on_server_alert, msg["message"])
                 elif act == "file_offer": wx.CallAfter(self.on_file_offer, msg)
@@ -583,6 +584,36 @@ class LoginDialog(wx.Dialog):
         if not u or not p: wx.MessageBox("Username and password cannot be empty.", "Login Error", wx.ICON_ERROR); return
         self.username = u; self.password = p; self.remember_checked = self.remember_cb.IsChecked(); self.autologin_checked = self.autologin_cb.IsChecked(); self.EndModal(wx.ID_OK)
 
+def format_size(size_bytes):
+    if size_bytes <= 0: return "No limit"
+    if size_bytes < 1024: return f"{size_bytes} bytes"
+    elif size_bytes < 1048576: return f"{size_bytes / 1024:.1f} KB"
+    elif size_bytes < 1073741824: return f"{size_bytes / 1048576:.1f} MB"
+    else: return f"{size_bytes / 1073741824:.1f} GB"
+
+class ServerInfoDialog(wx.Dialog):
+    def __init__(self, parent, info):
+        super().__init__(parent, title="Server Information", size=(400, 300))
+        dark_mode_on = is_windows_dark_mode()
+        if dark_mode_on:
+            dark_color = wx.Colour(40, 40, 40); light_text_color = wx.WHITE
+            WxMswDarkMode().enable(self); self.SetBackgroundColour(dark_color)
+        s = wx.BoxSizer(wx.VERTICAL)
+        self.lv = wx.ListCtrl(self, style=wx.LC_REPORT)
+        self.lv.InsertColumn(0, "Property", width=180); self.lv.InsertColumn(1, "Value", width=200)
+        if dark_mode_on:
+            self.lv.SetBackgroundColour(dark_color); self.lv.SetForegroundColour(light_text_color)
+        for prop, val in info:
+            idx = self.lv.GetItemCount(); self.lv.InsertItem(idx, prop); self.lv.SetItem(idx, 1, val)
+        btn = wx.Button(self, wx.ID_OK, label="&Close")
+        if dark_mode_on:
+            btn.SetBackgroundColour(dark_color); btn.SetForegroundColour(light_text_color)
+        s.Add(self.lv, 1, wx.EXPAND | wx.ALL, 5); s.Add(btn, 0, wx.ALIGN_CENTER | wx.ALL, 5); self.SetSizer(s)
+        self.Bind(wx.EVT_CHAR_HOOK, self.on_key)
+    def on_key(self, event):
+        if event.GetKeyCode() == wx.WXK_ESCAPE: self.Close()
+        else: event.Skip()
+
 class MainFrame(wx.Frame):
     def update_contact_status(self, user, online):
         for idx in range(self.lv.GetItemCount()):
@@ -622,23 +653,25 @@ class MainFrame(wx.Frame):
         box_contacts.Add(self.lv, 1, wx.EXPAND|wx.ALL, 5)
         self.btn_block = wx.Button(panel, label="&Block"); self.btn_add = wx.Button(panel, label="&Add Contact"); self.btn_send = wx.Button(panel, label="&Start Chat"); self.btn_delete = wx.Button(panel, label="&Delete Contact")
         self.btn_send_file = wx.Button(panel, label="Send &File")
+        self.btn_info = wx.Button(panel, label="Server &Info")
         self.btn_admin = wx.Button(panel, label="Use Ser&ver Side Commands"); self.btn_settings = wx.Button(panel, label="Se&ttings...")
         self.btn_logout = wx.Button(panel, label="L&ogout"); self.btn_exit = wx.Button(panel, label="E&xit")
         
         if dark_mode_on:
-            buttons = [self.btn_block, self.btn_add, self.btn_send, self.btn_delete, self.btn_send_file, self.btn_admin, self.btn_settings, self.btn_logout, self.btn_exit]
+            buttons = [self.btn_block, self.btn_add, self.btn_send, self.btn_delete, self.btn_send_file, self.btn_info, self.btn_admin, self.btn_settings, self.btn_logout, self.btn_exit]
             for btn in buttons:
                 btn.SetBackgroundColour(dark_color)
                 btn.SetForegroundColour(light_text_color)
                 
         self.btn_block.Bind(wx.EVT_BUTTON, self.on_block_toggle); self.btn_add.Bind(wx.EVT_BUTTON, self.on_add); self.btn_send.Bind(wx.EVT_BUTTON, self.on_send); self.btn_delete.Bind(wx.EVT_BUTTON, self.on_delete)
         self.btn_send_file.Bind(wx.EVT_BUTTON, self.on_send_file)
+        self.btn_info.Bind(wx.EVT_BUTTON, self.on_server_info)
         self.btn_admin.Bind(wx.EVT_BUTTON, self.on_admin); self.btn_settings.Bind(wx.EVT_BUTTON, self.on_settings)
         self.btn_logout.Bind(wx.EVT_BUTTON, self.on_logout); self.btn_exit.Bind(wx.EVT_BUTTON, self.on_exit)
-        accel_entries = [(wx.ACCEL_ALT, ord('B'), self.btn_block.GetId()), (wx.ACCEL_ALT, ord('A'), self.btn_add.GetId()), (wx.ACCEL_ALT, ord('S'), self.btn_send.GetId()), (wx.ACCEL_ALT, ord('D'), self.btn_delete.GetId()), (wx.ACCEL_ALT, ord('F'), self.btn_send_file.GetId()), (wx.ACCEL_ALT, ord('V'), self.btn_admin.GetId()), (wx.ACCEL_ALT, ord('T'), self.btn_settings.GetId()), (wx.ACCEL_ALT, ord('O'), self.btn_logout.GetId()), (wx.ACCEL_ALT, ord('X'), self.btn_exit.GetId()),]
+        accel_entries = [(wx.ACCEL_ALT, ord('B'), self.btn_block.GetId()), (wx.ACCEL_ALT, ord('A'), self.btn_add.GetId()), (wx.ACCEL_ALT, ord('S'), self.btn_send.GetId()), (wx.ACCEL_ALT, ord('D'), self.btn_delete.GetId()), (wx.ACCEL_ALT, ord('F'), self.btn_send_file.GetId()), (wx.ACCEL_ALT, ord('I'), self.btn_info.GetId()), (wx.ACCEL_ALT, ord('V'), self.btn_admin.GetId()), (wx.ACCEL_ALT, ord('T'), self.btn_settings.GetId()), (wx.ACCEL_ALT, ord('O'), self.btn_logout.GetId()), (wx.ACCEL_ALT, ord('X'), self.btn_exit.GetId()),]
         accel_tbl = wx.AcceleratorTable(accel_entries); self.SetAcceleratorTable(accel_tbl)
         gs_main = wx.GridSizer(1, 5, 5, 5); gs_main.Add(self.btn_block, 0, wx.EXPAND); gs_main.Add(self.btn_add, 0, wx.EXPAND); gs_main.Add(self.btn_send, 0, wx.EXPAND); gs_main.Add(self.btn_send_file, 0, wx.EXPAND); gs_main.Add(self.btn_delete, 0, wx.EXPAND)
-        gs_util = wx.GridSizer(1, 4, 5, 5); gs_util.Add(self.btn_admin, 0, wx.EXPAND); gs_util.Add(self.btn_settings, 0, wx.EXPAND); gs_util.Add(self.btn_logout, 0, wx.EXPAND); gs_util.Add(self.btn_exit, 0, wx.EXPAND)
+        gs_util = wx.GridSizer(1, 5, 5, 5); gs_util.Add(self.btn_info, 0, wx.EXPAND); gs_util.Add(self.btn_admin, 0, wx.EXPAND); gs_util.Add(self.btn_settings, 0, wx.EXPAND); gs_util.Add(self.btn_logout, 0, wx.EXPAND); gs_util.Add(self.btn_exit, 0, wx.EXPAND)
         s = wx.BoxSizer(wx.VERTICAL); s.Add(box_contacts, 1, wx.EXPAND|wx.ALL, 5); s.Add(gs_main, 0, wx.CENTER|wx.ALL, 5); s.Add(gs_util, 0, wx.CENTER|wx.ALL, 5); panel.SetSizer(s)
         self.update_button_states()
     def on_settings(self, event):
@@ -647,6 +680,16 @@ class MainFrame(wx.Frame):
             if dlg.ShowModal() == wx.ID_OK:
                 selected_pack = dlg.choice.GetStringSelection(); app.user_config['soundpack'] = selected_pack; save_user_config(app.user_config)
                 wx.MessageBox("Settings have been applied.", "Settings Saved", wx.OK | wx.ICON_INFORMATION)
+    def on_server_info(self, _):
+        self.sock.sendall(json.dumps({"action": "server_info"}).encode() + b"\n")
+    def on_server_info_response(self, msg):
+        encrypted = isinstance(self.sock, ssl.SSLSocket)
+        size_limit = msg.get("size_limit", 0)
+        size_str = format_size(size_limit) if size_limit > 0 else "No limit"
+        blackfiles = msg.get("blackfiles", [])
+        blackfiles_str = ", ".join(f".{ext}" for ext in blackfiles) if blackfiles else "None"
+        info = [("Hostname", SERVER_CONFIG['host']), ("Port", str(msg.get("port", SERVER_CONFIG['port']))), ("Encrypted", "Yes" if encrypted else "No"), ("Registered Users", str(msg.get("total_users", "N/A"))), ("Users Online", str(msg.get("online_users", "N/A"))), ("File Size Limit", size_str), ("Blacklisted Extensions", blackfiles_str)]
+        with ServerInfoDialog(self, info) as dlg: dlg.ShowModal()
     def update_button_states(self, event=None):
         is_selection = self.lv.GetSelectedItemCount() > 0
         self.btn_send.Enable(is_selection); self.btn_delete.Enable(is_selection); self.btn_block.Enable(is_selection); self.btn_send_file.Enable(is_selection)

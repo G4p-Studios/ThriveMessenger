@@ -115,7 +115,7 @@ You can start an IM conversation with a contact simply by pressing Enter on them
 
 ### File transfer
 
-As well as sending standard text messages, users can also send files to each other. To send a file, simply highlight the contact you want to send the file to and press Alt + F or click the send file button. A dialog will open where you can choose the file you wish to send. Once you choose your file, the receiving user will get a pop-up message asking if they want to accept the file. Your file will begin sending as soon as the receiver hits yes.
+As well as sending standard text messages, users can also send files to each other. To send a file, simply highlight the contact you want to send the file to and press Alt + F or click the send file button. A dialog will open where you can choose the file you wish to send. Once you choose your file, the receiving user will get a pop-up message asking if they want to accept the file. Your file will begin sending as soon as the receiver hits yes. Received files are stored in Documents/ThriveMessenger/files.
 Note: server owners might place file size limits and certain file type restrictions on users; see below on how to do this yourself.
 
 ### Server side commands
@@ -130,7 +130,7 @@ Each server side command must start with a forward slash (/). The following serv
 *   /del user: deletes the specified user's account from the server.
 *   /ban username date reason: bans the specified user from the server until the specified date (in MM/DD/YYYY format) for the specified reason. Wanna ban someone permanently? Just do what they do on Xbox Live and ban them until December 31st, 9999! Ha ha ha!
 *   /unban username: Unbans the specified user.
-* /banfile username type date reason: bans the user from sending a certain type of file until a given date. For example, /banfile doglover05 exe 12/31/9999 sending malware. Using a star (*) in the type argument will ban the user from sending files altogether.
+* /banfile username type date reason: bans the user from sending a certain type of file until a given date. For example, /banfile doglover05 exe 12/31/9999 sending malware. Using a star (*) in the type argument will ban the user from sending files altogether. Using the command without a date will result in a permanent file ban.
 * /unbanfile username type: Lifts the user's file ban for the given type. If no type is given, all file bans for the user will be lifted.
 * /alert message: Sends a Windows Live style alert message to all online users. For example, /alert The server is about to be shut down for maintenance.
 *   /exit: Shuts down the Thrive Messenger server.
