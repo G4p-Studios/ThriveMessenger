@@ -363,22 +363,27 @@ class ClientApp(wx.App):
         if not result: self.ExitMainLoop()
 
     def on_file_offer(self, msg):
-        sender = msg["from"]; filename = msg["filename"]; size = msg["size"]; transfer_id = msg["transfer_id"]
-        if size < 1024: size_str = f"{size} bytes"
-        elif size < 1048576: size_str = f"{size / 1024:.1f} KB"
-        else: size_str = f"{size / 1048576:.1f} MB"
+        sender = msg["from"]; files = msg["files"]; transfer_id = msg["transfer_id"]
         self.play_sound("file_receive.wav")
         parent = self.frame.get_chat(sender) or self.frame
-        result = wx.MessageBox(f"{sender} wants to send you a file:\n\n{filename} ({size_str})\n\nDo you want to accept?",
-                               "File Transfer Request", wx.YES_NO | wx.ICON_QUESTION, parent)
+        if len(files) == 1:
+            f = files[0]; size = f.get("size", 0)
+            prompt = f"{sender} wants to send you a file:\n\n{f['filename']} ({format_size(size)})\n\nDo you want to accept?"
+        else:
+            total_size = sum(f.get("size", 0) for f in files)
+            file_list = "\n".join(f"  {f['filename']} ({format_size(f.get('size', 0))})" for f in files)
+            prompt = f"{sender} wants to send you {len(files)} files ({format_size(total_size)} total):\n\n{file_list}\n\nDo you want to accept?"
+        result = wx.MessageBox(prompt, "File Transfer Request", wx.YES_NO | wx.ICON_QUESTION, parent)
         if result == wx.YES:
             self.sock.sendall((json.dumps({"action": "file_accept", "transfer_id": transfer_id}) + "\n").encode())
             chat = self.frame.get_chat(sender)
-            if chat: chat.append(f"Accepting file: {filename}...", "System", datetime.datetime.now().isoformat())
+            if chat:
+                names = ", ".join(f["filename"] for f in files)
+                chat.append(f"Accepting {len(files)} file(s): {names}...", "System", datetime.datetime.now().isoformat())
         else:
             self.sock.sendall((json.dumps({"action": "file_decline", "transfer_id": transfer_id}) + "\n").encode())
             chat = self.frame.get_chat(sender)
-            if chat: chat.append(f"Declined file: {filename}", "System", datetime.datetime.now().isoformat())
+            if chat: chat.append(f"Declined {len(files)} file(s) from {sender}", "System", datetime.datetime.now().isoformat())
 
     def on_file_offer_failed(self, msg):
         self.play_sound("file_error.wav")
@@ -388,79 +393,97 @@ class ClientApp(wx.App):
         else: wx.MessageBox(f"File transfer failed: {reason}", "File Transfer Error", wx.ICON_ERROR)
 
     def on_file_accepted(self, msg):
-        transfer_id = msg["transfer_id"]; to = msg["to"]; filename = msg["filename"]
-        file_path = self.pending_file_paths.pop(transfer_id, None)
-        if not file_path:
+        transfer_id = msg["transfer_id"]; to = msg["to"]; files_info = msg["files"]
+        file_paths = self.pending_file_paths.pop(transfer_id, None)
+        if not file_paths:
             chat = self.frame.get_chat(to)
-            if chat: chat.append_error("File transfer error: file no longer available.")
+            if chat: chat.append_error("File transfer error: files no longer available.")
             return
         def _send():
             try:
-                with open(file_path, 'rb') as f: file_data = base64.b64encode(f.read()).decode('ascii')
-                self.sock.sendall((json.dumps({"action": "file_data", "transfer_id": transfer_id, "to": to, "filename": filename, "data": file_data}) + "\n").encode())
-                wx.CallAfter(self._on_file_sent, to, filename)
+                files_data = []
+                for fp in file_paths:
+                    with open(fp, 'rb') as f: files_data.append({"filename": os.path.basename(fp), "data": base64.b64encode(f.read()).decode('ascii')})
+                self.sock.sendall((json.dumps({"action": "file_data", "transfer_id": transfer_id, "to": to, "files": files_data}) + "\n").encode())
+                names = [os.path.basename(fp) for fp in file_paths]
+                wx.CallAfter(self._on_files_sent, to, names)
             except Exception as e:
                 wx.CallAfter(self._on_file_send_error, to, e)
         threading.Thread(target=_send, daemon=True).start()
 
-    def _on_file_sent(self, to, filename):
+    def _on_files_sent(self, to, filenames):
         self.play_sound("file_send.wav")
         chat = self.frame.get_chat(to)
-        if chat: chat.append(f"File sent: {filename}", "System", datetime.datetime.now().isoformat())
+        if chat:
+            names = ", ".join(filenames)
+            chat.append(f"{len(filenames)} file(s) sent: {names}", "System", datetime.datetime.now().isoformat())
 
     def _on_file_send_error(self, to, error):
         self.play_sound("file_error.wav")
         chat = self.frame.get_chat(to)
-        if chat: chat.append_error(f"Failed to send file: {error}")
+        if chat: chat.append_error(f"Failed to send file(s): {error}")
 
     def on_file_declined(self, msg):
-        transfer_id = msg["transfer_id"]; to = msg["to"]; filename = msg["filename"]
+        transfer_id = msg["transfer_id"]; to = msg["to"]; files = msg["files"]
         self.pending_file_paths.pop(transfer_id, None)
         self.play_sound("file_error.wav")
+        names = ", ".join(f["filename"] for f in files)
         chat = self.frame.get_chat(to)
-        if chat: chat.append(f"{to} declined your file: {filename}", "System", datetime.datetime.now().isoformat())
-        else: wx.MessageBox(f"{to} declined your file: {filename}", "File Declined", wx.ICON_INFORMATION)
+        if chat: chat.append(f"{to} declined your file(s): {names}", "System", datetime.datetime.now().isoformat())
+        else: wx.MessageBox(f"{to} declined your file(s): {names}", "File Declined", wx.ICON_INFORMATION)
 
     def on_file_data(self, msg):
-        sender = msg["from"]; filename = msg["filename"]; data = msg["data"]
-        try:
-            docs_path = os.path.join(os.path.expanduser('~'), 'Documents')
-            save_dir = os.path.join(docs_path, 'ThriveMessenger', 'files')
-            os.makedirs(save_dir, exist_ok=True)
-            save_path = os.path.join(save_dir, filename)
-            # Handle duplicate filenames
-            if os.path.exists(save_path):
-                name, ext = os.path.splitext(filename)
-                counter = 1
-                while os.path.exists(save_path):
-                    save_path = os.path.join(save_dir, f"{name} ({counter}){ext}")
-                    counter += 1
-            with open(save_path, 'wb') as f: f.write(base64.b64decode(data))
+        sender = msg["from"]; files = msg["files"]
+        docs_path = os.path.join(os.path.expanduser('~'), 'Documents')
+        save_dir = os.path.join(docs_path, 'ThriveMessenger', 'files')
+        os.makedirs(save_dir, exist_ok=True)
+        saved = []
+        for finfo in files:
+            filename = finfo["filename"]; data = finfo["data"]
+            try:
+                save_path = os.path.join(save_dir, filename)
+                if os.path.exists(save_path):
+                    name, ext = os.path.splitext(filename)
+                    counter = 1
+                    while os.path.exists(save_path):
+                        save_path = os.path.join(save_dir, f"{name} ({counter}){ext}")
+                        counter += 1
+                with open(save_path, 'wb') as f: f.write(base64.b64decode(data))
+                saved.append(os.path.basename(save_path))
+            except Exception as e:
+                self.play_sound("file_error.wav")
+                chat = self.frame.get_chat(sender)
+                if chat: chat.append_error(f"Failed to save file '{filename}': {e}")
+        if saved:
             self.play_sound("file_receive.wav")
             chat = self.frame.get_chat(sender)
-            if chat: chat.append(f"File received and saved: {os.path.basename(save_path)}", "System", datetime.datetime.now().isoformat())
+            names = ", ".join(saved)
+            if chat: chat.append(f"{len(saved)} file(s) received and saved: {names}", "System", datetime.datetime.now().isoformat())
             else:
-                try: notification.notify("File Received", f"{sender} sent you: {filename}", timeout=5)
+                try: notification.notify("Files Received", f"{sender} sent you {len(saved)} file(s)", timeout=5)
                 except: pass
-        except Exception as e:
-            self.play_sound("file_error.wav")
-            chat = self.frame.get_chat(sender)
-            if chat: chat.append_error(f"Failed to save file: {e}")
 
     def send_file_to(self, contact, parent=None):
         if parent is None: parent = self.frame.get_chat(contact) or self.frame
-        with wx.FileDialog(parent, "Choose a file to send", wildcard="All files (*.*)|*.*", style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST) as dlg:
+        with wx.FileDialog(parent, "Choose file(s) to send", wildcard="All files (*.*)|*.*", style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST | wx.FD_MULTIPLE) as dlg:
             if dlg.ShowModal() == wx.ID_CANCEL: return
-            file_path = dlg.GetPath()
-        filename = os.path.basename(file_path)
-        try: size = os.path.getsize(file_path)
-        except OSError as e:
-            wx.MessageBox(f"Cannot read file: {e}", "File Error", wx.ICON_ERROR); return
+            file_paths = dlg.GetPaths()
+        files = []; valid_paths = []
+        for file_path in file_paths:
+            filename = os.path.basename(file_path)
+            try: size = os.path.getsize(file_path)
+            except OSError as e:
+                wx.MessageBox(f"Cannot read file '{filename}': {e}", "File Error", wx.ICON_ERROR); continue
+            files.append({"filename": filename, "size": size})
+            valid_paths.append(file_path)
+        if not files: return
         transfer_id = str(uuid.uuid4())
-        self.pending_file_paths[transfer_id] = file_path
-        self.sock.sendall((json.dumps({"action": "file_offer", "to": contact, "filename": filename, "size": size, "transfer_id": transfer_id}) + "\n").encode())
+        self.pending_file_paths[transfer_id] = valid_paths
+        self.sock.sendall((json.dumps({"action": "file_offer", "to": contact, "files": files, "transfer_id": transfer_id}) + "\n").encode())
         chat = self.frame.get_chat(contact)
-        if chat: chat.append(f"Sending file offer: {filename} ({size} bytes)...", "System", datetime.datetime.now().isoformat())
+        if chat:
+            names = ", ".join(f["filename"] for f in files)
+            chat.append(f"Sending file offer ({len(files)} file(s)): {names}...", "System", datetime.datetime.now().isoformat())
 
 class VerificationDialog(wx.Dialog):
     def __init__(self, parent, username):

@@ -426,9 +426,7 @@ def handle_client(cs, addr):
                     
             elif action == "file_offer":
                 to = msg["to"]
-                filename = msg["filename"]
-                size = msg.get("size", 0)
-                file_ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
+                files = msg.get("files", [])
 
                 # Check if recipient is online
                 with lock: sock_to = clients.get(to)
@@ -444,32 +442,35 @@ def handle_client(cs, addr):
                     sock.sendall((json.dumps({"action": "file_offer_failed", "to": to, "reason": f"{to} has you blocked."}) + "\n").encode())
                     continue
 
-                # Check server file type blacklist
-                if file_ext in file_config.get('blackfiles', []):
-                    sock.sendall((json.dumps({"action": "file_offer_failed", "to": to, "reason": f"File type '.{file_ext}' is not allowed by the server."}) + "\n").encode())
-                    continue
-
-                # Check server size limit
+                # Check each file against server rules
                 limit = file_config.get('size_limit', 0)
-                if limit > 0 and size > limit:
-                    sock.sendall((json.dumps({"action": "file_offer_failed", "to": to, "reason": f"File exceeds server size limit of {limit} bytes."}) + "\n").encode())
-                    continue
-
-                # Check file bans for this user
-                ban_reason = check_file_ban(user, file_ext)
-                if ban_reason is None and file_ext:
-                    ban_reason = check_file_ban(user, '*')
-                if ban_reason:
-                    sock.sendall((json.dumps({"action": "file_offer_failed", "to": to, "reason": f"You are banned from sending this file type: {ban_reason}"}) + "\n").encode())
-                    continue
+                blackfiles = file_config.get('blackfiles', [])
+                blocked = False
+                for finfo in files:
+                    fname = finfo["filename"]
+                    fsize = finfo.get("size", 0)
+                    file_ext = fname.rsplit('.', 1)[-1].lower() if '.' in fname else ''
+                    if file_ext in blackfiles:
+                        sock.sendall((json.dumps({"action": "file_offer_failed", "to": to, "reason": f"File type '.{file_ext}' is not allowed by the server."}) + "\n").encode())
+                        blocked = True; break
+                    if limit > 0 and fsize > limit:
+                        sock.sendall((json.dumps({"action": "file_offer_failed", "to": to, "reason": f"File '{fname}' exceeds server size limit of {limit} bytes."}) + "\n").encode())
+                        blocked = True; break
+                    ban_reason = check_file_ban(user, file_ext)
+                    if ban_reason is None and file_ext:
+                        ban_reason = check_file_ban(user, '*')
+                    if ban_reason:
+                        sock.sendall((json.dumps({"action": "file_offer_failed", "to": to, "reason": f"You are banned from sending '{fname}': {ban_reason}"}) + "\n").encode())
+                        blocked = True; break
+                if blocked: continue
 
                 # All checks passed, create transfer and forward offer
                 transfer_id = msg.get("transfer_id", str(uuid.uuid4()))
                 with transfer_lock:
-                    pending_transfers[transfer_id] = {"from": user, "to": to, "filename": filename, "size": size}
+                    pending_transfers[transfer_id] = {"from": user, "to": to, "files": files}
 
                 try:
-                    sock_to.sendall((json.dumps({"action": "file_offer", "from": user, "filename": filename, "size": size, "transfer_id": transfer_id}) + "\n").encode())
+                    sock_to.sendall((json.dumps({"action": "file_offer", "from": user, "files": files, "transfer_id": transfer_id}) + "\n").encode())
                 except:
                     sock.sendall((json.dumps({"action": "file_offer_failed", "to": to, "reason": f"Failed to send offer to {to}."}) + "\n").encode())
                     with transfer_lock: pending_transfers.pop(transfer_id, None)
@@ -481,7 +482,7 @@ def handle_client(cs, addr):
                 sender = transfer["from"]
                 with lock: sock_sender = clients.get(sender)
                 if sock_sender:
-                    try: sock_sender.sendall((json.dumps({"action": "file_accepted", "transfer_id": transfer_id, "to": transfer["to"], "filename": transfer["filename"]}) + "\n").encode())
+                    try: sock_sender.sendall((json.dumps({"action": "file_accepted", "transfer_id": transfer_id, "to": transfer["to"], "files": transfer["files"]}) + "\n").encode())
                     except: pass
 
             elif action == "file_decline":
@@ -491,7 +492,7 @@ def handle_client(cs, addr):
                 sender = transfer["from"]
                 with lock: sock_sender = clients.get(sender)
                 if sock_sender:
-                    try: sock_sender.sendall((json.dumps({"action": "file_declined", "transfer_id": transfer_id, "to": transfer["to"], "filename": transfer["filename"]}) + "\n").encode())
+                    try: sock_sender.sendall((json.dumps({"action": "file_declined", "transfer_id": transfer_id, "to": transfer["to"], "files": transfer["files"]}) + "\n").encode())
                     except: pass
 
             elif action == "file_data":
@@ -501,7 +502,7 @@ def handle_client(cs, addr):
                 recipient = transfer["to"]
                 with lock: sock_to = clients.get(recipient)
                 if sock_to:
-                    try: sock_to.sendall((json.dumps({"action": "file_data", "from": transfer["from"], "filename": transfer["filename"], "data": msg["data"]}) + "\n").encode())
+                    try: sock_to.sendall((json.dumps({"action": "file_data", "from": transfer["from"], "files": msg["files"]}) + "\n").encode())
                     except: pass
 
             elif action == "logout": break

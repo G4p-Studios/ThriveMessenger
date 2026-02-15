@@ -3,7 +3,7 @@
 ; Non-commercial use only
 
 #define MyAppName "Thrive Messenger"
-#define MyAppVersion "2026 Alpha 11.2"
+#define MyAppVersion "2026 Alpha 12"
 #define MyAppPublisher "G4p Studios"
 #define MyAppURL "https://github.com/G4p-Studios/ThriveMessenger"
 #define MyAppExeName "tmsg.exe"
