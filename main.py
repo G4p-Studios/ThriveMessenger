@@ -215,7 +215,7 @@ STATUS_PRESETS = ["online", "offline", "busy", "away", "on the phone", "doing ho
 
 class StatusDialog(wx.Dialog):
     def __init__(self, parent, current_status="online"):
-        super().__init__(parent, title="Set Status", size=(350, 180))
+        super().__init__(parent, title="Set Status")
         self.panel = panel = wx.Panel(self); self.sizer = s = wx.BoxSizer(wx.VERTICAL)
         self.dark_mode_on = is_windows_dark_mode()
         if self.dark_mode_on:
@@ -245,14 +245,17 @@ class StatusDialog(wx.Dialog):
             cancel_btn.SetBackgroundColour(self.dark_color); cancel_btn.SetForegroundColour(self.light_text_color)
         btn_sizer.AddButton(ok_btn); btn_sizer.AddButton(cancel_btn); btn_sizer.Realize()
         s.Add(btn_sizer, 0, wx.ALIGN_CENTER | wx.ALL, 10); panel.SetSizer(s)
-        if not is_custom: self.sizer.Hide(self.custom_box); self.panel.Layout(); self.Fit()
+        if not is_custom: self.sizer.Hide(self.custom_box)
+        self.panel.Layout()
+        self.SetSize((350, 220 if is_custom else 150))
     def _on_choice(self, event):
         sel = self.choice.GetStringSelection()
         if sel == "Custom...":
-            self.status_text.SetValue(""); self.sizer.Show(self.custom_box); self.panel.Layout(); self.Fit()
-            self.status_text.SetFocus()
+            self.status_text.SetValue(""); self.sizer.Show(self.custom_box); self.panel.Layout()
+            self.SetSize((350, 220)); self.status_text.SetFocus()
         else:
-            self.status_text.SetValue(sel); self.sizer.Hide(self.custom_box); self.panel.Layout(); self.Fit()
+            self.status_text.SetValue(sel); self.sizer.Hide(self.custom_box); self.panel.Layout()
+            self.SetSize((350, 150))
 
 def create_secure_socket():
     sock = socket.create_connection(ADDR)
