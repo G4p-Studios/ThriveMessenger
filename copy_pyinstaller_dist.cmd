@@ -1,5 +1,5 @@
 @echo off
-robocopy sounds\default dist\tmsg\sounds\default /E
-robocopy sounds\galaxia dist\tmsg\sounds\galaxia /E
-robocopy sounds\skype dist\tmsg\sounds\skype /E
-copy client.conf dist\tmsg
+robocopy sounds\default dist\thrive_messenger\sounds\default /E
+robocopy sounds\galaxia dist\thrive_messenger\sounds\galaxia /E
+robocopy sounds\skype dist\thrive_messenger\sounds\skype /E
+copy client.conf dist\thrive_messenger

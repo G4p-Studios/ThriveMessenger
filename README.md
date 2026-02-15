@@ -98,7 +98,7 @@ Logging into your Thrive Messenger account is as simple as logging into your com
 
 ### The Thrive Messenger UI
 
-When you log into Thrive Messenger, you will land on your contact list. Of course, if your account is brand new, you won't have any contacts to chat with. This list view will show you the name of each contact, as well as their online status, either online or offline. You can navigate your contact list with the up and down arrow keys. Using the Tab key will allow you to navigate the rest of the UI.
+When you log into Thrive Messenger, you will land on your contact list. Of course, if your account is brand new, you won't have any contacts to chat with. This list view will show you the name of each contact, as well as their online status. You can navigate your contact list with the up and down arrow keys. Using the Tab key will allow you to navigate the rest of the UI.
 
 *   The block button, accessible with Alt + B, lets you block the focused contact in the list so they can't message you. This is useful if they are being spammy or abusive.
 *   The add Contact button, Alt + A, will let you add a new contact. Simply click this button, enter the username of the contact you wish to add, then press Enter.
@@ -108,8 +108,8 @@ When you log into Thrive Messenger, you will land on your contact list. Of cours
 *   The Use Server Side Commands (Alt + V) button will allow you to perform various server side commands; more on these later.
 *   The logout (Alt + O) and exit (Alt + X) buttons are self explanatory.
 * The server info button (Alt + I) will show information about the server you're currently logged into.
-
-Pressing Alt F4 will minimize the client to the system tray, ready for you to receive messages. Simply double click or press Enter on the Thrive Messenger system tray item to bring it back up.
+* Alt + U will allow you to set an online status that your contacts will see. You can choose from a list of preset statuses, such as online, offline and busy, or you can choose a custom one and type a personal message. Server owners can customize the character limit for custom statuses via max_status_length, so check that you have enough characters before you start setting System of a Down lyrics as your status.
+* Pressing Alt F4 will minimize the client to the system tray, ready for you to receive messages. Simply double click or press Enter on the Thrive Messenger system tray item to bring it back up.
 
 ### Sending and receiving messages
 

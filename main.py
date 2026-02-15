@@ -1,6 +1,19 @@
 import wx, socket, json, threading, datetime, wx.adv, configparser, ssl, sys, os, base64, uuid
 import keyring
-from plyer import notification
+if sys.platform == 'win32':
+    from winotify import Notification as _WinNotification
+else:
+    from plyer import notification as _plyer_notification
+
+def show_notification(title, message, timeout=5):
+    try:
+        if sys.platform == 'win32':
+            toast = _WinNotification(app_id="Thrive Messenger", title=title, msg=message, duration="short")
+            toast.show()
+        else:
+            _plyer_notification.notify(title, message, timeout=timeout)
+    except Exception as e:
+        print(f"Error showing notification: {e}")
 
 # --- Dark Mode for MSW ---
 try:
@@ -45,6 +58,10 @@ except (ImportError, ModuleNotFoundError):
         def enable(self, window: wx.Window, enable: bool = True): return False
     def is_windows_dark_mode(): return False
 # --- End of Dark Mode Logic ---
+
+if sys.platform == 'win32':
+    try: ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('Thrive.Thrive_Messenger')
+    except Exception: pass
 
 def load_server_config():
     # Now reading connection details from client.conf instead of srv.conf
@@ -194,6 +211,49 @@ class SettingsDialog(wx.Dialog):
             
         btn_sizer.AddButton(ok_btn); btn_sizer.AddButton(cancel_btn); btn_sizer.Realize(); main_sizer.Add(btn_sizer, 0, wx.ALIGN_CENTER | wx.ALL, 10); panel.SetSizer(main_sizer)
 
+STATUS_PRESETS = ["online", "offline", "busy", "away", "on the phone", "doing homework", "in the shower", "watching TV", "hiding from the parents", "fixing my PC", "battery about to die"]
+
+class StatusDialog(wx.Dialog):
+    def __init__(self, parent, current_status="online"):
+        super().__init__(parent, title="Set Status", size=(350, 180))
+        self.panel = panel = wx.Panel(self); self.sizer = s = wx.BoxSizer(wx.VERTICAL)
+        self.dark_mode_on = is_windows_dark_mode()
+        if self.dark_mode_on:
+            self.dark_color = wx.Colour(40, 40, 40); self.light_text_color = wx.WHITE
+            WxMswDarkMode().enable(self); self.SetBackgroundColour(self.dark_color); panel.SetBackgroundColour(self.dark_color)
+        status_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "&Preset")
+        self.choice = wx.Choice(status_box.GetStaticBox(), choices=STATUS_PRESETS + ["Custom..."])
+        is_custom = current_status not in STATUS_PRESETS
+        if is_custom: self.choice.SetStringSelection("Custom...")
+        else: self.choice.SetStringSelection(current_status)
+        status_box.Add(self.choice, 0, wx.EXPAND | wx.ALL, 5)
+        self.custom_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "S&tatus Text")
+        self.status_text = wx.TextCtrl(self.custom_box.GetStaticBox())
+        self.status_text.SetValue(current_status if is_custom else "")
+        self.custom_box.Add(self.status_text, 0, wx.EXPAND | wx.ALL, 5)
+        self.choice.Bind(wx.EVT_CHOICE, self._on_choice)
+        s.Add(status_box, 0, wx.EXPAND | wx.ALL, 5); s.Add(self.custom_box, 0, wx.EXPAND | wx.ALL, 5)
+        btn_sizer = wx.StdDialogButtonSizer()
+        ok_btn = wx.Button(panel, wx.ID_OK, label="&Apply"); ok_btn.SetDefault()
+        cancel_btn = wx.Button(panel, wx.ID_CANCEL)
+        if self.dark_mode_on:
+            for box in [status_box, self.custom_box]:
+                box.GetStaticBox().SetForegroundColour(self.light_text_color); box.GetStaticBox().SetBackgroundColour(self.dark_color)
+            self.choice.SetBackgroundColour(self.dark_color); self.choice.SetForegroundColour(self.light_text_color)
+            self.status_text.SetBackgroundColour(self.dark_color); self.status_text.SetForegroundColour(self.light_text_color)
+            ok_btn.SetBackgroundColour(self.dark_color); ok_btn.SetForegroundColour(self.light_text_color)
+            cancel_btn.SetBackgroundColour(self.dark_color); cancel_btn.SetForegroundColour(self.light_text_color)
+        btn_sizer.AddButton(ok_btn); btn_sizer.AddButton(cancel_btn); btn_sizer.Realize()
+        s.Add(btn_sizer, 0, wx.ALIGN_CENTER | wx.ALL, 10); panel.SetSizer(s)
+        if not is_custom: self.sizer.Hide(self.custom_box); self.panel.Layout(); self.Fit()
+    def _on_choice(self, event):
+        sel = self.choice.GetStringSelection()
+        if sel == "Custom...":
+            self.status_text.SetValue(""); self.sizer.Show(self.custom_box); self.panel.Layout(); self.Fit()
+            self.status_text.SetFocus()
+        else:
+            self.status_text.SetValue(sel); self.sizer.Hide(self.custom_box); self.panel.Layout(); self.Fit()
+
 def create_secure_socket():
     sock = socket.create_connection(ADDR)
     if SERVER_CONFIG['cafile'] and os.path.exists(SERVER_CONFIG['cafile']):
@@ -316,7 +376,7 @@ class ClientApp(wx.App):
             for line in self.sockfile:
                 msg = json.loads(line); act = msg.get("action")
                 if act == "contact_list": wx.CallAfter(self.frame.load_contacts, msg["contacts"])
-                elif act == "contact_status": wx.CallAfter(self.frame.update_contact_status, msg["user"], msg["online"])
+                elif act == "contact_status": wx.CallAfter(self.frame.update_contact_status, msg["user"], msg["online"], msg.get("status_text"))
                 elif act == "msg": wx.CallAfter(self.frame.receive_message, msg)
                 elif act == "msg_failed": wx.CallAfter(self.frame.on_message_failed, msg["to"], msg["reason"])
                 elif act == "add_contact_failed": wx.CallAfter(self.frame.on_add_contact_failed, msg["reason"])
@@ -460,8 +520,7 @@ class ClientApp(wx.App):
             names = ", ".join(saved)
             if chat: chat.append(f"{len(saved)} file(s) received and saved: {names}", "System", datetime.datetime.now().isoformat())
             else:
-                try: notification.notify("Files Received", f"{sender} sent you {len(saved)} file(s)", timeout=5)
-                except: pass
+                show_notification("Files Received", f"{sender} sent you {len(saved)} file(s)")
 
     def send_file_to(self, contact, parent=None):
         if parent is None: parent = self.frame.get_chat(contact) or self.frame
@@ -708,36 +767,37 @@ class ServerInfoDialog(wx.Dialog):
         else: event.Skip()
 
 class MainFrame(wx.Frame):
-    def update_contact_status(self, user, online):
+    def update_contact_status(self, user, online, status_text=None):
         for idx in range(self.lv.GetItemCount()):
             if self.lv.GetItemText(idx) == user:
+                was_online = self.lv.GetItemText(idx, 1) != "offline"
                 current_status = self.lv.GetItemText(idx, 1); is_admin = "(Admin)" in current_status
-                new_status = "online" if online else "offline"
+                new_status = status_text if status_text else ("online" if online else "offline")
+                if not online: new_status = "offline"
                 if is_admin: new_status += " (Admin)"
                 self.lv.SetItem(idx, 1, new_status)
-                if online:
+                if online and not was_online:
                     wx.GetApp().play_sound("contact_online.wav")
-                    try: notification.notify("Contact online", f"{user} has come online.", timeout=5)
-                    except Exception as e: print(f"Error showing notification: {e}")
-                else:
+                    show_notification("Contact online", f"{user} has come online.")
+                elif not online and was_online:
                     wx.GetApp().play_sound("contact_offline.wav")
-                    try: notification.notify("Contact offline", f"{user} has gone offline.", timeout=5)
-                    except Exception as e: print(f"Error showing notification: {e}")
+                    show_notification("Contact offline", f"{user} has gone offline.")
                 break
 
     def __init__(self, user, sock):
         super().__init__(None, title=f"Thrive Messenger – {user}", size=(400,380)); self.user, self.sock = user, sock; self.task_bar_icon = None; self.is_exiting = False
+        self.current_status = "online"
         self.notifications = []; self.Bind(wx.EVT_CLOSE, self.on_close_window); panel = wx.Panel(self)
-        
+
         dark_mode_on = is_windows_dark_mode()
         if dark_mode_on:
             dark_color = wx.Colour(40, 40, 40); light_text_color = wx.WHITE
             WxMswDarkMode().enable(self); self.SetBackgroundColour(dark_color); panel.SetBackgroundColour(dark_color)
-            
+
         box_contacts = wx.StaticBoxSizer(wx.VERTICAL, panel, "&Contacts")
-        self.lv = wx.ListCtrl(box_contacts.GetStaticBox(), style=wx.LC_REPORT); self.lv.InsertColumn(0, "Username", width=120); self.lv.InsertColumn(1, "Status", width=100)
+        self.lv = wx.ListCtrl(box_contacts.GetStaticBox(), style=wx.LC_REPORT); self.lv.InsertColumn(0, "Username", width=120); self.lv.InsertColumn(1, "Status", width=160)
         self.lv.Bind(wx.EVT_CHAR_HOOK, self.on_key); self.lv.Bind(wx.EVT_LIST_ITEM_SELECTED, self.update_button_states); self.lv.Bind(wx.EVT_LIST_ITEM_DESELECTED, self.update_button_states)
-        
+
         if dark_mode_on:
             box_contacts.GetStaticBox().SetForegroundColour(light_text_color)
             box_contacts.GetStaticBox().SetBackgroundColour(dark_color)
@@ -747,11 +807,12 @@ class MainFrame(wx.Frame):
         self.btn_block = wx.Button(panel, label="&Block"); self.btn_add = wx.Button(panel, label="&Add Contact"); self.btn_send = wx.Button(panel, label="&Start Chat"); self.btn_delete = wx.Button(panel, label="&Delete Contact")
         self.btn_send_file = wx.Button(panel, label="Send &File")
         self.btn_info = wx.Button(panel, label="Server &Info")
+        self.btn_status = wx.Button(panel, label="Set Stat&us...")
         self.btn_admin = wx.Button(panel, label="Use Ser&ver Side Commands"); self.btn_settings = wx.Button(panel, label="Se&ttings...")
         self.btn_logout = wx.Button(panel, label="L&ogout"); self.btn_exit = wx.Button(panel, label="E&xit")
-        
+
         if dark_mode_on:
-            buttons = [self.btn_block, self.btn_add, self.btn_send, self.btn_delete, self.btn_send_file, self.btn_info, self.btn_admin, self.btn_settings, self.btn_logout, self.btn_exit]
+            buttons = [self.btn_block, self.btn_add, self.btn_send, self.btn_delete, self.btn_send_file, self.btn_info, self.btn_status, self.btn_admin, self.btn_settings, self.btn_logout, self.btn_exit]
             for btn in buttons:
                 btn.SetBackgroundColour(dark_color)
                 btn.SetForegroundColour(light_text_color)
@@ -759,12 +820,13 @@ class MainFrame(wx.Frame):
         self.btn_block.Bind(wx.EVT_BUTTON, self.on_block_toggle); self.btn_add.Bind(wx.EVT_BUTTON, self.on_add); self.btn_send.Bind(wx.EVT_BUTTON, self.on_send); self.btn_delete.Bind(wx.EVT_BUTTON, self.on_delete)
         self.btn_send_file.Bind(wx.EVT_BUTTON, self.on_send_file)
         self.btn_info.Bind(wx.EVT_BUTTON, self.on_server_info)
+        self.btn_status.Bind(wx.EVT_BUTTON, self.on_set_status)
         self.btn_admin.Bind(wx.EVT_BUTTON, self.on_admin); self.btn_settings.Bind(wx.EVT_BUTTON, self.on_settings)
         self.btn_logout.Bind(wx.EVT_BUTTON, self.on_logout); self.btn_exit.Bind(wx.EVT_BUTTON, self.on_exit)
-        accel_entries = [(wx.ACCEL_ALT, ord('B'), self.btn_block.GetId()), (wx.ACCEL_ALT, ord('A'), self.btn_add.GetId()), (wx.ACCEL_ALT, ord('S'), self.btn_send.GetId()), (wx.ACCEL_ALT, ord('D'), self.btn_delete.GetId()), (wx.ACCEL_ALT, ord('F'), self.btn_send_file.GetId()), (wx.ACCEL_ALT, ord('I'), self.btn_info.GetId()), (wx.ACCEL_ALT, ord('V'), self.btn_admin.GetId()), (wx.ACCEL_ALT, ord('T'), self.btn_settings.GetId()), (wx.ACCEL_ALT, ord('O'), self.btn_logout.GetId()), (wx.ACCEL_ALT, ord('X'), self.btn_exit.GetId()),]
+        accel_entries = [(wx.ACCEL_ALT, ord('B'), self.btn_block.GetId()), (wx.ACCEL_ALT, ord('A'), self.btn_add.GetId()), (wx.ACCEL_ALT, ord('S'), self.btn_send.GetId()), (wx.ACCEL_ALT, ord('D'), self.btn_delete.GetId()), (wx.ACCEL_ALT, ord('F'), self.btn_send_file.GetId()), (wx.ACCEL_ALT, ord('I'), self.btn_info.GetId()), (wx.ACCEL_ALT, ord('U'), self.btn_status.GetId()), (wx.ACCEL_ALT, ord('V'), self.btn_admin.GetId()), (wx.ACCEL_ALT, ord('T'), self.btn_settings.GetId()), (wx.ACCEL_ALT, ord('O'), self.btn_logout.GetId()), (wx.ACCEL_ALT, ord('X'), self.btn_exit.GetId()),]
         accel_tbl = wx.AcceleratorTable(accel_entries); self.SetAcceleratorTable(accel_tbl)
         gs_main = wx.GridSizer(1, 5, 5, 5); gs_main.Add(self.btn_block, 0, wx.EXPAND); gs_main.Add(self.btn_add, 0, wx.EXPAND); gs_main.Add(self.btn_send, 0, wx.EXPAND); gs_main.Add(self.btn_send_file, 0, wx.EXPAND); gs_main.Add(self.btn_delete, 0, wx.EXPAND)
-        gs_util = wx.GridSizer(1, 5, 5, 5); gs_util.Add(self.btn_info, 0, wx.EXPAND); gs_util.Add(self.btn_admin, 0, wx.EXPAND); gs_util.Add(self.btn_settings, 0, wx.EXPAND); gs_util.Add(self.btn_logout, 0, wx.EXPAND); gs_util.Add(self.btn_exit, 0, wx.EXPAND)
+        gs_util = wx.GridSizer(1, 6, 5, 5); gs_util.Add(self.btn_info, 0, wx.EXPAND); gs_util.Add(self.btn_status, 0, wx.EXPAND); gs_util.Add(self.btn_admin, 0, wx.EXPAND); gs_util.Add(self.btn_settings, 0, wx.EXPAND); gs_util.Add(self.btn_logout, 0, wx.EXPAND); gs_util.Add(self.btn_exit, 0, wx.EXPAND)
         s = wx.BoxSizer(wx.VERTICAL); s.Add(box_contacts, 1, wx.EXPAND|wx.ALL, 5); s.Add(gs_main, 0, wx.CENTER|wx.ALL, 5); s.Add(gs_util, 0, wx.CENTER|wx.ALL, 5); panel.SetSizer(s)
         self.update_button_states()
     def on_settings(self, event):
@@ -781,7 +843,8 @@ class MainFrame(wx.Frame):
         size_str = format_size(size_limit) if size_limit > 0 else "No limit"
         blackfiles = msg.get("blackfiles", [])
         blackfiles_str = ", ".join(f".{ext}" for ext in blackfiles) if blackfiles else "None"
-        info = [("Hostname", SERVER_CONFIG['host']), ("Port", str(msg.get("port", SERVER_CONFIG['port']))), ("Encrypted", "Yes" if encrypted else "No"), ("Registered Users", str(msg.get("total_users", "N/A"))), ("Users Online", str(msg.get("online_users", "N/A"))), ("File Size Limit", size_str), ("Blacklisted Extensions", blackfiles_str)]
+        max_status_len = msg.get("max_status_length", "N/A")
+        info = [("Hostname", SERVER_CONFIG['host']), ("Port", str(msg.get("port", SERVER_CONFIG['port']))), ("Encrypted", "Yes" if encrypted else "No"), ("Registered Users", str(msg.get("total_users", "N/A"))), ("Users Online", str(msg.get("online_users", "N/A"))), ("File Size Limit", size_str), ("Blacklisted Extensions", blackfiles_str), ("Max Status Length", str(max_status_len))]
         with ServerInfoDialog(self, info) as dlg: dlg.ShowModal()
     def update_button_states(self, event=None):
         is_selection = self.lv.GetSelectedItemCount() > 0
@@ -791,10 +854,19 @@ class MainFrame(wx.Frame):
             is_blocked = self.contact_states.get(contact_name, 0); self.btn_block.SetLabel("&Unblock" if is_blocked else "&Block")
         else: self.btn_block.SetLabel("&Block")
         if event: event.Skip()
+    def on_set_status(self, event):
+        with StatusDialog(self, self.current_status) as dlg:
+            if dlg.ShowModal() == wx.ID_OK:
+                sel = dlg.choice.GetStringSelection()
+                status = dlg.status_text.GetValue().strip() if sel == "Custom..." else sel
+                if not status: return
+                self.current_status = status
+                try: self.sock.sendall((json.dumps({"action": "set_status", "status_text": status}) + "\n").encode())
+                except Exception as e: print(f"Error setting status: {e}")
     def on_add_contact_failed(self, reason): wx.MessageBox(reason, "Add Contact Failed", wx.ICON_ERROR)
     def on_add_contact_success(self, contact_data):
         c = contact_data; self.contact_states[c["user"]] = c["blocked"]; idx = self.lv.InsertItem(self.lv.GetItemCount(), c["user"])
-        status = "online" if c["online"] and not c["blocked"] else "offline"
+        status = c.get("status_text", "online") if c["online"] and not c["blocked"] else "offline"
         if c.get("is_admin"): status += " (Admin)"
         self.lv.SetItem(idx, 1, status)
         if c["blocked"]: self.lv.SetItemTextColour(idx, wx.Colour(150,150,150))
@@ -811,7 +883,8 @@ class MainFrame(wx.Frame):
     def load_contacts(self, contacts):
         self.contact_states = {c["user"]: c["blocked"] for c in contacts}; self.lv.DeleteAllItems()
         for c in contacts:
-            idx = self.lv.InsertItem(self.lv.GetItemCount(), c["user"]); status = "online" if c["online"] and not c["blocked"] else "offline"
+            idx = self.lv.InsertItem(self.lv.GetItemCount(), c["user"])
+            status = c.get("status_text", "online") if c["online"] and not c["blocked"] else "offline"
             if c.get("is_admin"): status += " (Admin)"
             self.lv.SetItem(idx, 1, status)
             if c["blocked"]: self.lv.SetItemTextColour(idx, wx.Colour(150,150,150))

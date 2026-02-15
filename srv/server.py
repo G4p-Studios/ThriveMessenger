@@ -5,10 +5,12 @@ from email.mime.text import MIMEText
 DB = 'thrive.db'
 ADMIN_FILE = 'admins.txt'
 clients = {}
+client_statuses = {}
 lock = threading.Lock()
 smtp_config = {}
 file_config = {}
 shutdown_timeout = 5
+max_status_length = 50
 pending_transfers = {}
 transfer_lock = threading.Lock()
 server_port = 0
@@ -95,6 +97,8 @@ def load_config():
     }
     global shutdown_timeout
     shutdown_timeout = config.getint('server', 'shutdown_timeout', fallback=5)
+    global max_status_length
+    max_status_length = config.getint('server', 'max_status_length', fallback=50)
     return {
         'port': config.getint('server', 'port', fallback=5005),
         'certfile': config.get('server', 'certfile', fallback='server.crt'),
@@ -125,7 +129,9 @@ def init_db():
     conn.close()
 
 def broadcast_contact_status(user, online):
-    msg = json.dumps({"action":"contact_status","user":user,"online":online}) + "\n"
+    with lock:
+        status_text = client_statuses.get(user, "offline") if online else "offline"
+    msg = json.dumps({"action":"contact_status","user":user,"online":online,"status_text":status_text}) + "\n"
     with lock:
         for owner, sock in clients.items():
             db = sqlite3.connect(DB)
@@ -141,7 +147,9 @@ def kick_if_banned(user):
         try: s.sendall(json.dumps({"action":"banned_kick"}).encode() + b"\n")
         except: pass
         s.close()
-        with lock: clients.pop(user, None)
+        with lock:
+            clients.pop(user, None)
+            client_statuses.pop(user, None)
         broadcast_contact_status(user, False)
 
 def handle_client(cs, addr):
@@ -280,11 +288,14 @@ def handle_client(cs, addr):
 
         sock.sendall(b'{"status":"ok"}\n')
         user = req["user"]
-        with lock: clients[user] = sock
-        
+        with lock:
+            clients[user] = sock
+            client_statuses[user] = "online"
+
         admins = get_admins()
         rows = db.execute("SELECT contact,blocked FROM contacts WHERE owner=?", (user,)).fetchall()
-        contacts = [{"user":c, "blocked":b, "online": (c in clients), "is_admin": (c in admins)} for c,b in rows]
+        with lock:
+            contacts = [{"user":c, "blocked":b, "online": (c in clients), "is_admin": (c in admins), "status_text": client_statuses.get(c, "offline") if c in clients else "offline"} for c,b in rows]
         sock.sendall((json.dumps({"action":"contact_list","contacts":contacts})+"\n").encode())
         db.close()
         
@@ -308,9 +319,11 @@ def handle_client(cs, addr):
                 else:
                     con.execute("INSERT OR IGNORE INTO contacts(owner,contact) VALUES(?,?)", (user, contact_to_add))
                     con.commit()
-                    with lock: is_online = contact_to_add in clients
+                    with lock:
+                        is_online = contact_to_add in clients
+                        contact_status_text = client_statuses.get(contact_to_add, "offline") if is_online else "offline"
                     admins = get_admins()
-                    contact_data = {"user": contact_to_add, "blocked": 0, "online": is_online, "is_admin": contact_to_add in admins}
+                    contact_data = {"user": contact_to_add, "blocked": 0, "online": is_online, "is_admin": contact_to_add in admins, "status_text": contact_status_text}
                     sock.sendall((json.dumps({"action": "add_contact_success", "contact": contact_data}) + "\n").encode())
                 con.close()
                 
@@ -398,7 +411,7 @@ def handle_client(cs, addr):
                 total_users = con.execute("SELECT COUNT(*) FROM users").fetchone()[0]
                 con.close()
                 with lock: online_count = len(clients)
-                info = {"action": "server_info_response", "port": server_port, "ssl": use_ssl, "total_users": total_users, "online_users": online_count, "size_limit": file_config.get('size_limit', 0), "blackfiles": file_config.get('blackfiles', [])}
+                info = {"action": "server_info_response", "port": server_port, "ssl": use_ssl, "total_users": total_users, "online_users": online_count, "size_limit": file_config.get('size_limit', 0), "blackfiles": file_config.get('blackfiles', []), "max_status_length": max_status_length}
                 try: sock.sendall((json.dumps(info) + "\n").encode())
                 except: pass
 
@@ -505,6 +518,11 @@ def handle_client(cs, addr):
                     try: sock_to.sendall((json.dumps({"action": "file_data", "from": transfer["from"], "files": msg["files"]}) + "\n").encode())
                     except: pass
 
+            elif action == "set_status":
+                status_text = msg.get("status_text", "online")[:max_status_length]
+                with lock: client_statuses[user] = status_text
+                broadcast_contact_status(user, True)
+
             elif action == "logout": break
     except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
         pass
@@ -513,6 +531,7 @@ def handle_client(cs, addr):
         except: pass
         with lock:
             if user in clients: del clients[user]
+            client_statuses.pop(user, None)
         if user: broadcast_contact_status(user, False)
 
 def check_file_ban(username, file_ext):

@@ -8,6 +8,7 @@ dependencies = [
     "keyring>=25.7.0",
     "nuitka>=4.0",
     "plyer>=2.1.0",
+    "winotify>=1.1.0; sys_platform == 'win32'",
     "pyinstaller>=6.18.0",
     "pyinstaller-versionfile>=3.0.1",
     "wxpython>=4.2.5",
