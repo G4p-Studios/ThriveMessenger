@@ -359,6 +359,9 @@ class ClientApp(wx.App):
         self.username = username; self.sock = sock; self.sockfile = sf; self.pending_file_paths = {}
         self.intentional_disconnect = False
         self.frame = MainFrame(self.username, self.sock); self.frame.Show()
+        if self.frame.current_status != "online":
+            try: self.sock.sendall((json.dumps({"action": "set_status", "status_text": self.frame.current_status}) + "\n").encode())
+            except Exception: pass
         self.play_sound("login.wav"); threading.Thread(target=self.listen_loop, daemon=True).start()
     
     def play_sound(self, sound_file):
@@ -786,7 +789,7 @@ class MainFrame(wx.Frame):
 
     def __init__(self, user, sock):
         super().__init__(None, title=f"Thrive Messenger – {user}", size=(400,380)); self.user, self.sock = user, sock; self.task_bar_icon = None; self.is_exiting = False
-        self.current_status = "online"
+        self.current_status = wx.GetApp().user_config.get('status', 'online')
         self.notifications = []; self.Bind(wx.EVT_CLOSE, self.on_close_window); panel = wx.Panel(self)
 
         dark_mode_on = is_windows_dark_mode()
@@ -861,6 +864,7 @@ class MainFrame(wx.Frame):
                 status = dlg.status_text.GetValue().strip() if sel == "Custom..." else sel
                 if not status: return
                 self.current_status = status
+                app = wx.GetApp(); app.user_config['status'] = status; save_user_config(app.user_config)
                 try: self.sock.sendall((json.dumps({"action": "set_status", "status_text": status}) + "\n").encode())
                 except Exception as e: print(f"Error setting status: {e}")
     def on_add_contact_failed(self, reason): wx.MessageBox(reason, "Add Contact Failed", wx.ICON_ERROR)
