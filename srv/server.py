@@ -415,6 +415,20 @@ def handle_client(cs, addr):
                 try: sock.sendall((json.dumps(info) + "\n").encode())
                 except: pass
 
+            elif action == "user_directory":
+                con = sqlite3.connect(DB)
+                all_users = con.execute("SELECT username FROM users WHERE is_verified=1").fetchall()
+                user_contacts = {row[0]: row[1] for row in con.execute("SELECT contact, blocked FROM contacts WHERE owner=?", (user,)).fetchall()}
+                con.close()
+                admins = get_admins()
+                directory = []
+                with lock:
+                    for (uname,) in all_users:
+                        is_online = uname in clients
+                        directory.append({"user": uname, "online": is_online, "status_text": client_statuses.get(uname, "offline") if is_online else "offline", "is_admin": uname in admins, "is_contact": uname in user_contacts, "is_blocked": user_contacts.get(uname, 0) == 1})
+                try: sock.sendall((json.dumps({"action": "user_directory_response", "users": directory}) + "\n").encode())
+                except: pass
+
             elif action == "msg":
                 to, frm = msg["to"], msg["from"]
                 con = sqlite3.connect(DB)

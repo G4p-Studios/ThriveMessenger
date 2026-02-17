@@ -482,6 +482,7 @@ class ClientApp(wx.App):
                 elif act == "add_contact_success": wx.CallAfter(self.frame.on_add_contact_success, msg["contact"])
                 elif act == "admin_response": wx.CallAfter(self.frame.on_admin_response, msg["response"])
                 elif act == "server_info_response": wx.CallAfter(self.frame.on_server_info_response, msg)
+                elif act == "user_directory_response": wx.CallAfter(self.frame.on_user_directory_response, msg)
                 elif act == "admin_status_change": wx.CallAfter(self.frame.on_admin_status_change, msg["user"], msg["is_admin"])
                 elif act == "server_alert": wx.CallAfter(self.frame.on_server_alert, msg["message"])
                 elif act == "file_offer": wx.CallAfter(self.on_file_offer, msg)
@@ -865,6 +866,148 @@ class ServerInfoDialog(wx.Dialog):
         if event.GetKeyCode() == wx.WXK_ESCAPE: self.Close()
         else: event.Skip()
 
+class UserDirectoryDialog(wx.Dialog):
+    def __init__(self, parent_frame, users, my_username, contact_states):
+        super().__init__(None, title="User Directory", size=(550, 500), style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        self.parent_frame = parent_frame; self.my_username = my_username; self.contact_states = contact_states
+        self._all_users = users; self._selected_user = None
+        panel = wx.Panel(self)
+        dark_mode_on = is_windows_dark_mode()
+        if dark_mode_on:
+            dc = wx.Colour(40, 40, 40); lt = wx.WHITE
+            WxMswDarkMode().enable(self); self.SetBackgroundColour(dc); panel.SetBackgroundColour(dc)
+        s = wx.BoxSizer(wx.VERTICAL)
+        search_label = wx.StaticText(panel, label="Searc&h:")
+        self.search_box = wx.TextCtrl(panel, style=wx.TE_PROCESS_ENTER)
+        self.search_box.Bind(wx.EVT_TEXT, self.on_search)
+        if dark_mode_on:
+            search_label.SetForegroundColour(lt); self.search_box.SetBackgroundColour(dc); self.search_box.SetForegroundColour(lt)
+        search_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        search_sizer.Add(search_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+        search_sizer.Add(self.search_box, 1, wx.EXPAND)
+        s.Add(search_sizer, 0, wx.EXPAND | wx.ALL, 5)
+        self.notebook = wx.Notebook(panel)
+        self.tabs = {}
+        for tab_name in ["Everyone", "Online", "Offline", "Admins"]:
+            lv = wx.ListCtrl(self.notebook, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
+            lv.InsertColumn(0, "Username", width=150); lv.InsertColumn(1, "Status", width=150); lv.InsertColumn(2, "Info", width=150)
+            lv.Bind(wx.EVT_LIST_ITEM_SELECTED, self.on_selection_changed)
+            lv.Bind(wx.EVT_LIST_ITEM_DESELECTED, self.on_selection_changed)
+            lv.Bind(wx.EVT_LIST_ITEM_ACTIVATED, self.on_item_activated)
+            lv.Bind(wx.EVT_CHAR_HOOK, self.on_list_key)
+            if dark_mode_on: lv.SetBackgroundColour(dc); lv.SetForegroundColour(lt)
+            self.notebook.AddPage(lv, tab_name); self.tabs[tab_name] = lv
+        self.notebook.Bind(wx.EVT_NOTEBOOK_PAGE_CHANGED, self.on_tab_changed)
+        if dark_mode_on: self.notebook.SetBackgroundColour(dc); self.notebook.SetForegroundColour(lt)
+        s.Add(self.notebook, 1, wx.EXPAND | wx.ALL, 5)
+        self.btn_chat = wx.Button(panel, label="&Start Chat"); self.btn_file = wx.Button(panel, label="Send &File")
+        self.btn_block = wx.Button(panel, label="&Block"); self.btn_add = wx.Button(panel, label="&Add to Contacts")
+        self.btn_close = wx.Button(panel, label="&Close")
+        self.btn_chat.Bind(wx.EVT_BUTTON, self.on_start_chat); self.btn_file.Bind(wx.EVT_BUTTON, self.on_send_file)
+        self.btn_block.Bind(wx.EVT_BUTTON, self.on_block_toggle); self.btn_add.Bind(wx.EVT_BUTTON, self.on_add_to_contacts)
+        self.btn_close.Bind(wx.EVT_BUTTON, lambda e: self.Close())
+        if dark_mode_on:
+            for btn in [self.btn_chat, self.btn_file, self.btn_block, self.btn_add, self.btn_close]:
+                btn.SetBackgroundColour(dc); btn.SetForegroundColour(lt)
+        btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        btn_sizer.Add(self.btn_chat, 1, wx.EXPAND | wx.ALL, 2); btn_sizer.Add(self.btn_file, 1, wx.EXPAND | wx.ALL, 2)
+        btn_sizer.Add(self.btn_block, 1, wx.EXPAND | wx.ALL, 2); btn_sizer.Add(self.btn_add, 1, wx.EXPAND | wx.ALL, 2)
+        btn_sizer.Add(self.btn_close, 1, wx.EXPAND | wx.ALL, 2)
+        s.Add(btn_sizer, 0, wx.EXPAND | wx.ALL, 5)
+        panel.SetSizer(s)
+        esc_id = wx.NewIdRef()
+        self.Bind(wx.EVT_MENU, lambda e: self.Close(), id=esc_id)
+        self.SetAcceleratorTable(wx.AcceleratorTable([(wx.ACCEL_NORMAL, wx.WXK_ESCAPE, esc_id)]))
+        self.Bind(wx.EVT_CLOSE, self.on_close)
+        self._populate_all_tabs(); self.update_button_states()
+    def _get_active_list(self):
+        page = self.notebook.GetSelection()
+        return self.notebook.GetPage(page) if page != wx.NOT_FOUND else None
+    def _get_selected_user(self):
+        lv = self._get_active_list()
+        if not lv: return None
+        sel = lv.GetFirstSelected()
+        if sel >= 0:
+            self._selected_user = lv.GetItemText(sel)
+            return self._selected_user
+        return None
+    def _populate_all_tabs(self):
+        query = self.search_box.GetValue().strip().lower()
+        for tab_name, lv in self.tabs.items():
+            lv.DeleteAllItems()
+            for u in self._all_users:
+                if query and query not in u["user"].lower(): continue
+                if tab_name == "Online" and not u["online"]: continue
+                if tab_name == "Offline" and u["online"]: continue
+                if tab_name == "Admins" and not u["is_admin"]: continue
+                info_parts = []
+                if u["user"] == self.my_username: info_parts.append("You")
+                if u["is_admin"]: info_parts.append("Admin")
+                if u["is_contact"]: info_parts.append("Contact")
+                if u["is_blocked"]: info_parts.append("Blocked")
+                idx = lv.InsertItem(lv.GetItemCount(), u["user"])
+                lv.SetItem(idx, 1, u["status_text"])
+                lv.SetItem(idx, 2, ", ".join(info_parts))
+                if u["is_blocked"]: lv.SetItemTextColour(idx, wx.Colour(150, 150, 150))
+        self.update_button_states()
+    def update_button_states(self):
+        user = self._get_selected_user()
+        if not user or user == self.my_username:
+            self.btn_chat.Disable(); self.btn_file.Disable(); self.btn_block.Disable(); self.btn_add.Disable()
+            self.btn_block.SetLabel("&Block"); return
+        self.btn_chat.Enable(); self.btn_file.Enable()
+        is_contact = user in self.contact_states
+        self.btn_add.Enable(not is_contact); self.btn_add.SetLabel("&Add to Contacts")
+        self.btn_block.Enable(is_contact)
+        if is_contact:
+            blocked = self.contact_states.get(user, 0) == 1
+            self.btn_block.SetLabel("&Unblock" if blocked else "&Block")
+        else:
+            self.btn_block.SetLabel("&Block")
+    def on_search(self, event): self._populate_all_tabs()
+    def on_tab_changed(self, event): self._selected_user = None; self.update_button_states(); event.Skip()
+    def on_selection_changed(self, event): self.update_button_states(); event.Skip()
+    def on_item_activated(self, event):
+        self.on_selection_changed(event); self.on_start_chat(None)
+    def on_start_chat(self, _):
+        user = self._selected_user
+        if not user or user == self.my_username: return
+        app = wx.GetApp(); logging_config = app.user_config.get('chat_logging', {}); is_logging_enabled = logging_config.get(user, False)
+        is_contact = user in self.contact_states
+        dlg = self.parent_frame.get_chat(user) or ChatDialog(self.parent_frame, user, self.parent_frame.sock, self.parent_frame.user, is_logging_enabled, is_contact=is_contact)
+        dlg.Show(); dlg.input_ctrl.SetFocus()
+    def on_send_file(self, _):
+        if self._selected_user: wx.GetApp().send_file_to(self._selected_user)
+    def on_block_toggle(self, _):
+        user = self._selected_user
+        if not user or user not in self.contact_states: return
+        blocked = self.contact_states.get(user, 0) == 1
+        action = "unblock_contact" if blocked else "block_contact"
+        self.parent_frame.sock.sendall(json.dumps({"action": action, "to": user}).encode() + b"\n")
+        self.contact_states[user] = 0 if blocked else 1
+        for entry in self.parent_frame._all_contacts:
+            if entry["user"] == user: entry["blocked"] = 0 if blocked else 1; break
+        self.parent_frame._apply_search_filter()
+        for u in self._all_users:
+            if u["user"] == user: u["is_blocked"] = not blocked; break
+        self._populate_all_tabs()
+    def on_add_to_contacts(self, _):
+        user = self._selected_user
+        if not user: return
+        self.parent_frame.sock.sendall(json.dumps({"action": "add_contact", "to": user}).encode() + b"\n")
+        self.btn_add.Disable(); self.btn_add.SetLabel("Adding...")
+    def on_list_key(self, event):
+        if event.GetKeyCode() == wx.WXK_TAB:
+            if event.ShiftDown():
+                self.notebook.SetFocus()
+            else:
+                self.btn_chat.SetFocus()
+            return
+        event.Skip()
+    def on_close(self, event):
+        if self.parent_frame: self.parent_frame._directory_dlg = None
+        self.Destroy()
+
 class MainFrame(wx.Frame):
     def update_contact_status(self, user, online, status_text=None):
         was_online = False
@@ -886,7 +1029,7 @@ class MainFrame(wx.Frame):
             show_notification("Contact offline", f"{user} has gone offline.")
 
     def __init__(self, user, sock):
-        super().__init__(None, title=f"Thrive Messenger – {user}", size=(400,380)); self.user, self.sock = user, sock; self.task_bar_icon = None; self.is_exiting = False
+        super().__init__(None, title=f"Thrive Messenger – {user}", size=(400,380)); self.user, self.sock = user, sock; self.task_bar_icon = None; self.is_exiting = False; self._directory_dlg = None
         self.current_status = wx.GetApp().user_config.get('status', 'online')
         self.notifications = []; self.Bind(wx.EVT_CLOSE, self.on_close_window); panel = wx.Panel(self)
 
@@ -919,12 +1062,13 @@ class MainFrame(wx.Frame):
         self.btn_send_file = wx.Button(panel, label="Send &File")
         self.btn_info = wx.Button(panel, label="Server &Info")
         self.btn_status = wx.Button(panel, label="Set Stat&us...")
+        self.btn_directory = wx.Button(panel, label="User Director&y")
         self.btn_admin = wx.Button(panel, label="Use Ser&ver Side Commands"); self.btn_settings = wx.Button(panel, label="Se&ttings...")
         self.btn_update = wx.Button(panel, label="Check for U&pdates")
         self.btn_logout = wx.Button(panel, label="L&ogout"); self.btn_exit = wx.Button(panel, label="E&xit")
 
         if dark_mode_on:
-            buttons = [self.btn_block, self.btn_add, self.btn_send, self.btn_delete, self.btn_send_file, self.btn_info, self.btn_status, self.btn_admin, self.btn_settings, self.btn_update, self.btn_logout, self.btn_exit]
+            buttons = [self.btn_block, self.btn_add, self.btn_send, self.btn_delete, self.btn_send_file, self.btn_info, self.btn_status, self.btn_directory, self.btn_admin, self.btn_settings, self.btn_update, self.btn_logout, self.btn_exit]
             for btn in buttons:
                 btn.SetBackgroundColour(dark_color)
                 btn.SetForegroundColour(light_text_color)
@@ -933,13 +1077,14 @@ class MainFrame(wx.Frame):
         self.btn_send_file.Bind(wx.EVT_BUTTON, self.on_send_file)
         self.btn_info.Bind(wx.EVT_BUTTON, self.on_server_info)
         self.btn_status.Bind(wx.EVT_BUTTON, self.on_set_status)
+        self.btn_directory.Bind(wx.EVT_BUTTON, self.on_user_directory)
         self.btn_admin.Bind(wx.EVT_BUTTON, self.on_admin); self.btn_settings.Bind(wx.EVT_BUTTON, self.on_settings)
         self.btn_update.Bind(wx.EVT_BUTTON, self.on_check_updates)
         self.btn_logout.Bind(wx.EVT_BUTTON, self.on_logout); self.btn_exit.Bind(wx.EVT_BUTTON, self.on_exit)
-        accel_entries = [(wx.ACCEL_ALT, ord('B'), self.btn_block.GetId()), (wx.ACCEL_ALT, ord('A'), self.btn_add.GetId()), (wx.ACCEL_ALT, ord('S'), self.btn_send.GetId()), (wx.ACCEL_ALT, ord('D'), self.btn_delete.GetId()), (wx.ACCEL_ALT, ord('F'), self.btn_send_file.GetId()), (wx.ACCEL_ALT, ord('I'), self.btn_info.GetId()), (wx.ACCEL_ALT, ord('U'), self.btn_status.GetId()), (wx.ACCEL_ALT, ord('V'), self.btn_admin.GetId()), (wx.ACCEL_ALT, ord('T'), self.btn_settings.GetId()), (wx.ACCEL_ALT, ord('P'), self.btn_update.GetId()), (wx.ACCEL_ALT, ord('O'), self.btn_logout.GetId()), (wx.ACCEL_ALT, ord('X'), self.btn_exit.GetId()),]
+        accel_entries = [(wx.ACCEL_ALT, ord('B'), self.btn_block.GetId()), (wx.ACCEL_ALT, ord('A'), self.btn_add.GetId()), (wx.ACCEL_ALT, ord('S'), self.btn_send.GetId()), (wx.ACCEL_ALT, ord('D'), self.btn_delete.GetId()), (wx.ACCEL_ALT, ord('F'), self.btn_send_file.GetId()), (wx.ACCEL_ALT, ord('I'), self.btn_info.GetId()), (wx.ACCEL_ALT, ord('U'), self.btn_status.GetId()), (wx.ACCEL_ALT, ord('Y'), self.btn_directory.GetId()), (wx.ACCEL_ALT, ord('V'), self.btn_admin.GetId()), (wx.ACCEL_ALT, ord('T'), self.btn_settings.GetId()), (wx.ACCEL_ALT, ord('P'), self.btn_update.GetId()), (wx.ACCEL_ALT, ord('O'), self.btn_logout.GetId()), (wx.ACCEL_ALT, ord('X'), self.btn_exit.GetId()),]
         accel_tbl = wx.AcceleratorTable(accel_entries); self.SetAcceleratorTable(accel_tbl)
         gs_main = wx.GridSizer(1, 5, 5, 5); gs_main.Add(self.btn_block, 0, wx.EXPAND); gs_main.Add(self.btn_add, 0, wx.EXPAND); gs_main.Add(self.btn_send, 0, wx.EXPAND); gs_main.Add(self.btn_send_file, 0, wx.EXPAND); gs_main.Add(self.btn_delete, 0, wx.EXPAND)
-        gs_util = wx.GridSizer(1, 7, 5, 5); gs_util.Add(self.btn_info, 0, wx.EXPAND); gs_util.Add(self.btn_status, 0, wx.EXPAND); gs_util.Add(self.btn_admin, 0, wx.EXPAND); gs_util.Add(self.btn_settings, 0, wx.EXPAND); gs_util.Add(self.btn_update, 0, wx.EXPAND); gs_util.Add(self.btn_logout, 0, wx.EXPAND); gs_util.Add(self.btn_exit, 0, wx.EXPAND)
+        gs_util = wx.GridSizer(1, 8, 5, 5); gs_util.Add(self.btn_info, 0, wx.EXPAND); gs_util.Add(self.btn_status, 0, wx.EXPAND); gs_util.Add(self.btn_directory, 0, wx.EXPAND); gs_util.Add(self.btn_admin, 0, wx.EXPAND); gs_util.Add(self.btn_settings, 0, wx.EXPAND); gs_util.Add(self.btn_update, 0, wx.EXPAND); gs_util.Add(self.btn_logout, 0, wx.EXPAND); gs_util.Add(self.btn_exit, 0, wx.EXPAND)
         s = wx.BoxSizer(wx.VERTICAL); s.Add(box_contacts, 1, wx.EXPAND|wx.ALL, 5); s.Add(gs_main, 0, wx.CENTER|wx.ALL, 5); s.Add(gs_util, 0, wx.CENTER|wx.ALL, 5); panel.SetSizer(s)
         self.update_button_states()
     def on_settings(self, event):
@@ -948,6 +1093,15 @@ class MainFrame(wx.Frame):
             if dlg.ShowModal() == wx.ID_OK:
                 selected_pack = dlg.choice.GetStringSelection(); app.user_config['soundpack'] = selected_pack; save_user_config(app.user_config)
                 wx.MessageBox("Settings have been applied.", "Settings Saved", wx.OK | wx.ICON_INFORMATION)
+    def on_user_directory(self, _):
+        if self._directory_dlg:
+            self._directory_dlg.Raise(); self._directory_dlg.SetFocus(); return
+        self.sock.sendall(json.dumps({"action": "user_directory"}).encode() + b"\n")
+    def on_user_directory_response(self, msg):
+        users = msg.get("users", [])
+        dlg = UserDirectoryDialog(self, users, self.user, self.contact_states)
+        self._directory_dlg = dlg
+        dlg.Show()
     def on_server_info(self, _):
         self.sock.sendall(json.dumps({"action": "server_info"}).encode() + b"\n")
     def on_server_info_response(self, msg):
@@ -1041,6 +1195,10 @@ class MainFrame(wx.Frame):
         self._apply_search_filter()
         chat = self.get_chat(c["user"])
         if chat: chat.hide_add_button()
+        if self._directory_dlg:
+            for u in self._directory_dlg._all_users:
+                if u["user"] == c["user"]: u["is_contact"] = True; u["is_blocked"] = c["blocked"] == 1; break
+            self._directory_dlg._populate_all_tabs(); self._directory_dlg.update_button_states()
     def on_server_alert(self, message):
         wx.GetApp().play_sound("receive.wav"); wx.MessageBox(message, "Server Alert", wx.OK | wx.ICON_INFORMATION | wx.STAY_ON_TOP)
     def on_add(self, _):
@@ -1089,6 +1247,9 @@ class MainFrame(wx.Frame):
     def restore_from_tray(self):
         if self.task_bar_icon: self.task_bar_icon.Destroy(); self.task_bar_icon = None
         self.Show(); self.Raise()
+        if self._directory_dlg and self._directory_dlg.IsShown(): self._directory_dlg.Raise()
+        for child in self.GetChildren():
+            if isinstance(child, (ChatDialog, AdminDialog)) and child.IsShown(): child.Raise()
     def on_exit(self, _):
         print("Exiting application...");
         app = wx.GetApp(); app.intentional_disconnect = True
@@ -1096,6 +1257,7 @@ class MainFrame(wx.Frame):
         except: pass
         try: self.sock.close()
         except: pass
+        if self._directory_dlg: self._directory_dlg.Destroy(); self._directory_dlg = None
         if self.task_bar_icon: self.task_bar_icon.Destroy()
         self.is_exiting = True; self.Destroy()
         app.ExitMainLoop()
@@ -1105,6 +1267,7 @@ class MainFrame(wx.Frame):
         except: pass
         try: self.sock.close()
         except: pass
+        if self._directory_dlg: self._directory_dlg.Destroy(); self._directory_dlg = None
         app.play_sound("logout.wav"); self.Destroy()
         app.show_login_dialog()
     def on_key(self, evt):
