@@ -1152,6 +1152,7 @@ class LoginDialog(wx.Dialog):
     def __init__(self, parent, user_config):
         super().__init__(parent, title="Login", size=(390, 470)); self.user_config = user_config
         self.Bind(wx.EVT_CHAR_HOOK, self.on_key)
+        self.Bind(wx.EVT_CLOSE, self.on_close_dialog)
         panel = wx.Panel(self); s = wx.BoxSizer(wx.VERTICAL)
         self.server_entries = dedupe_server_entries(self.user_config.get('server_entries', []))
         if not self.server_entries:
@@ -1341,6 +1342,15 @@ class LoginDialog(wx.Dialog):
             open_help_docs_for_context("login", self)
             return
         event.Skip()
+
+    def on_close_dialog(self, event):
+        # On macOS, closing the last window can leave the app resident.
+        # Treat login-window close as explicit app exit.
+        app = wx.GetApp()
+        self.EndModal(wx.ID_CANCEL)
+        if app:
+            app.intentional_disconnect = True
+            wx.CallAfter(app.ExitMainLoop)
 
 def format_size(size_bytes):
     if size_bytes <= 0: return "No limit"
