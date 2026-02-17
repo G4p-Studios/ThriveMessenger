@@ -75,6 +75,24 @@ If you wish to compile a binary, run the appropriate compile script. Thrive Mess
     compile_pyinstaller.cmd
     ```
 
+### Compiling on macOS (Intel + Apple Silicon)
+
+The repo includes a macOS build script that produces a `.app` zipped archive:
+
+```bash
+chmod +x scripts/build_macos.sh
+scripts/build_macos.sh
+```
+
+This writes output archives to `dist-macos/`.
+
+For automated dual-architecture builds, run the GitHub Actions workflow:
+`Build macOS Desktop`.
+It produces:
+
+- `thrive_messenger-macos-x86_64.zip`
+- `thrive_messenger-macos-arm64.zip`
+
 ### Running compiled
 
 If you don't feel like fighting with UV and Python, a pre-compiled release is provided.

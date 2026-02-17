@@ -86,10 +86,11 @@ def load_server_entries_from_client_conf():
     entries = []
     if config.has_section('server'):
         entries.append({
-            'name': config.get('server', 'name', fallback='Primary Server'),
+            'name': config.get('server', 'name', fallback='Default Server'),
             'host': config.get('server', 'host', fallback='msg.thecubed.cc'),
             'port': config.getint('server', 'port', fallback=2005),
             'cafile': config.get('server', 'cafile', fallback=''),
+            'primary': config.getboolean('server', 'primary', fallback=False),
         })
     for section in config.sections():
         if section == 'server':
@@ -100,6 +101,7 @@ def load_server_entries_from_client_conf():
                 'host': config.get(section, 'host', fallback='msg.thecubed.cc'),
                 'port': config.getint(section, 'port', fallback=2005),
                 'cafile': config.get(section, 'cafile', fallback=''),
+                'primary': config.getboolean(section, 'primary', fallback=False),
             })
     return dedupe_server_entries(entries)
 
@@ -113,7 +115,8 @@ def normalize_server_entry(entry):
         port = 2005
     if port <= 0:
         port = 2005
-    return {'name': name, 'host': host, 'port': port, 'cafile': cafile}
+    primary = bool(entry.get('primary', False))
+    return {'name': name, 'host': host, 'port': port, 'cafile': cafile, 'primary': primary}
 
 def dedupe_server_entries(entries):
     out = []
@@ -127,6 +130,8 @@ def dedupe_server_entries(entries):
             continue
         seen.add(key)
         out.append(normalized)
+    if out and not any(e.get('primary') for e in out):
+        out[0]['primary'] = True
     return out
 
 def get_config_dir():
@@ -173,7 +178,8 @@ def load_user_config():
         'soundpack': 'default',
         'chat_logging': {},
         'server_entries': file_entries,
-        'last_server_name': file_entries[0]['name'] if file_entries else 'Primary Server',
+        'last_server_name': file_entries[0]['name'] if file_entries else 'Default Server',
+        'primary_server_name': next((e['name'] for e in file_entries if e.get('primary')), file_entries[0]['name'] if file_entries else 'Default Server'),
         'auto_open_received_files': True,
         'read_messages_aloud': False,
         'typing_indicators': True,
@@ -196,8 +202,11 @@ def load_user_config():
     if not merged_entries:
         merged_entries = [fallback_entry]
     settings['server_entries'] = merged_entries
+    if settings.get('primary_server_name') not in [e['name'] for e in merged_entries]:
+        primary = next((e['name'] for e in merged_entries if e.get('primary')), merged_entries[0]['name'])
+        settings['primary_server_name'] = primary
     if settings.get('last_server_name') not in [e['name'] for e in merged_entries]:
-        settings['last_server_name'] = merged_entries[0]['name']
+        settings['last_server_name'] = settings.get('primary_server_name') or merged_entries[0]['name']
 
     # 3. Load password from Keyring if "Remember me" is active
     if settings.get('username') and settings.get('remember'):
@@ -259,11 +268,11 @@ def set_active_server_config(server_entry):
     }
     ADDR = (SERVER_CONFIG['host'], SERVER_CONFIG['port'])
 
-def resolve_last_server_entry(user_config):
+def resolve_default_server_entry(user_config):
     entries = dedupe_server_entries(user_config.get('server_entries', []))
     if not entries:
         entries = [normalize_server_entry(load_server_config())]
-    preferred_name = user_config.get('last_server_name', '')
+    preferred_name = user_config.get('primary_server_name') or user_config.get('last_server_name', '')
     for entry in entries:
         if entry['name'] == preferred_name:
             return entry
@@ -321,7 +330,7 @@ def _help_docs_dir():
 def ensure_help_docs():
     docs = {
         "general": "<h1>Thrive Messenger Help</h1><p>Press F1 in each window for contextual help.</p>",
-        "login": "<h1>Login Help</h1><p>Use Server dropdown to pick a server. Use Manage Servers to add/edit endpoints. Then enter username and password and sign in.</p>",
+        "login": "<h1>Login Help</h1><p>Use Server dropdown to pick a server. Use Manage Servers to add/edit endpoints. Use Set as Primary to choose your default server. Then enter username and password and sign in.</p>",
         "main": "<h1>Contacts Window Help</h1><p>Manage contacts, statuses, files, and chats. Activate a status containing a link to open it. Use Alt shortcuts on each button.</p>",
         "chat": "<h1>Chat Window Help</h1><p>Enter sends, Shift+Enter adds newline. Links in messages are clickable by activating message rows. Typing indicators and readout can be toggled in Settings.</p>",
         "directory": "<h1>User Directory Help</h1><p>Shows users from current and configured servers with server labels. Activate entries to start chat or open status links.</p>",
@@ -609,10 +618,10 @@ class ClientApp(wx.App):
             self._ipc_sock = None
         self.user_config = load_user_config()
         self.session_password = ""
-        self.active_server_entry = resolve_last_server_entry(self.user_config)
+        self.active_server_entry = resolve_default_server_entry(self.user_config)
         if self.user_config.get('autologin') and self.user_config.get('username') and self.user_config.get('password'):
             print("Attempting auto-login...")
-            selected_server = resolve_last_server_entry(self.user_config)
+            selected_server = resolve_default_server_entry(self.user_config)
             success, sock, sf, reason = self.perform_login(self.user_config['username'], self.user_config['password'], selected_server)
             if success: self.start_main_session(self.user_config['username'], sock, sf); return True
             else: wx.MessageBox(f"Auto-login failed: {reason}", "Login Failed", wx.ICON_ERROR); self.user_config['autologin'] = False; save_user_config(self.user_config)
@@ -650,6 +659,7 @@ class ClientApp(wx.App):
                 if success:
                     self.user_config['server_entries'] = dlg.server_entries
                     self.user_config['last_server_name'] = dlg.selected_server.get('name', '')
+                    self.user_config['primary_server_name'] = dlg.primary_server_name
                     if dlg.remember_checked:
                         self.user_config['username'] = dlg.username
                         self.user_config['password'] = dlg.password
@@ -673,7 +683,8 @@ class ClientApp(wx.App):
                         'soundpack': 'default',
                         'chat_logging': {},
                         'server_entries': dlg.server_entries,
-                        'last_server_name': dlg.selected_server.get('name', '')
+                        'last_server_name': dlg.selected_server.get('name', ''),
+                        'primary_server_name': dlg.primary_server_name
                     }
                     save_user_config(self.user_config); self.start_main_session(dlg.new_username, sock, sf); return True
             else: return False
@@ -1145,6 +1156,9 @@ class LoginDialog(wx.Dialog):
         self.server_entries = dedupe_server_entries(self.user_config.get('server_entries', []))
         if not self.server_entries:
             self.server_entries = [normalize_server_entry(load_server_config())]
+        self.primary_server_name = self.user_config.get('primary_server_name', '')
+        if self.primary_server_name not in [e['name'] for e in self.server_entries]:
+            self.primary_server_name = next((e['name'] for e in self.server_entries if e.get('primary')), self.server_entries[0]['name'])
         self.selected_server = self.server_entries[0]
         
         dark_mode_on = is_windows_dark_mode()
@@ -1157,9 +1171,12 @@ class LoginDialog(wx.Dialog):
         self.server_choice.Bind(wx.EVT_CHOICE, self.on_server_choice)
         manage_servers_btn = wx.Button(server_box.GetStaticBox(), label="Manage Servers...")
         manage_servers_btn.Bind(wx.EVT_BUTTON, self.on_manage_servers)
+        set_primary_btn = wx.Button(server_box.GetStaticBox(), label="Set as Primary")
+        set_primary_btn.Bind(wx.EVT_BUTTON, self.on_set_primary_server)
         server_row = wx.BoxSizer(wx.HORIZONTAL)
         server_row.Add(self.server_choice, 1, wx.EXPAND | wx.RIGHT, 4)
-        server_row.Add(manage_servers_btn, 0, wx.EXPAND)
+        server_row.Add(manage_servers_btn, 0, wx.EXPAND | wx.RIGHT, 4)
+        server_row.Add(set_primary_btn, 0, wx.EXPAND)
         server_box.Add(server_row, 0, wx.EXPAND | wx.ALL, 5)
         self.welcome_preview = wx.StaticText(server_box.GetStaticBox(), label="Welcome: (loading...)")
         self.welcome_preview.Wrap(330)
@@ -1187,7 +1204,7 @@ class LoginDialog(wx.Dialog):
                 box.GetStaticBox().SetBackgroundColour(dark_color)
             for ctrl in [self.server_choice, self.u, self.p]:
                 ctrl.SetBackgroundColour(dark_color); ctrl.SetForegroundColour(light_text_color)
-            for btn in [manage_servers_btn, welcome_btn, login_btn, create_btn, forgot_btn]:
+            for btn in [manage_servers_btn, set_primary_btn, welcome_btn, login_btn, create_btn, forgot_btn]:
                 btn.SetBackgroundColour(dark_color); btn.SetForegroundColour(light_text_color)
             self.remember_cb.SetForegroundColour(light_text_color); self.autologin_cb.SetForegroundColour(light_text_color)
 
@@ -1204,10 +1221,13 @@ class LoginDialog(wx.Dialog):
 
     def populate_server_choice(self):
         self.server_choice.Clear()
-        labels = [f"{e['name']} ({e['host']}:{e['port']})" for e in self.server_entries]
+        labels = []
+        for e in self.server_entries:
+            suffix = " [Primary]" if e['name'] == self.primary_server_name else ""
+            labels.append(f"{e['name']}{suffix} ({e['host']}:{e['port']})")
         for label in labels:
             self.server_choice.Append(label)
-        preferred_name = self.user_config.get('last_server_name', '')
+        preferred_name = self.user_config.get('last_server_name', '') or self.primary_server_name
         index = 0
         for i, entry in enumerate(self.server_entries):
             if entry['name'] == preferred_name:
@@ -1231,11 +1251,20 @@ class LoginDialog(wx.Dialog):
                     return
                 self.server_entries = entries
                 self.user_config['server_entries'] = self.server_entries
+                if self.primary_server_name not in [e['name'] for e in self.server_entries]:
+                    self.primary_server_name = self.server_entries[0]['name']
                 # Keep selection stable where possible
                 current_name = self.selected_server.get('name', '')
                 self.user_config['last_server_name'] = current_name if any(e['name'] == current_name for e in self.server_entries) else self.server_entries[0]['name']
                 self.populate_server_choice()
                 self.refresh_welcome_preview()
+
+    def on_set_primary_server(self, _):
+        if not self.selected_server:
+            return
+        self.primary_server_name = self.selected_server.get('name', self.primary_server_name)
+        self.populate_server_choice()
+        wx.MessageBox(f"{self.primary_server_name} is now your default server.", "Primary Server Updated", wx.OK | wx.ICON_INFORMATION)
 
     def refresh_welcome_preview(self):
         info = fetch_server_welcome(self.selected_server)
@@ -1300,8 +1329,11 @@ class LoginDialog(wx.Dialog):
         self.password = p
         self.remember_checked = self.remember_cb.IsChecked()
         self.autologin_checked = self.autologin_cb.IsChecked()
+        for entry in self.server_entries:
+            entry['primary'] = (entry.get('name') == self.primary_server_name)
         self.user_config['server_entries'] = self.server_entries
         self.user_config['last_server_name'] = self.selected_server.get('name', '')
+        self.user_config['primary_server_name'] = self.primary_server_name
         self.EndModal(wx.ID_OK)
 
     def on_key(self, event):
