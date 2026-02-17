@@ -2,6 +2,10 @@ import wx, socket, json, threading, datetime, wx.adv, configparser, ssl, sys, os
 import keyring
 
 VERSION_TAG = "v2026-alpha14"
+
+# Constants
+MAX_CACHED_MESSAGES_PER_CONTACT = 100
+
 if sys.platform == 'win32':
     from winotify import Notification as _WinNotification
 else:
@@ -112,7 +116,9 @@ def load_user_config():
         'username': '',
         'password': '',
         'soundpack': 'default',
-        'chat_logging': {}
+        'chat_logging': {},
+        'message_cache': {},
+        'use_local_time': True
     }
 
     # 1. Load non-sensitive preferences from JSON
@@ -274,7 +280,7 @@ class ThriveTaskBarIcon(wx.adv.TaskBarIcon):
 
 class SettingsDialog(wx.Dialog):
     def __init__(self, parent, current_config):
-        super().__init__(parent, title="Settings", size=(300, 150)); self.config = current_config
+        super().__init__(parent, title="Settings", size=(300, 200)); self.config = current_config
         panel = wx.Panel(self); main_sizer = wx.BoxSizer(wx.VERTICAL); sound_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "&Sound Pack")
         
         dark_mode_on = is_windows_dark_mode()
@@ -293,7 +299,16 @@ class SettingsDialog(wx.Dialog):
         if current_pack in sound_packs: self.choice.SetStringSelection(current_pack)
         else: self.choice.SetSelection(0)
         
-        sound_box.Add(self.choice, 0, wx.EXPAND | wx.ALL, 5); main_sizer.Add(sound_box, 0, wx.EXPAND | wx.ALL, 5); btn_sizer = wx.StdDialogButtonSizer()
+        sound_box.Add(self.choice, 0, wx.EXPAND | wx.ALL, 5); main_sizer.Add(sound_box, 0, wx.EXPAND | wx.ALL, 5)
+        
+        # Add timezone checkbox
+        self.use_local_time_cb = wx.CheckBox(panel, label="Use &local computer time for messages")
+        self.use_local_time_cb.SetValue(self.config.get('use_local_time', True))
+        if dark_mode_on:
+            self.use_local_time_cb.SetForegroundColour(light_text_color); self.use_local_time_cb.SetBackgroundColour(dark_color)
+        main_sizer.Add(self.use_local_time_cb, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        
+        btn_sizer = wx.StdDialogButtonSizer()
         ok_btn = wx.Button(panel, wx.ID_OK, label="&Apply"); ok_btn.SetDefault(); cancel_btn = wx.Button(panel, wx.ID_CANCEL)
         
         if dark_mode_on:
@@ -1091,7 +1106,9 @@ class MainFrame(wx.Frame):
         app = wx.GetApp()
         with SettingsDialog(self, app.user_config) as dlg:
             if dlg.ShowModal() == wx.ID_OK:
-                selected_pack = dlg.choice.GetStringSelection(); app.user_config['soundpack'] = selected_pack; save_user_config(app.user_config)
+                selected_pack = dlg.choice.GetStringSelection(); app.user_config['soundpack'] = selected_pack
+                app.user_config['use_local_time'] = dlg.use_local_time_cb.IsChecked()
+                save_user_config(app.user_config)
                 wx.MessageBox("Settings have been applied.", "Settings Saved", wx.OK | wx.ICON_INFORMATION)
     def on_user_directory(self, _):
         if self._directory_dlg:
@@ -1314,9 +1331,26 @@ class MainFrame(wx.Frame):
         return None
 
 def get_day_with_suffix(d): return str(d) + "th" if 11 <= d <= 13 else str(d) + {1: "st", 2: "nd", 3: "rd"}.get(d % 10, "th")
-def format_timestamp(iso_ts):
+def format_timestamp(iso_ts, use_local_time=True):
+    """
+    Format an ISO timestamp into a human-readable format.
+    
+    Args:
+        iso_ts: ISO 8601 timestamp string (e.g., '2024-01-15T14:30:00' or '2024-01-15T14:30:00+00:00')
+        use_local_time: If True, convert to local timezone. Naive timestamps are assumed to be UTC.
+    
+    Returns:
+        Formatted string like 'Monday, January 15th, 2024 at 2:30 PM'
+    """
     try:
-        dt = datetime.datetime.fromisoformat(iso_ts); day_with_suffix = get_day_with_suffix(dt.day)
+        dt = datetime.datetime.fromisoformat(iso_ts)
+        # Convert to local timezone if use_local_time is enabled
+        if use_local_time:
+            # Naive timestamps are assumed to be UTC
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=datetime.timezone.utc)
+            dt = dt.astimezone()
+        day_with_suffix = get_day_with_suffix(dt.day)
         formatted_hour = dt.strftime('%I:%M %p').lstrip('0'); return dt.strftime(f'%A, %B {day_with_suffix}, %Y at {formatted_hour}')
     except (ValueError, TypeError): return iso_ts
 
@@ -1352,14 +1386,19 @@ class AdminDialog(wx.Dialog):
         if not cmd.startswith('/'): self.append_response("Error: Commands must start with /"); return
         msg = {"action":"admin_cmd", "cmd": cmd[1:]}; self.sock.sendall(json.dumps(msg).encode()+b"\n"); self.input_ctrl.Clear(); self.input_ctrl.SetFocus()
     def append_response(self, text):
-        ts = datetime.datetime.now().isoformat(); idx = self.hist.GetItemCount(); self.hist.InsertItem(idx, text); self.hist.SetItem(idx, 1, format_timestamp(ts))
+        ts = datetime.datetime.now().isoformat(); idx = self.hist.GetItemCount(); self.hist.InsertItem(idx, text)
+        app = wx.GetApp()
+        use_local_time = app.user_config.get('use_local_time', True)
+        self.hist.SetItem(idx, 1, format_timestamp(ts, use_local_time))
         if text.lower().startswith('error'): self.hist.SetItemTextColour(idx, wx.RED)
 
 class ChatDialog(wx.Dialog):
     def __init__(self, parent, contact, sock, user, logging_enabled=False, is_contact=True):
         super().__init__(parent, title=f"Chat with {contact}", size=(450, 450))
         self.contact, self.sock, self.user = contact, sock, user
+        self._save_timer = None  # Initialize timer for delayed cache saves
         self.Bind(wx.EVT_CHAR_HOOK, self.on_key)
+        self.Bind(wx.EVT_CLOSE, self.on_close)
 
         dark_mode_on = is_windows_dark_mode()
         if dark_mode_on:
@@ -1403,6 +1442,65 @@ class ChatDialog(wx.Dialog):
         btn_sizer.Add(btn_file, 1, wx.EXPAND | wx.ALL, 5)
         s.Add(btn_sizer, 0, wx.EXPAND|wx.ALL, 5)
         self.SetSizer(s)
+        
+        # Load cached messages for this contact
+        self._load_cached_messages()
+    def _load_cached_messages(self):
+        """Load cached messages for this contact and display them"""
+        app = wx.GetApp()
+        message_cache = app.user_config.get('message_cache', {})
+        contact_messages = message_cache.get(self.contact, [])
+        
+        for msg_data in contact_messages:
+            msg_text = msg_data.get('msg', '')
+            sender = msg_data.get('from', '')
+            timestamp = msg_data.get('time', '')
+            is_error = msg_data.get('is_error', False)
+            
+            idx = self.hist.GetItemCount()
+            self.hist.InsertItem(idx, sender)
+            self.hist.SetItem(idx, 1, msg_text)
+            use_local_time = app.user_config.get('use_local_time', True)
+            formatted_time = format_timestamp(timestamp, use_local_time)
+            self.hist.SetItem(idx, 2, formatted_time)
+            if is_error:
+                self.hist.SetItemTextColour(idx, wx.RED)
+    
+    def _save_message_to_cache(self, text, sender, ts, is_error=False):
+        """Save a message to the persistent cache"""
+        app = wx.GetApp()
+        if 'message_cache' not in app.user_config:
+            app.user_config['message_cache'] = {}
+        
+        if self.contact not in app.user_config['message_cache']:
+            app.user_config['message_cache'][self.contact] = []
+        
+        # Add the message to cache
+        msg_data = {
+            'msg': text,
+            'from': sender,
+            'time': ts,
+            'is_error': is_error
+        }
+        contact_cache = app.user_config['message_cache'][self.contact]
+        contact_cache.append(msg_data)
+        
+        # Limit cache to last MAX_CACHED_MESSAGES_PER_CONTACT messages per contact
+        if len(contact_cache) > MAX_CACHED_MESSAGES_PER_CONTACT:
+            app.user_config['message_cache'][self.contact] = contact_cache[-MAX_CACHED_MESSAGES_PER_CONTACT:]
+        
+        # Schedule a delayed save to reduce I/O frequency
+        if self._save_timer and self._save_timer.IsRunning():
+            self._save_timer.Stop()
+        self._save_timer = wx.CallLater(2000, self._flush_cache_to_disk)
+    
+    def _flush_cache_to_disk(self):
+        """Actually write the cache to disk"""
+        try:
+            save_user_config(wx.GetApp().user_config)
+        except Exception as e:
+            print(f"Error saving message cache: {e}")
+    
     def on_toggle_save(self, event):
         app = wx.GetApp(); is_enabled = self.save_hist_cb.IsChecked()
         if 'chat_logging' not in app.user_config: app.user_config['chat_logging'] = {}
@@ -1423,6 +1521,12 @@ class ChatDialog(wx.Dialog):
             if event.ShiftDown(): self.input_ctrl.WriteText('\n')
             else: self.on_send(None)
         else: event.Skip()
+    def on_close(self, event):
+        """Handle dialog close event to flush cache"""
+        if self._save_timer and self._save_timer.IsRunning():
+            self._save_timer.Stop()
+        self._flush_cache_to_disk()
+        event.Skip()  # Continue with normal close processing
     def on_key(self, event):
         if event.GetKeyCode() == wx.WXK_ESCAPE: self.Close()
         else: event.Skip()
@@ -1444,8 +1548,14 @@ class ChatDialog(wx.Dialog):
         self.btn_add_contact.Hide(); self.GetSizer().Layout()
     def append(self, text, sender, ts, is_error=False):
         idx = self.hist.GetItemCount(); self.hist.InsertItem(idx, sender); self.hist.SetItem(idx, 1, text)
-        formatted_time = format_timestamp(ts); self.hist.SetItem(idx, 2, formatted_time)
+        app = wx.GetApp()
+        use_local_time = app.user_config.get('use_local_time', True)
+        formatted_time = format_timestamp(ts, use_local_time); self.hist.SetItem(idx, 2, formatted_time)
         if is_error: self.hist.SetItemTextColour(idx, wx.RED)
+        
+        # Save to cache
+        self._save_message_to_cache(text, sender, ts, is_error)
+        
         if self.save_hist_cb.IsChecked():
             log_line = f"[{formatted_time}] {sender}: {text}\n"
             self._save_message_to_log(log_line)
