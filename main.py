@@ -7,6 +7,22 @@ if sys.platform == 'win32':
 else:
     from plyer import notification as _plyer_notification
 
+# Initialize accessible_output2 for speech feedback
+try:
+    from accessible_output2.outputs.auto import Auto as _SpeechOutput
+    _speech = _SpeechOutput()
+except Exception as e:
+    print(f"Could not initialize speech output: {e}")
+    _speech = None
+
+def speak_message(message):
+    """Speak a message using accessible_output2 if speech feedback is enabled."""
+    try:
+        if _speech and wx.GetApp() and wx.GetApp().user_config.get('speech_feedback', False):
+            _speech.speak(message, interrupt=False)
+    except Exception as e:
+        print(f"Error speaking message: {e}")
+
 def show_notification(title, message, timeout=5):
     try:
         if sys.platform == 'win32':
@@ -112,6 +128,7 @@ def load_user_config():
         'username': '',
         'password': '',
         'soundpack': 'default',
+        'speech_feedback': False,
         'chat_logging': {}
     }
 
@@ -274,7 +291,7 @@ class ThriveTaskBarIcon(wx.adv.TaskBarIcon):
 
 class SettingsDialog(wx.Dialog):
     def __init__(self, parent, current_config):
-        super().__init__(parent, title="Settings", size=(300, 150)); self.config = current_config
+        super().__init__(parent, title="Settings", size=(300, 200)); self.config = current_config
         panel = wx.Panel(self); main_sizer = wx.BoxSizer(wx.VERTICAL); sound_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "&Sound Pack")
         
         dark_mode_on = is_windows_dark_mode()
@@ -293,7 +310,17 @@ class SettingsDialog(wx.Dialog):
         if current_pack in sound_packs: self.choice.SetStringSelection(current_pack)
         else: self.choice.SetSelection(0)
         
-        sound_box.Add(self.choice, 0, wx.EXPAND | wx.ALL, 5); main_sizer.Add(sound_box, 0, wx.EXPAND | wx.ALL, 5); btn_sizer = wx.StdDialogButtonSizer()
+        sound_box.Add(self.choice, 0, wx.EXPAND | wx.ALL, 5); main_sizer.Add(sound_box, 0, wx.EXPAND | wx.ALL, 5)
+        
+        # Add speech feedback checkbox
+        self.speech_checkbox = wx.CheckBox(panel, label="Enable &speech feedback for online/offline status")
+        self.speech_checkbox.SetValue(self.config.get('speech_feedback', False))
+        if dark_mode_on:
+            self.speech_checkbox.SetBackgroundColour(dark_color)
+            self.speech_checkbox.SetForegroundColour(light_text_color)
+        main_sizer.Add(self.speech_checkbox, 0, wx.EXPAND | wx.ALL, 5)
+        
+        btn_sizer = wx.StdDialogButtonSizer()
         ok_btn = wx.Button(panel, wx.ID_OK, label="&Apply"); ok_btn.SetDefault(); cancel_btn = wx.Button(panel, wx.ID_CANCEL)
         
         if dark_mode_on:
@@ -1024,9 +1051,11 @@ class MainFrame(wx.Frame):
         if online and not was_online:
             wx.GetApp().play_sound("contact_online.wav")
             show_notification("Contact online", f"{user} has come online.")
+            speak_message(f"{user} has come online.")
         elif not online and was_online:
             wx.GetApp().play_sound("contact_offline.wav")
             show_notification("Contact offline", f"{user} has gone offline.")
+            speak_message(f"{user} has gone offline.")
 
     def __init__(self, user, sock):
         super().__init__(None, title=f"Thrive Messenger – {user}", size=(400,380)); self.user, self.sock = user, sock; self.task_bar_icon = None; self.is_exiting = False; self._directory_dlg = None
@@ -1091,7 +1120,9 @@ class MainFrame(wx.Frame):
         app = wx.GetApp()
         with SettingsDialog(self, app.user_config) as dlg:
             if dlg.ShowModal() == wx.ID_OK:
-                selected_pack = dlg.choice.GetStringSelection(); app.user_config['soundpack'] = selected_pack; save_user_config(app.user_config)
+                selected_pack = dlg.choice.GetStringSelection(); app.user_config['soundpack'] = selected_pack
+                app.user_config['speech_feedback'] = dlg.speech_checkbox.GetValue()
+                save_user_config(app.user_config)
                 wx.MessageBox("Settings have been applied.", "Settings Saved", wx.OK | wx.ICON_INFORMATION)
     def on_user_directory(self, _):
         if self._directory_dlg:
