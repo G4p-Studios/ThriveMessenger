@@ -1345,11 +1345,10 @@ def format_timestamp(iso_ts, use_local_time=True):
     try:
         dt = datetime.datetime.fromisoformat(iso_ts)
         # Convert to local timezone if use_local_time is enabled
-        if use_local_time and dt.tzinfo is None:
-            # Naive timestamps are assumed to be UTC and converted to local time
-            dt = dt.replace(tzinfo=datetime.timezone.utc).astimezone()
-        elif use_local_time and dt.tzinfo is not None:
-            # If timestamp has timezone info, convert to local
+        if use_local_time:
+            # Naive timestamps are assumed to be UTC
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=datetime.timezone.utc)
             dt = dt.astimezone()
         day_with_suffix = get_day_with_suffix(dt.day)
         formatted_hour = dt.strftime('%I:%M %p').lstrip('0'); return dt.strftime(f'%A, %B {day_with_suffix}, %Y at {formatted_hour}')
@@ -1399,6 +1398,7 @@ class ChatDialog(wx.Dialog):
         self.contact, self.sock, self.user = contact, sock, user
         self._save_timer = None  # Initialize timer for delayed cache saves
         self.Bind(wx.EVT_CHAR_HOOK, self.on_key)
+        self.Bind(wx.EVT_CLOSE, self.on_close)
 
         dark_mode_on = is_windows_dark_mode()
         if dark_mode_on:
@@ -1482,14 +1482,15 @@ class ChatDialog(wx.Dialog):
             'time': ts,
             'is_error': is_error
         }
-        app.user_config['message_cache'][self.contact].append(msg_data)
+        contact_cache = app.user_config['message_cache'][self.contact]
+        contact_cache.append(msg_data)
         
         # Limit cache to last MAX_CACHED_MESSAGES_PER_CONTACT messages per contact
-        if len(app.user_config['message_cache'][self.contact]) > MAX_CACHED_MESSAGES_PER_CONTACT:
-            app.user_config['message_cache'][self.contact] = app.user_config['message_cache'][self.contact][-MAX_CACHED_MESSAGES_PER_CONTACT:]
+        if len(contact_cache) > MAX_CACHED_MESSAGES_PER_CONTACT:
+            app.user_config['message_cache'][self.contact] = contact_cache[-MAX_CACHED_MESSAGES_PER_CONTACT:]
         
         # Schedule a delayed save to reduce I/O frequency
-        if hasattr(self, '_save_timer') and self._save_timer:
+        if self._save_timer and self._save_timer.IsRunning():
             self._save_timer.Stop()
         self._save_timer = wx.CallLater(2000, self._flush_cache_to_disk)
     
@@ -1520,13 +1521,14 @@ class ChatDialog(wx.Dialog):
             if event.ShiftDown(): self.input_ctrl.WriteText('\n')
             else: self.on_send(None)
         else: event.Skip()
+    def on_close(self, event):
+        """Handle dialog close event to flush cache"""
+        if self._save_timer and self._save_timer.IsRunning():
+            self._save_timer.Stop()
+        self._flush_cache_to_disk()
+        event.Skip()  # Continue with normal close processing
     def on_key(self, event):
-        if event.GetKeyCode() == wx.WXK_ESCAPE:
-            # Flush cache before closing
-            if hasattr(self, '_save_timer') and self._save_timer:
-                self._save_timer.Stop()
-            self._flush_cache_to_disk()
-            self.Close()
+        if event.GetKeyCode() == wx.WXK_ESCAPE: self.Close()
         else: event.Skip()
     def on_send(self, _):
         txt = self.input_ctrl.GetValue().strip()
