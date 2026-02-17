@@ -1,7 +1,6 @@
 import wx, socket, json, threading, datetime, wx.adv, configparser, ssl, sys, os, base64, uuid, subprocess, tempfile, re
 import keyring
 
-VERSION = "26.0.13.1"
 VERSION_TAG = "v2026-alpha14"
 if sys.platform == 'win32':
     from winotify import Notification as _WinNotification
@@ -176,9 +175,6 @@ SERVER_CONFIG = load_server_config()
 ADDR = (SERVER_CONFIG['host'], SERVER_CONFIG['port'])
 _IPC_PORT = 48951
 
-def parse_version(v):
-    return tuple(int(x) for x in v.strip().split('.'))
-
 def parse_github_tag(tag):
     m = re.match(r'^v(\d{4})-alpha(\d+)(?:\.(\d+))?$', tag)
     if not m: return None
@@ -196,13 +192,15 @@ def check_for_update(callback):
         import urllib.request
         try:
             req = urllib.request.Request("https://api.github.com/repos/G4p-Studios/ThriveMessenger/releases/latest",
-                headers={"Accept": "application/vnd.github+json", "User-Agent": "ThriveMessenger/" + VERSION})
+                headers={"Accept": "application/vnd.github+json", "User-Agent": "ThriveMessenger/" + VERSION_TAG})
             with urllib.request.urlopen(req, timeout=15) as resp:
                 data = json.loads(resp.read().decode())
             tag = data.get("tag_name", "")
             remote = parse_github_tag(tag)
             if remote is None: wx.CallAfter(callback, None, None, f"Unrecognized release tag: {tag}"); return
-            if remote > parse_version(VERSION):
+            local = parse_github_tag(VERSION_TAG)
+            if local is None: wx.CallAfter(callback, None, None, f"Unrecognized local version tag: {VERSION_TAG}"); return
+            if remote != local:
                 wx.CallAfter(callback, tag, ".".join(str(x) for x in remote), None)
             else:
                 wx.CallAfter(callback, None, None, None)
@@ -214,7 +212,7 @@ def download_update(url, dest, progress_dlg, callback):
     def _download():
         import urllib.request
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "ThriveMessenger/" + VERSION})
+            req = urllib.request.Request(url, headers={"User-Agent": "ThriveMessenger/" + VERSION_TAG})
             with urllib.request.urlopen(req, timeout=120) as resp:
                 total = int(resp.headers.get('Content-Length', 0))
                 downloaded = 0
@@ -998,7 +996,7 @@ class MainFrame(wx.Frame):
         import urllib.request
         api_url = f"https://api.github.com/repos/G4p-Studios/ThriveMessenger/releases/tags/{tag}"
         try:
-            req = urllib.request.Request(api_url, headers={"Accept": "application/vnd.github+json", "User-Agent": "ThriveMessenger/" + VERSION})
+            req = urllib.request.Request(api_url, headers={"Accept": "application/vnd.github+json", "User-Agent": "ThriveMessenger/" + VERSION_TAG})
             with urllib.request.urlopen(req, timeout=15) as resp:
                 data = json.loads(resp.read().decode())
         except Exception as e:
