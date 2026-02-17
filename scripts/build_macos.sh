@@ -8,9 +8,14 @@ APP_NAME="Thrive Messenger"
 DIST_NAME="thrive_messenger"
 OUT_DIR="${ROOT_DIR}/dist-macos"
 ARCH_LABEL="${1:-$(uname -m)}"
+VENV_DIR="${ROOT_DIR}/.venv-build"
+PYTHON_BIN="${THRIVE_PYTHON_BIN:-python3}"
 
-python3 -m pip install --upgrade pip
-python3 -m pip install \
+${PYTHON_BIN} -m venv "${VENV_DIR}"
+source "${VENV_DIR}/bin/activate"
+
+python -m pip install --upgrade pip
+python -m pip install \
   "pyinstaller>=6.18.0" \
   "keyring>=25.7.0" \
   "plyer>=2.1.0" \
