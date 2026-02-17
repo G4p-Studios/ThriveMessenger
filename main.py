@@ -2,7 +2,7 @@ import wx, socket, json, threading, datetime, wx.adv, configparser, ssl, sys, os
 import keyring
 
 VERSION = "26.0.13.1"
-VERSION_TAG = "v2026-alpha13.1"
+VERSION_TAG = "v2026-alpha14"
 if sys.platform == 'win32':
     from winotify import Notification as _WinNotification
 else:
