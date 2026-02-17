@@ -99,6 +99,14 @@ def load_config():
     shutdown_timeout = config.getint('server', 'shutdown_timeout', fallback=5)
     global max_status_length
     max_status_length = config.getint('server', 'max_status_length', fallback=50)
+    global server_identity
+    server_identity = config.get('server', 'name', fallback=config.get('server', 'host', fallback='Server'))
+    global welcome_config
+    welcome_config = {
+        'enabled': config.getboolean('welcome', 'enabled', fallback=False),
+        'pre_login': config.get('welcome', 'pre_login', fallback=''),
+        'post_login': config.get('welcome', 'post_login', fallback=''),
+    }
     return {
         'port': config.getint('server', 'port', fallback=5005),
         'certfile': config.get('server', 'certfile', fallback='server.crt'),
@@ -164,6 +172,16 @@ def handle_client(cs, addr):
         except (UnicodeDecodeError, json.JSONDecodeError): return
 
         action = req.get("action")
+
+        # --- Welcome Message (pre-login safe endpoint) ---
+        if action == "get_welcome":
+            sock.sendall((json.dumps({
+                "action": "welcome_info",
+                "enabled": bool(welcome_config.get('enabled', False)),
+                "pre_login": welcome_config.get('pre_login', '') if welcome_config.get('enabled', False) else '',
+                "post_login": welcome_config.get('post_login', '') if welcome_config.get('enabled', False) else '',
+            }) + "\n").encode())
+            return
         
         # --- Create Account ---
         if action == "create_account":
@@ -425,7 +443,7 @@ def handle_client(cs, addr):
                 with lock:
                     for (uname,) in all_users:
                         is_online = uname in clients
-                        directory.append({"user": uname, "online": is_online, "status_text": client_statuses.get(uname, "offline") if is_online else "offline", "is_admin": uname in admins, "is_contact": uname in user_contacts, "is_blocked": user_contacts.get(uname, 0) == 1})
+                        directory.append({"user": uname, "online": is_online, "status_text": client_statuses.get(uname, "offline") if is_online else "offline", "is_admin": uname in admins, "is_contact": uname in user_contacts, "is_blocked": user_contacts.get(uname, 0) == 1, "server": server_identity})
                 try: sock.sendall((json.dumps({"action": "user_directory_response", "users": directory}) + "\n").encode())
                 except: pass
 
@@ -450,6 +468,19 @@ def handle_client(cs, addr):
                     except: pass
                 if reason: 
                     sock.sendall(json.dumps({"action": "msg_failed", "to": to, "reason": reason}).encode() + b"\n")
+
+            elif action == "typing":
+                to = msg.get("to")
+                typing = bool(msg.get("typing", False))
+                if not to:
+                    continue
+                with lock:
+                    sock_to = clients.get(to)
+                if sock_to:
+                    try:
+                        sock_to.sendall((json.dumps({"action": "typing", "from": user, "typing": typing}) + "\n").encode())
+                    except Exception:
+                        pass
                     
             elif action == "file_offer":
                 to = msg["to"]
