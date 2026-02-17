@@ -1,5 +1,8 @@
-import wx, socket, json, threading, datetime, wx.adv, configparser, ssl, sys, os, base64, uuid
+import wx, socket, json, threading, datetime, wx.adv, configparser, ssl, sys, os, base64, uuid, subprocess, tempfile, re
 import keyring
+
+VERSION = "26.0.13.1"
+VERSION_TAG = "v2026-alpha13.1"
 if sys.platform == 'win32':
     from winotify import Notification as _WinNotification
 else:
@@ -172,6 +175,97 @@ def save_user_config(settings):
 SERVER_CONFIG = load_server_config()
 ADDR = (SERVER_CONFIG['host'], SERVER_CONFIG['port'])
 _IPC_PORT = 48951
+
+def parse_version(v):
+    return tuple(int(x) for x in v.strip().split('.'))
+
+def parse_github_tag(tag):
+    m = re.match(r'^v(\d{4})-alpha(\d+)(?:\.(\d+))?$', tag)
+    if not m: return None
+    return (int(m.group(1)) - 2000, 0, int(m.group(2)), int(m.group(3)) if m.group(3) else 0)
+
+def get_program_dir():
+    if getattr(sys, 'frozen', False): return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+def is_installer_install():
+    return os.path.exists(os.path.join(get_program_dir(), 'unins000.exe'))
+
+def check_for_update(callback):
+    def _check():
+        import urllib.request
+        try:
+            req = urllib.request.Request("https://api.github.com/repos/G4p-Studios/ThriveMessenger/releases/latest",
+                headers={"Accept": "application/vnd.github+json", "User-Agent": "ThriveMessenger/" + VERSION})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode())
+            tag = data.get("tag_name", "")
+            remote = parse_github_tag(tag)
+            if remote is None: wx.CallAfter(callback, None, None, f"Unrecognized release tag: {tag}"); return
+            if remote > parse_version(VERSION):
+                wx.CallAfter(callback, tag, ".".join(str(x) for x in remote), None)
+            else:
+                wx.CallAfter(callback, None, None, None)
+        except Exception as e:
+            wx.CallAfter(callback, None, None, str(e))
+    threading.Thread(target=_check, daemon=True).start()
+
+def download_update(url, dest, progress_dlg, callback):
+    def _download():
+        import urllib.request
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "ThriveMessenger/" + VERSION})
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                total = int(resp.headers.get('Content-Length', 0))
+                downloaded = 0
+                with open(dest, 'wb') as f:
+                    while True:
+                        chunk = resp.read(65536)
+                        if not chunk: break
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if total > 0:
+                            pct = min(int(downloaded * 100 / total), 100)
+                            wx.CallAfter(progress_dlg.Update, pct, f"Downloaded {downloaded // 1024} KB of {total // 1024} KB")
+            wx.CallAfter(callback, True, None)
+        except Exception as e:
+            wx.CallAfter(callback, False, str(e))
+    threading.Thread(target=_download, daemon=True).start()
+
+def apply_installer_update(installer_path):
+    program_dir = get_program_dir()
+    exe_path = os.path.join(program_dir, 'thrive_messenger.exe')
+    batch_path = os.path.join(tempfile.gettempdir(), 'thrive_update.cmd')
+    with open(batch_path, 'w') as f:
+        f.write(f'@echo off\r\n')
+        f.write(f'start /wait "" "{installer_path}" /VERYSILENT /CLOSEAPPLICATIONS /NORESTART\r\n')
+        f.write(f'start "" "{exe_path}"\r\n')
+        f.write(f'del "{installer_path}"\r\n')
+        f.write(f'del "%~f0"\r\n')
+    subprocess.Popen(['cmd', '/c', batch_path], creationflags=0x08000000)
+
+def apply_zip_update(zip_path):
+    program_dir = get_program_dir()
+    exe_path = os.path.join(program_dir, 'thrive_messenger.exe')
+    pid = os.getpid()
+    temp_extract = os.path.join(tempfile.gettempdir(), 'thrive_update_extract')
+    batch_path = os.path.join(tempfile.gettempdir(), 'thrive_update.cmd')
+    with open(batch_path, 'w') as f:
+        f.write(f'@echo off\r\n')
+        f.write(f':waitloop\r\n')
+        f.write(f'tasklist /fi "PID eq {pid}" 2>NUL | find /i "{pid}" >NUL\r\n')
+        f.write(f'if not errorlevel 1 (\r\n')
+        f.write(f'    timeout /t 1 /nobreak >NUL\r\n')
+        f.write(f'    goto waitloop\r\n')
+        f.write(f')\r\n')
+        f.write(f'if exist "{temp_extract}" rmdir /s /q "{temp_extract}"\r\n')
+        f.write(f'powershell -Command "Expand-Archive -Path \'{zip_path}\' -DestinationPath \'{temp_extract}\' -Force"\r\n')
+        f.write(f'xcopy /s /e /y /q "{temp_extract}\\thrive_messenger\\*" "{program_dir}\\"\r\n')
+        f.write(f'rmdir /s /q "{temp_extract}"\r\n')
+        f.write(f'del "{zip_path}"\r\n')
+        f.write(f'start "" "{exe_path}"\r\n')
+        f.write(f'del "%~f0"\r\n')
+    subprocess.Popen(['cmd', '/c', batch_path], creationflags=0x08000000)
 
 class ThriveTaskBarIcon(wx.adv.TaskBarIcon):
     def __init__(self, frame):
@@ -366,7 +460,8 @@ class ClientApp(wx.App):
             try: self.sock.sendall((json.dumps({"action": "set_status", "status_text": self.frame.current_status}) + "\n").encode())
             except Exception: pass
         self.play_sound("login.wav"); threading.Thread(target=self.listen_loop, daemon=True).start()
-    
+        self.frame.on_check_updates(silent=True)
+
     def play_sound(self, sound_file):
         pack = self.user_config.get('soundpack', 'default')
         path = os.path.join('sounds', pack, sound_file)
@@ -774,21 +869,23 @@ class ServerInfoDialog(wx.Dialog):
 
 class MainFrame(wx.Frame):
     def update_contact_status(self, user, online, status_text=None):
-        for idx in range(self.lv.GetItemCount()):
-            if self.lv.GetItemText(idx) == user:
-                was_online = self.lv.GetItemText(idx, 1) != "offline"
-                current_status = self.lv.GetItemText(idx, 1); is_admin = "(Admin)" in current_status
+        was_online = False
+        for c in self._all_contacts:
+            if c["user"] == user:
+                was_online = c["status"] != "offline" and not c["status"].startswith("offline")
+                is_admin = "(Admin)" in c["status"]
                 new_status = status_text if status_text else ("online" if online else "offline")
                 if not online: new_status = "offline"
                 if is_admin: new_status += " (Admin)"
-                self.lv.SetItem(idx, 1, new_status)
-                if online and not was_online:
-                    wx.GetApp().play_sound("contact_online.wav")
-                    show_notification("Contact online", f"{user} has come online.")
-                elif not online and was_online:
-                    wx.GetApp().play_sound("contact_offline.wav")
-                    show_notification("Contact offline", f"{user} has gone offline.")
+                c["status"] = new_status
                 break
+        self._apply_search_filter()
+        if online and not was_online:
+            wx.GetApp().play_sound("contact_online.wav")
+            show_notification("Contact online", f"{user} has come online.")
+        elif not online and was_online:
+            wx.GetApp().play_sound("contact_offline.wav")
+            show_notification("Contact offline", f"{user} has gone offline.")
 
     def __init__(self, user, sock):
         super().__init__(None, title=f"Thrive Messenger – {user}", size=(400,380)); self.user, self.sock = user, sock; self.task_bar_icon = None; self.is_exiting = False
@@ -800,25 +897,36 @@ class MainFrame(wx.Frame):
             dark_color = wx.Colour(40, 40, 40); light_text_color = wx.WHITE
             WxMswDarkMode().enable(self); self.SetBackgroundColour(dark_color); panel.SetBackgroundColour(dark_color)
 
+        self._all_contacts = []
         box_contacts = wx.StaticBoxSizer(wx.VERTICAL, panel, "&Contacts")
+        search_label = wx.StaticText(box_contacts.GetStaticBox(), label="Searc&h contacts:")
+        self.search_box = wx.TextCtrl(box_contacts.GetStaticBox(), style=wx.TE_PROCESS_ENTER)
+        self.search_box.Bind(wx.EVT_TEXT, self.on_search)
         self.lv = wx.ListCtrl(box_contacts.GetStaticBox(), style=wx.LC_REPORT); self.lv.InsertColumn(0, "Username", width=120); self.lv.InsertColumn(1, "Status", width=160)
         self.lv.Bind(wx.EVT_CHAR_HOOK, self.on_key); self.lv.Bind(wx.EVT_LIST_ITEM_SELECTED, self.update_button_states); self.lv.Bind(wx.EVT_LIST_ITEM_DESELECTED, self.update_button_states)
 
         if dark_mode_on:
             box_contacts.GetStaticBox().SetForegroundColour(light_text_color)
             box_contacts.GetStaticBox().SetBackgroundColour(dark_color)
+            search_label.SetForegroundColour(light_text_color)
+            self.search_box.SetBackgroundColour(dark_color); self.search_box.SetForegroundColour(light_text_color)
             self.lv.SetBackgroundColour(dark_color); self.lv.SetForegroundColour(light_text_color)
 
+        search_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        search_sizer.Add(search_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+        search_sizer.Add(self.search_box, 1, wx.EXPAND)
+        box_contacts.Add(search_sizer, 0, wx.EXPAND|wx.LEFT|wx.RIGHT|wx.TOP, 5)
         box_contacts.Add(self.lv, 1, wx.EXPAND|wx.ALL, 5)
         self.btn_block = wx.Button(panel, label="&Block"); self.btn_add = wx.Button(panel, label="&Add Contact"); self.btn_send = wx.Button(panel, label="&Start Chat"); self.btn_delete = wx.Button(panel, label="&Delete Contact")
         self.btn_send_file = wx.Button(panel, label="Send &File")
         self.btn_info = wx.Button(panel, label="Server &Info")
         self.btn_status = wx.Button(panel, label="Set Stat&us...")
         self.btn_admin = wx.Button(panel, label="Use Ser&ver Side Commands"); self.btn_settings = wx.Button(panel, label="Se&ttings...")
+        self.btn_update = wx.Button(panel, label="Check for U&pdates")
         self.btn_logout = wx.Button(panel, label="L&ogout"); self.btn_exit = wx.Button(panel, label="E&xit")
 
         if dark_mode_on:
-            buttons = [self.btn_block, self.btn_add, self.btn_send, self.btn_delete, self.btn_send_file, self.btn_info, self.btn_status, self.btn_admin, self.btn_settings, self.btn_logout, self.btn_exit]
+            buttons = [self.btn_block, self.btn_add, self.btn_send, self.btn_delete, self.btn_send_file, self.btn_info, self.btn_status, self.btn_admin, self.btn_settings, self.btn_update, self.btn_logout, self.btn_exit]
             for btn in buttons:
                 btn.SetBackgroundColour(dark_color)
                 btn.SetForegroundColour(light_text_color)
@@ -828,11 +936,12 @@ class MainFrame(wx.Frame):
         self.btn_info.Bind(wx.EVT_BUTTON, self.on_server_info)
         self.btn_status.Bind(wx.EVT_BUTTON, self.on_set_status)
         self.btn_admin.Bind(wx.EVT_BUTTON, self.on_admin); self.btn_settings.Bind(wx.EVT_BUTTON, self.on_settings)
+        self.btn_update.Bind(wx.EVT_BUTTON, self.on_check_updates)
         self.btn_logout.Bind(wx.EVT_BUTTON, self.on_logout); self.btn_exit.Bind(wx.EVT_BUTTON, self.on_exit)
-        accel_entries = [(wx.ACCEL_ALT, ord('B'), self.btn_block.GetId()), (wx.ACCEL_ALT, ord('A'), self.btn_add.GetId()), (wx.ACCEL_ALT, ord('S'), self.btn_send.GetId()), (wx.ACCEL_ALT, ord('D'), self.btn_delete.GetId()), (wx.ACCEL_ALT, ord('F'), self.btn_send_file.GetId()), (wx.ACCEL_ALT, ord('I'), self.btn_info.GetId()), (wx.ACCEL_ALT, ord('U'), self.btn_status.GetId()), (wx.ACCEL_ALT, ord('V'), self.btn_admin.GetId()), (wx.ACCEL_ALT, ord('T'), self.btn_settings.GetId()), (wx.ACCEL_ALT, ord('O'), self.btn_logout.GetId()), (wx.ACCEL_ALT, ord('X'), self.btn_exit.GetId()),]
+        accel_entries = [(wx.ACCEL_ALT, ord('B'), self.btn_block.GetId()), (wx.ACCEL_ALT, ord('A'), self.btn_add.GetId()), (wx.ACCEL_ALT, ord('S'), self.btn_send.GetId()), (wx.ACCEL_ALT, ord('D'), self.btn_delete.GetId()), (wx.ACCEL_ALT, ord('F'), self.btn_send_file.GetId()), (wx.ACCEL_ALT, ord('I'), self.btn_info.GetId()), (wx.ACCEL_ALT, ord('U'), self.btn_status.GetId()), (wx.ACCEL_ALT, ord('V'), self.btn_admin.GetId()), (wx.ACCEL_ALT, ord('T'), self.btn_settings.GetId()), (wx.ACCEL_ALT, ord('P'), self.btn_update.GetId()), (wx.ACCEL_ALT, ord('O'), self.btn_logout.GetId()), (wx.ACCEL_ALT, ord('X'), self.btn_exit.GetId()),]
         accel_tbl = wx.AcceleratorTable(accel_entries); self.SetAcceleratorTable(accel_tbl)
         gs_main = wx.GridSizer(1, 5, 5, 5); gs_main.Add(self.btn_block, 0, wx.EXPAND); gs_main.Add(self.btn_add, 0, wx.EXPAND); gs_main.Add(self.btn_send, 0, wx.EXPAND); gs_main.Add(self.btn_send_file, 0, wx.EXPAND); gs_main.Add(self.btn_delete, 0, wx.EXPAND)
-        gs_util = wx.GridSizer(1, 6, 5, 5); gs_util.Add(self.btn_info, 0, wx.EXPAND); gs_util.Add(self.btn_status, 0, wx.EXPAND); gs_util.Add(self.btn_admin, 0, wx.EXPAND); gs_util.Add(self.btn_settings, 0, wx.EXPAND); gs_util.Add(self.btn_logout, 0, wx.EXPAND); gs_util.Add(self.btn_exit, 0, wx.EXPAND)
+        gs_util = wx.GridSizer(1, 7, 5, 5); gs_util.Add(self.btn_info, 0, wx.EXPAND); gs_util.Add(self.btn_status, 0, wx.EXPAND); gs_util.Add(self.btn_admin, 0, wx.EXPAND); gs_util.Add(self.btn_settings, 0, wx.EXPAND); gs_util.Add(self.btn_update, 0, wx.EXPAND); gs_util.Add(self.btn_logout, 0, wx.EXPAND); gs_util.Add(self.btn_exit, 0, wx.EXPAND)
         s = wx.BoxSizer(wx.VERTICAL); s.Add(box_contacts, 1, wx.EXPAND|wx.ALL, 5); s.Add(gs_main, 0, wx.CENTER|wx.ALL, 5); s.Add(gs_util, 0, wx.CENTER|wx.ALL, 5); panel.SetSizer(s)
         self.update_button_states()
     def on_settings(self, event):
@@ -870,14 +979,70 @@ class MainFrame(wx.Frame):
                 app = wx.GetApp(); app.user_config['status'] = status; save_user_config(app.user_config)
                 try: self.sock.sendall((json.dumps({"action": "set_status", "status_text": status}) + "\n").encode())
                 except Exception as e: print(f"Error setting status: {e}")
+    def on_check_updates(self, event=None, silent=False):
+        self.btn_update.Disable()
+        def _callback(tag, version_str, error):
+            self.btn_update.Enable()
+            if tag:
+                result = wx.MessageBox(
+                    f"A new version is available: {tag}\nYou are currently running {VERSION_TAG}.\n\nWould you like to download and install it?",
+                    "Update Available", wx.YES_NO | wx.ICON_INFORMATION, self)
+                if result == wx.YES:
+                    self._start_update_download(tag)
+            elif error and not silent:
+                wx.MessageBox(f"Could not check for updates:\n{error}", "Update Check Failed", wx.ICON_ERROR)
+            elif not error and not silent:
+                wx.MessageBox(f"You are running the latest version, {VERSION_TAG}.", "No Updates", wx.ICON_INFORMATION)
+        check_for_update(_callback)
+    def _start_update_download(self, tag):
+        import urllib.request
+        api_url = f"https://api.github.com/repos/G4p-Studios/ThriveMessenger/releases/tags/{tag}"
+        try:
+            req = urllib.request.Request(api_url, headers={"Accept": "application/vnd.github+json", "User-Agent": "ThriveMessenger/" + VERSION})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode())
+        except Exception as e:
+            wx.MessageBox(f"Failed to fetch release info:\n{e}", "Update Error", wx.ICON_ERROR); return
+        assets = data.get("assets", [])
+        use_installer = is_installer_install()
+        target_name = "thrive_messenger_installer.exe" if use_installer else "thrive_messenger.zip"
+        asset_url = None
+        for a in assets:
+            if a["name"] == target_name:
+                asset_url = a["browser_download_url"]; break
+        if not asset_url:
+            wx.MessageBox(f"Could not find {target_name} in release assets.", "Update Error", wx.ICON_ERROR); return
+        ext = ".exe" if use_installer else ".zip"
+        dest = os.path.join(tempfile.gettempdir(), f"thrive_update{ext}")
+        progress = wx.ProgressDialog("Downloading Update", "Starting download...", maximum=100, parent=self,
+            style=wx.PD_APP_MODAL | wx.PD_AUTO_HIDE | wx.PD_CAN_ABORT | wx.PD_SMOOTH)
+        def _done(success, error):
+            progress.Destroy()
+            if success:
+                if use_installer:
+                    apply_installer_update(dest)
+                else:
+                    apply_zip_update(dest)
+                app = wx.GetApp(); app.intentional_disconnect = True
+                try: self.sock.sendall(json.dumps({"action":"logout"}).encode()+b"\n")
+                except: pass
+                try: self.sock.close()
+                except: pass
+                if self.task_bar_icon: self.task_bar_icon.Destroy()
+                self.is_exiting = True; self.Destroy()
+                app.ExitMainLoop()
+            else:
+                wx.MessageBox(f"Download failed:\n{error}", "Update Error", wx.ICON_ERROR)
+        download_update(asset_url, dest, progress, _done)
     def on_add_contact_failed(self, reason): wx.MessageBox(reason, "Add Contact Failed", wx.ICON_ERROR)
     def on_add_contact_success(self, contact_data):
-        c = contact_data; self.contact_states[c["user"]] = c["blocked"]; idx = self.lv.InsertItem(self.lv.GetItemCount(), c["user"])
+        c = contact_data; self.contact_states[c["user"]] = c["blocked"]
         status = c.get("status_text", "online") if c["online"] and not c["blocked"] else "offline"
         if c.get("is_admin"): status += " (Admin)"
-        self.lv.SetItem(idx, 1, status)
-        if c["blocked"]: self.lv.SetItemTextColour(idx, wx.Colour(150,150,150))
-        self.update_button_states()
+        self._all_contacts.append({"user": c["user"], "status": status, "blocked": c["blocked"]})
+        self._apply_search_filter()
+        chat = self.get_chat(c["user"])
+        if chat: chat.hide_add_button()
     def on_server_alert(self, message):
         wx.GetApp().play_sound("receive.wav"); wx.MessageBox(message, "Server Alert", wx.OK | wx.ICON_INFORMATION | wx.STAY_ON_TOP)
     def on_add(self, _):
@@ -888,19 +1053,30 @@ class MainFrame(wx.Frame):
                 if c == self.user: wx.MessageBox("You cannot add yourself as a contact.", "Input Error", wx.ICON_ERROR); return
                 self.sock.sendall(json.dumps({"action":"add_contact","to":c}).encode()+b"\n")
     def load_contacts(self, contacts):
-        self.contact_states = {c["user"]: c["blocked"] for c in contacts}; self.lv.DeleteAllItems()
+        self.contact_states = {c["user"]: c["blocked"] for c in contacts}
+        self._all_contacts = []
         for c in contacts:
-            idx = self.lv.InsertItem(self.lv.GetItemCount(), c["user"])
             status = c.get("status_text", "online") if c["online"] and not c["blocked"] else "offline"
             if c.get("is_admin"): status += " (Admin)"
-            self.lv.SetItem(idx, 1, status)
+            self._all_contacts.append({"user": c["user"], "status": status, "blocked": c["blocked"]})
+        self._apply_search_filter()
+    def _apply_search_filter(self):
+        query = self.search_box.GetValue().strip().lower()
+        self.lv.DeleteAllItems()
+        for c in self._all_contacts:
+            if query and query not in c["user"].lower(): continue
+            idx = self.lv.InsertItem(self.lv.GetItemCount(), c["user"])
+            self.lv.SetItem(idx, 1, c["status"])
             if c["blocked"]: self.lv.SetItemTextColour(idx, wx.Colour(150,150,150))
         self.update_button_states()
+    def on_search(self, event):
+        self._apply_search_filter()
     def on_admin_status_change(self, user, is_admin):
-        for idx in range(self.lv.GetItemCount()):
-            if self.lv.GetItemText(idx) == user:
-                current_status = self.lv.GetItemText(idx, 1); base_status = current_status.replace(" (Admin)", "")
-                new_status = base_status + " (Admin)" if is_admin else base_status; self.lv.SetItem(idx, 1, new_status); break
+        for c in self._all_contacts:
+            if c["user"] == user:
+                base_status = c["status"].replace(" (Admin)", "")
+                c["status"] = base_status + " (Admin)" if is_admin else base_status; break
+        self._apply_search_filter()
     def on_admin(self, _): dlg = self.get_admin_dialog() or AdminDialog(self, self.sock); dlg.Show(); dlg.input_ctrl.SetFocus()
     def get_admin_dialog(self):
         for child in self.GetChildren():
@@ -937,14 +1113,19 @@ class MainFrame(wx.Frame):
         if evt.GetKeyCode() == wx.WXK_RETURN: self.on_send(None)
         elif evt.GetKeyCode() == wx.WXK_DELETE: self.on_delete(None)
         else: evt.Skip()
-    def on_block_toggle(self, _): 
+    def on_block_toggle(self, _):
         sel = self.lv.GetFirstSelected()
         if sel < 0: return
-        c = self.lv.GetItemText(sel); blocked = self.contact_states.get(c,0) == 1; action = "unblock_contact" if blocked else "block_contact"; self.sock.sendall(json.dumps({"action":action,"to":c}).encode()+b"\n"); self.contact_states[c] = 0 if blocked else 1; idx_color = wx.NullColour if blocked else wx.Colour(150,150,150); self.lv.SetItemTextColour(sel, idx_color); self.update_button_states()
+        c = self.lv.GetItemText(sel); blocked = self.contact_states.get(c,0) == 1; action = "unblock_contact" if blocked else "block_contact"; self.sock.sendall(json.dumps({"action":action,"to":c}).encode()+b"\n"); self.contact_states[c] = 0 if blocked else 1
+        for entry in self._all_contacts:
+            if entry["user"] == c: entry["blocked"] = 0 if blocked else 1; break
+        self._apply_search_filter()
     def on_delete(self, _):
         sel = self.lv.GetFirstSelected()
         if sel < 0: return
-        c = self.lv.GetItemText(sel); self.sock.sendall(json.dumps({"action":"delete_contact","to":c}).encode()+b"\n"); self.lv.DeleteItem(sel); self.contact_states.pop(c, None); self.update_button_states()
+        c = self.lv.GetItemText(sel); self.sock.sendall(json.dumps({"action":"delete_contact","to":c}).encode()+b"\n"); self.contact_states.pop(c, None)
+        self._all_contacts = [entry for entry in self._all_contacts if entry["user"] != c]
+        self._apply_search_filter()
     def on_send(self, _):
         sel = self.lv.GetFirstSelected()
         if sel < 0: return
@@ -958,9 +1139,12 @@ class MainFrame(wx.Frame):
         c = self.lv.GetItemText(sel)
         wx.GetApp().send_file_to(c)
     def receive_message(self, msg):
-        wx.GetApp().play_sound("receive.wav"); 
+        wx.GetApp().play_sound("receive.wav");
         app = wx.GetApp(); logging_config = app.user_config.get('chat_logging', {}); is_logging_enabled = logging_config.get(msg["from"], False)
-        dlg = self.get_chat(msg["from"]) or ChatDialog(self, msg["from"], self.sock, self.user, is_logging_enabled)
+        dlg = self.get_chat(msg["from"])
+        if not dlg:
+            is_contact = msg["from"] in self.contact_states
+            dlg = ChatDialog(self, msg["from"], self.sock, self.user, is_logging_enabled, is_contact=is_contact)
         dlg.Show(); dlg.append(msg["msg"], msg["from"], msg["time"]); dlg.input_ctrl.SetFocus(); self.RequestUserAttention()
     def on_message_failed(self, to, reason): chat_dlg = self.get_chat(to); (chat_dlg.append_error(reason) if chat_dlg else wx.MessageBox(reason, "Message Failed", wx.OK | wx.ICON_ERROR))
     def get_chat(self, contact):
@@ -1011,17 +1195,23 @@ class AdminDialog(wx.Dialog):
         if text.lower().startswith('error'): self.hist.SetItemTextColour(idx, wx.RED)
 
 class ChatDialog(wx.Dialog):
-    def __init__(self, parent, contact, sock, user, logging_enabled=False):
+    def __init__(self, parent, contact, sock, user, logging_enabled=False, is_contact=True):
         super().__init__(parent, title=f"Chat with {contact}", size=(450, 450))
         self.contact, self.sock, self.user = contact, sock, user
         self.Bind(wx.EVT_CHAR_HOOK, self.on_key)
-        
+
         dark_mode_on = is_windows_dark_mode()
         if dark_mode_on:
             dark_color = wx.Colour(40, 40, 40); light_text_color = wx.WHITE
             WxMswDarkMode().enable(self); self.SetBackgroundColour(dark_color)
-        
+
         s = wx.BoxSizer(wx.VERTICAL)
+        self.btn_add_contact = wx.Button(self, label="&Add to Contacts")
+        self.btn_add_contact.Bind(wx.EVT_BUTTON, self.on_add_contact)
+        if dark_mode_on:
+            self.btn_add_contact.SetBackgroundColour(dark_color); self.btn_add_contact.SetForegroundColour(light_text_color)
+        s.Add(self.btn_add_contact, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 5)
+        if is_contact: self.btn_add_contact.Hide()
         self.hist = wx.ListCtrl(self, style=wx.LC_REPORT)
         self.hist.InsertColumn(0, "Sender", width=80); self.hist.InsertColumn(1, "Message", width=160); self.hist.InsertColumn(2, "Time", width=180)
         self.save_hist_cb = wx.CheckBox(self, label="Sa&ve chat history")
@@ -1086,6 +1276,11 @@ class ChatDialog(wx.Dialog):
         self.input_ctrl.Clear(); self.input_ctrl.SetFocus()
     def on_send_file(self, _):
         wx.GetApp().send_file_to(self.contact)
+    def on_add_contact(self, _):
+        self.sock.sendall(json.dumps({"action": "add_contact", "to": self.contact}).encode() + b"\n")
+        self.btn_add_contact.Disable(); self.btn_add_contact.SetLabel("Adding...")
+    def hide_add_button(self):
+        self.btn_add_contact.Hide(); self.GetSizer().Layout()
     def append(self, text, sender, ts, is_error=False):
         idx = self.hist.GetItemCount(); self.hist.InsertItem(idx, sender); self.hist.SetItem(idx, 1, text)
         formatted_time = format_timestamp(ts); self.hist.SetItem(idx, 2, formatted_time)

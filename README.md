@@ -109,6 +109,7 @@ When you log into Thrive Messenger, you will land on your contact list. Of cours
 *   The logout (Alt + O) and exit (Alt + X) buttons are self explanatory.
 * The server info button (Alt + I) will show information about the server you're currently logged into.
 * Alt + U will allow you to set an online status that your contacts will see. You can choose from a list of preset statuses, such as online, offline and busy, or you can choose a custom one and type a personal message. Server owners can customize the character limit for custom statuses via max_status_length, so check that you have enough characters before you start setting System of a Down lyrics as your status.
+* Alt P will check for updates to the program and allow you to auto download them.
 * Pressing Alt F4 will minimize the client to the system tray, ready for you to receive messages. Simply double click or press Enter on the Thrive Messenger system tray item to bring it back up.
 
 ### Sending and receiving messages
