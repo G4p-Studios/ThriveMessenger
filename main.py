@@ -238,6 +238,7 @@ def load_user_config():
         'typing_indicators': True,
         'announce_typing': True,
         'enter_key_action': 'send',
+        'escape_main_action': 'none',
         'save_chat_history_default': False
     }
 
@@ -671,6 +672,16 @@ class SettingsDialog(wx.Dialog):
         ])
         self.enter_action_choice.SetSelection(0 if self.config.get('enter_key_action', 'send') == 'send' else 1)
         enter_row.Add(self.enter_action_choice, 1, wx.EXPAND)
+        escape_row = wx.BoxSizer(wx.HORIZONTAL)
+        escape_row.Add(wx.StaticText(accessibility_box.GetStaticBox(), label="Escape in main window:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        self.escape_action_choice = wx.Choice(accessibility_box.GetStaticBox(), choices=[
+            "Do nothing (recommended)",
+            "Minimize to tray/status menu",
+            "Quit app",
+        ])
+        esc_val = str(self.config.get('escape_main_action', 'none') or 'none')
+        self.escape_action_choice.SetSelection(0 if esc_val == 'none' else (1 if esc_val == 'minimize' else 2))
+        escape_row.Add(self.escape_action_choice, 1, wx.EXPAND)
 
         sound_box.Add(self.choice, 0, wx.EXPAND | wx.ALL, 5)
         sound_box.Add(self.default_soundpack_label, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
@@ -688,6 +699,7 @@ class SettingsDialog(wx.Dialog):
         accessibility_box.Add(self.typing_indicator_cb, 0, wx.ALL, 5)
         accessibility_box.Add(self.announce_typing_cb, 0, wx.ALL, 5)
         accessibility_box.Add(enter_row, 0, wx.EXPAND | wx.ALL, 5)
+        accessibility_box.Add(escape_row, 0, wx.EXPAND | wx.ALL, 5)
         main_sizer.Add(sound_box, 0, wx.EXPAND | wx.ALL, 5)
         main_sizer.Add(call_audio_box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         main_sizer.Add(accessibility_box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
@@ -704,6 +716,7 @@ class SettingsDialog(wx.Dialog):
             for cb in [self.auto_open_files_cb, self.read_aloud_cb, self.global_chat_logging_cb, self.show_main_actions_cb, self.typing_indicator_cb, self.announce_typing_cb]:
                 cb.SetForegroundColour(light_text_color)
             self.enter_action_choice.SetBackgroundColour(dark_color); self.enter_action_choice.SetForegroundColour(light_text_color)
+            self.escape_action_choice.SetBackgroundColour(dark_color); self.escape_action_choice.SetForegroundColour(light_text_color)
             ok_btn.SetBackgroundColour(dark_color); ok_btn.SetForegroundColour(light_text_color)
             cancel_btn.SetBackgroundColour(dark_color); cancel_btn.SetForegroundColour(light_text_color)
             
@@ -2106,6 +2119,7 @@ class MainFrame(wx.Frame):
         self._root_sizer = s
         self._build_menu_bar()
         self._apply_voiceover_hints(search_label)
+        self.Bind(wx.EVT_CHAR_HOOK, self.on_key)
         self.apply_action_button_layout()
         self.update_button_states()
 
@@ -2243,6 +2257,7 @@ class MainFrame(wx.Frame):
                 app.user_config['typing_indicators'] = dlg.typing_indicator_cb.IsChecked()
                 app.user_config['announce_typing'] = dlg.announce_typing_cb.IsChecked()
                 app.user_config['enter_key_action'] = 'send' if dlg.enter_action_choice.GetSelection() == 0 else 'newline'
+                app.user_config['escape_main_action'] = ('none' if dlg.escape_action_choice.GetSelection() == 0 else ('minimize' if dlg.escape_action_choice.GetSelection() == 1 else 'quit'))
                 save_user_config(app.user_config)
                 self.apply_action_button_layout()
                 wx.MessageBox("Settings have been applied.", "Settings Saved", wx.OK | wx.ICON_INFORMATION)
@@ -2330,15 +2345,100 @@ class MainFrame(wx.Frame):
                 self.btn_block.SetLabel("&Block")
         if event: event.Skip()
     def on_set_status(self, event):
-        with StatusDialog(self, self.current_status) as dlg:
-            if dlg.ShowModal() == wx.ID_OK:
-                sel = dlg.choice.GetStringSelection()
-                status = dlg.status_text.GetValue().strip() if sel == "Custom..." else sel
-                if not status: return
-                self.current_status = status
-                app = wx.GetApp(); app.user_config['status'] = status; save_user_config(app.user_config)
-                try: self.sock.sendall((json.dumps({"action": "set_status", "status_text": status}) + "\n").encode())
-                except Exception as e: print(f"Error setting status: {e}")
+        menu = wx.Menu()
+        app = wx.GetApp()
+        status_preset = app.user_config.get('status_preset', 'online')
+        status_custom_by_preset = app.user_config.get('status_custom_by_preset', {})
+        if not isinstance(status_custom_by_preset, dict):
+            status_custom_by_preset = {}
+        status_global_custom = app.user_config.get('status_global_custom', '')
+
+        def _compose_status_text(preset):
+            preset_custom = str(status_custom_by_preset.get(preset, '') or '').strip()
+            global_custom = str(status_global_custom or '').strip()
+            if preset_custom:
+                return f"{preset} status, {preset_custom}"
+            if global_custom:
+                return f"{preset} status, {global_custom}"
+            return preset
+
+        current_line = menu.Append(wx.ID_ANY, f"Currently: {_compose_status_text(status_preset)}")
+        current_line.Enable(False)
+        menu.AppendSeparator()
+
+        preset_items = {}
+        for preset in STATUS_PRESETS:
+            label = preset
+            if preset == status_preset:
+                label += " (Selected)"
+            mi = menu.Append(wx.ID_ANY, label)
+            preset_items[mi.GetId()] = preset
+
+        menu.AppendSeparator()
+        mi_custom_selected = menu.Append(wx.ID_ANY, f"Set custom text for selected status ({status_preset})")
+        mi_custom_global = menu.Append(wx.ID_ANY, "Set global custom text")
+        mi_clear_selected = menu.Append(wx.ID_ANY, f"Clear custom text for selected status ({status_preset})")
+        mi_clear_global = menu.Append(wx.ID_ANY, "Clear global custom text")
+
+        def _send_status_text(text):
+            self.current_status = text
+            app.user_config['status'] = text
+            save_user_config(app.user_config)
+            try:
+                self.sock.sendall((json.dumps({"action": "set_status", "status_text": text}) + "\n").encode())
+            except Exception as e:
+                print(f"Error setting status: {e}")
+
+        def _on_pick_preset(evt):
+            nonlocal status_preset
+            preset = preset_items.get(evt.GetId())
+            if not preset:
+                return
+            status_preset = preset
+            app.user_config['status_preset'] = preset
+            _send_status_text(_compose_status_text(preset))
+
+        def _on_set_custom_selected(_):
+            nonlocal status_custom_by_preset
+            with wx.TextEntryDialog(self, f"Custom text for '{status_preset}' (leave blank to clear):", "Custom Status") as dlg:
+                if dlg.ShowModal() != wx.ID_OK:
+                    return
+                txt = dlg.GetValue().strip()
+                if txt:
+                    status_custom_by_preset[status_preset] = txt
+                else:
+                    status_custom_by_preset.pop(status_preset, None)
+                app.user_config['status_custom_by_preset'] = status_custom_by_preset
+                _send_status_text(_compose_status_text(status_preset))
+
+        def _on_set_custom_global(_):
+            nonlocal status_global_custom
+            with wx.TextEntryDialog(self, "Global custom text (used when selected status has no custom text):", "Global Custom Status") as dlg:
+                if dlg.ShowModal() != wx.ID_OK:
+                    return
+                status_global_custom = dlg.GetValue().strip()
+                app.user_config['status_global_custom'] = status_global_custom
+                _send_status_text(_compose_status_text(status_preset))
+
+        def _on_clear_selected(_):
+            status_custom_by_preset.pop(status_preset, None)
+            app.user_config['status_custom_by_preset'] = status_custom_by_preset
+            _send_status_text(_compose_status_text(status_preset))
+
+        def _on_clear_global(_):
+            nonlocal status_global_custom
+            status_global_custom = ""
+            app.user_config['status_global_custom'] = ""
+            _send_status_text(_compose_status_text(status_preset))
+
+        for item_id in preset_items:
+            menu.Bind(wx.EVT_MENU, _on_pick_preset, id=item_id)
+        menu.Bind(wx.EVT_MENU, _on_set_custom_selected, mi_custom_selected)
+        menu.Bind(wx.EVT_MENU, _on_set_custom_global, mi_custom_global)
+        menu.Bind(wx.EVT_MENU, _on_clear_selected, mi_clear_selected)
+        menu.Bind(wx.EVT_MENU, _on_clear_global, mi_clear_global)
+        self.PopupMenu(menu)
+        menu.Destroy()
     def on_check_updates(self, event=None, silent=False):
         self.btn_update.Disable()
         def _callback(tag, version_str, error):
@@ -2562,8 +2662,11 @@ class MainFrame(wx.Frame):
         if sys.platform == "darwin":
             self.on_exit(None)
             return
+        self.minimize_to_tray()
+    def minimize_to_tray(self):
         self.Hide()
-        self.task_bar_icon = ThriveTaskBarIcon(self)
+        if not self.task_bar_icon:
+            self.task_bar_icon = ThriveTaskBarIcon(self)
     def restore_from_tray(self):
         if self.task_bar_icon: self.task_bar_icon.Destroy(); self.task_bar_icon = None
         self.Show(); self.Raise()
@@ -2593,6 +2696,13 @@ class MainFrame(wx.Frame):
     def on_key(self, evt):
         if evt.GetKeyCode() == wx.WXK_F1:
             open_help_docs_for_context("main", self)
+        elif evt.GetKeyCode() == wx.WXK_ESCAPE:
+            action = str(wx.GetApp().user_config.get('escape_main_action', 'none') or 'none')
+            if action == 'quit':
+                self.on_exit(None)
+            elif action == 'minimize':
+                self.minimize_to_tray()
+            return
         elif evt.GetKeyCode() == wx.WXK_RETURN: self.on_send(None)
         elif evt.GetKeyCode() == wx.WXK_DELETE: self.on_delete(None)
         else: evt.Skip()

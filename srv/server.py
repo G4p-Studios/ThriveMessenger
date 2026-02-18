@@ -871,13 +871,15 @@ def handle_delete(user):
 
 def run_cli():
     print("Thrive Server Admin Console")
-    print("Available commands: create, ban, unban, del, admin, unadmin, alert, banfile, unbanfile, restart, exit")
+    print("Available commands: help, create, ban, unban, del, admin, unadmin, alert, banfile, unbanfile, restart, exit")
     while True:
         try:
             cmd_line = input("> ").strip()
             parts = cmd_line.split()
             if not parts: continue
             command = parts[0].lower()
+            if command == "help":
+                print("Available commands: help, create, ban, unban, del, admin, unadmin, alert, banfile, unbanfile, restart, exit")
             if command == "exit":
                 broadcast_alert(f"The server is shutting down in {shutdown_timeout} seconds.")
                 print(f"Server shutting down in {shutdown_timeout} seconds...")
