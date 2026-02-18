@@ -1586,8 +1586,10 @@ def format_timestamp(iso_ts, use_local_time=True):
                 dt = dt.replace(tzinfo=datetime.timezone.utc)
             dt = dt.astimezone()
         day_with_suffix = get_day_with_suffix(dt.day)
-        formatted_hour = dt.strftime('%I:%M %p').lstrip('0'); return dt.strftime(f'%A, %B {day_with_suffix}, %Y at {formatted_hour}')
-    except (ValueError, TypeError): return iso_ts
+        formatted_hour = dt.strftime('%I:%M %p').lstrip('0')
+        return dt.strftime(f'%A, %B {day_with_suffix}, %Y at {formatted_hour}')
+    except (ValueError, TypeError):
+        return iso_ts
 
 class AdminDialog(wx.Dialog):
     def __init__(self, parent, sock):
@@ -1782,11 +1784,15 @@ class ChatDialog(wx.Dialog):
     def hide_add_button(self):
         self.btn_add_contact.Hide(); self.GetSizer().Layout()
     def append(self, text, sender, ts, is_error=False):
-        idx = self.hist.GetItemCount(); self.hist.InsertItem(idx, sender); self.hist.SetItem(idx, 1, text)
+        idx = self.hist.GetItemCount()
+        self.hist.InsertItem(idx, sender)
+        self.hist.SetItem(idx, 1, text)
         app = wx.GetApp()
         use_local_time = app.user_config.get('use_local_time', True)
-        formatted_time = format_timestamp(ts, use_local_time); self.hist.SetItem(idx, 2, formatted_time)
-        if is_error: self.hist.SetItemTextColour(idx, wx.RED)
+        formatted_time = format_timestamp(ts, use_local_time)
+        self.hist.SetItem(idx, 2, formatted_time)
+        if is_error:
+            self.hist.SetItemTextColour(idx, wx.RED)
         
         # Save to cache
         self._save_message_to_cache(text, sender, ts, is_error)
