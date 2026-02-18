@@ -1,44 +1,39 @@
 import wx, socket, json, threading, datetime, wx.adv, configparser, ssl, sys, os, base64, uuid, subprocess, tempfile, re, time
 import keyring
 
-try:
-    from accessible_output2.outputs.auto import Auto as _AO2Auto
-    _ao2 = _AO2Auto()
-    _ao2_available = True
-except Exception:
-    _ao2 = None
-    _ao2_available = False
-
-def speak(text):
-    if _ao2_available and _ao2:
-        try: _ao2.speak(text, interrupt=True)
-        except Exception: pass
-
 VERSION_TAG = "v2026-alpha15"
 
 # Constants
 MAX_CACHED_MESSAGES_PER_CONTACT = 100
 
-if sys.platform == 'win32':
-    from winotify import Notification as _WinNotification
-else:
-    from plyer import notification as _plyer_notification
-
-# Initialize accessible_output2 for speech feedback
+# Initialize accessible_output2 for speech feedback and TTS
 try:
-    from accessible_output2.outputs.auto import Auto as _SpeechOutput
-    _speech = _SpeechOutput()
+    from accessible_output2.outputs.auto import Auto as _AO2Auto
+    _ao2 = _AO2Auto()
+    _ao2_available = True
 except Exception as e:
-    print(f"Could not initialize speech output: {e}")
-    _speech = None
+    print(f"Could not initialize accessible_output2: {e}")
+    _ao2 = None
+    _ao2_available = False
+
+def speak(text):
+    """Speak text immediately, interrupting any current speech."""
+    if _ao2_available and _ao2:
+        try: _ao2.speak(text, interrupt=True)
+        except Exception: pass
 
 def speak_message(message):
     """Speak a message using accessible_output2 if speech feedback is enabled."""
     try:
-        if _speech and wx.GetApp() and wx.GetApp().user_config.get('speech_feedback', False):
-            _speech.speak(message, interrupt=False)
+        if _ao2 and wx.GetApp() and wx.GetApp().user_config.get('speech_feedback', False):
+            _ao2.speak(message, interrupt=False)
     except Exception as e:
         print(f"Error speaking message: {e}")
+
+if sys.platform == 'win32':
+    from winotify import Notification as _WinNotification
+else:
+    from plyer import notification as _plyer_notification
 
 def show_notification(title, message, timeout=5):
     """Show OS notification if enabled in user preferences."""
@@ -668,7 +663,19 @@ class ClientApp(wx.App):
             elif result == wx.ID_ABORT:
                 success, sock, sf, _ = self.perform_login(dlg.new_username, dlg.new_password)
                 if success:
-                    self.user_config = {'username': dlg.new_username, 'password': dlg.new_password, 'remember': True, 'autologin': True, 'soundpack': 'default', 'chat_logging': {}}
+                    self.user_config = {
+                        'username': dlg.new_username,
+                        'password': dlg.new_password,
+                        'remember': True,
+                        'autologin': True,
+                        'soundpack': 'default',
+                        'speech_feedback': False,
+                        'show_notifications': True,
+                        'chat_logging': {},
+                        'tts_enabled': False,
+                        'message_cache': {},
+                        'use_local_time': True
+                    }
                     save_user_config(self.user_config); self.start_main_session(dlg.new_username, sock, sf); return True
             else: return False
     
