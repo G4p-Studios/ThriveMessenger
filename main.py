@@ -1991,7 +1991,7 @@ class FileTransfersDialog(wx.Dialog):
 
 class UserDirectoryDialog(wx.Dialog):
     def __init__(self, parent_frame, users, my_username, contact_states):
-        super().__init__(None, title="User Directory", size=(550, 500), style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        super().__init__(parent_frame, title="User Directory", size=(550, 500), style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
         self.Bind(wx.EVT_CHAR_HOOK, self.on_key)
         self.parent_frame = parent_frame; self.my_username = my_username; self.contact_states = contact_states
         self._all_users = users; self._selected_user = None
