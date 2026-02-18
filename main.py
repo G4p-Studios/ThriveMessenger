@@ -148,14 +148,10 @@ def load_user_config():
         'username': '',
         'password': '',
         'soundpack': 'default',
-<<<<<<< HEAD
         'speech_feedback': False,
         'show_notifications': True,
-        'chat_logging': {}
-=======
         'chat_logging': {},
         'tts_enabled': False
->>>>>>> 8081db200dd6093efdf8c4bda21156d9c2d44682
     }
 
     # 1. Load non-sensitive preferences from JSON
@@ -376,7 +372,6 @@ class SettingsDialog(wx.Dialog):
         self.choice = wx.Choice(sound_box.GetStaticBox(), choices=sound_packs); current_pack = self.config.get('soundpack', 'default')
         if current_pack in sound_packs: self.choice.SetStringSelection(current_pack)
         else: self.choice.SetSelection(0)
-<<<<<<< HEAD
         
         sound_box.Add(self.choice, 0, wx.EXPAND | wx.ALL, 5); main_sizer.Add(sound_box, 0, wx.EXPAND | wx.ALL, 5)
         
@@ -413,21 +408,28 @@ class SettingsDialog(wx.Dialog):
         notification_box.Add(self.notification_list, 1, wx.EXPAND | wx.ALL, 5)
         main_sizer.Add(notification_box, 1, wx.EXPAND | wx.ALL, 5)
         
-=======
-
+        # Add TTS checkbox from main branch
         self.tts_cb = wx.CheckBox(panel, label="&Read new messages aloud")
-        self.tts_cb.SetValue(self.config.get('tts_enabled', True))
+        self.tts_cb.SetValue(self.config.get('tts_enabled', False))
         if not _ao2_available:
             self.tts_cb.Enable(False)
             self.tts_cb.SetToolTip("accessible_output2 is not installed")
-
+        
+        if dark_mode_on:
+            self.tts_cb.SetBackgroundColour(dark_color)
+            self.tts_cb.SetForegroundColour(light_text_color)
+        
+        main_sizer.Add(self.tts_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        
+        # Add Change Password button from main branch
         self.btn_chpass = wx.Button(panel, label="C&hange Password...")
         self.btn_chpass.Bind(wx.EVT_BUTTON, self.on_change_password)
-
-        sound_box.Add(self.choice, 0, wx.EXPAND | wx.ALL, 5); main_sizer.Add(sound_box, 0, wx.EXPAND | wx.ALL, 5)
-        main_sizer.Add(self.tts_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        
+        if dark_mode_on:
+            self.btn_chpass.SetBackgroundColour(dark_color)
+            self.btn_chpass.SetForegroundColour(light_text_color)
+        
         main_sizer.Add(self.btn_chpass, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
->>>>>>> 8081db200dd6093efdf8c4bda21156d9c2d44682
         btn_sizer = wx.StdDialogButtonSizer()
         ok_btn = wx.Button(panel, wx.ID_OK, label="&Apply"); ok_btn.SetDefault(); cancel_btn = wx.Button(panel, wx.ID_CANCEL)
 
@@ -1366,14 +1368,12 @@ class MainFrame(wx.Frame):
         with SettingsDialog(self, app.user_config) as dlg:
             if dlg.ShowModal() == wx.ID_OK:
                 selected_pack = dlg.choice.GetStringSelection(); app.user_config['soundpack'] = selected_pack
-<<<<<<< HEAD
                 # Get checked states from ListCtrl
                 app.user_config['speech_feedback'] = dlg.notification_list.IsItemChecked(0)
                 app.user_config['show_notifications'] = dlg.notification_list.IsItemChecked(1)
+                # Get TTS setting from main branch
+                app.user_config['tts_enabled'] = dlg.tts_cb.IsChecked()
                 save_user_config(app.user_config)
-=======
-                app.user_config['tts_enabled'] = dlg.tts_cb.IsChecked(); save_user_config(app.user_config)
->>>>>>> 8081db200dd6093efdf8c4bda21156d9c2d44682
                 wx.MessageBox("Settings have been applied.", "Settings Saved", wx.OK | wx.ICON_INFORMATION)
     def on_conversations(self, _):
         if self._conversations_dlg:
