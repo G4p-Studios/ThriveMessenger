@@ -19,6 +19,20 @@ server_port = 0
 use_ssl = False
 server_started_at = time.time()
 bot_usernames = set()
+bot_status_map = {}
+bot_purpose_map = {}
+
+def _parse_bot_map(raw):
+    out = {}
+    for item in str(raw or "").split(","):
+        if ":" not in item:
+            continue
+        name, value = item.split(":", 1)
+        name = name.strip()
+        value = value.strip()
+        if name and value:
+            out[name] = value
+    return out
 
 def _active_usernames():
     with lock:
@@ -29,7 +43,9 @@ def _is_online_user(username):
 
 def _status_for_user(username):
     if username in bot_usernames:
-        return "online"
+        status = bot_status_map.get(username, "online")
+        purpose = bot_purpose_map.get(username, "")
+        return f"{status} - {purpose}" if purpose else status
     with lock:
         return client_statuses.get(username, "online" if username in clients else "offline")
 
@@ -170,10 +186,11 @@ def load_config():
         'api_token': config.get('flexpbx', 'api_token', fallback=''),
         'from_number': config.get('flexpbx', 'from_number', fallback=''),
     }
+    enforce_blackfiles = config.getboolean('server', 'enforce_blackfile_list', fallback=False)
     global file_config
     file_config = {
         'size_limit': config.getint('server', 'size_limit', fallback=0),
-        'blackfiles': [ext.strip().lower() for ext in config.get('server', 'blackfiles', fallback='').split(',') if ext.strip()],
+        'blackfiles': [ext.strip().lower() for ext in config.get('server', 'blackfiles', fallback='').split(',') if ext.strip()] if enforce_blackfiles else [],
     }
     global shutdown_timeout
     shutdown_timeout = config.getint('server', 'shutdown_timeout', fallback=5)
@@ -190,6 +207,12 @@ def load_config():
     global bot_usernames
     raw_bots = config.get('bots', 'names', fallback='assistant-bot,helper-bot')
     bot_usernames = {name.strip() for name in raw_bots.split(',') if name.strip()}
+    if not bot_usernames:
+        bot_usernames = {"assistant-bot", "helper-bot"}
+    global bot_status_map
+    bot_status_map = _parse_bot_map(config.get('bots', 'status_map', fallback=''))
+    global bot_purpose_map
+    bot_purpose_map = _parse_bot_map(config.get('bots', 'purpose_map', fallback=''))
     return {
         'port': config.getint('server', 'port', fallback=5005),
         'certfile': config.get('server', 'certfile', fallback='server.crt'),
@@ -443,6 +466,7 @@ def handle_client(cs, addr):
                 target_user = str(msg.get("username", "")).strip()
                 method = str(msg.get("method", "email")).strip().lower()
                 target = str(msg.get("target", "")).strip()
+                include_link = bool(msg.get("include_link", True))
                 if not target_user or not target:
                     sock.sendall((json.dumps({
                         "action": "invite_result",
@@ -452,15 +476,16 @@ def handle_client(cs, addr):
                         "reason": "Invite target username and destination are required."
                     }) + "\n").encode())
                     continue
-                invite_text = (
-                    f"{user} invited you to join Thrive Messenger on {server_identity}. "
-                    f"Visit https://im.tappedin.fm/ for setup and sign-in."
-                )
+                if method not in ("email", "sms"):
+                    method = "email" if "@" in target else "sms"
+                invite_text = f"{user} invited you to join Thrive Messenger on {server_identity}."
+                if include_link:
+                    invite_text += " Visit https://im.tappedin.fm/ for setup and sign-in."
                 ok = False
                 reason = "Unsupported invite method."
                 if method == "email":
                     ok = EmailManager.send_email(target, "You're invited to Thrive Messenger", invite_text)
-                    reason = "Invite email sent." if ok else "Email module is not enabled or delivery failed."
+                    reason = "Invite email sent." if ok else "Email delivery is unavailable or failed."
                 elif method == "sms":
                     ok, sms_reason = FlexPBXManager.send_sms(target, invite_text)
                     reason = "Invite SMS sent." if ok else sms_reason

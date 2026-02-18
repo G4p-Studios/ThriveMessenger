@@ -1,4 +1,4 @@
-import wx, socket, json, threading, datetime, wx.adv, configparser, ssl, sys, os, base64, uuid, subprocess, tempfile, re, random
+import wx, socket, json, threading, datetime, wx.adv, configparser, ssl, sys, os, base64, uuid, subprocess, tempfile, re, random, shutil
 import keyring
 try:
     import wx.html2 as wxhtml2
@@ -224,6 +224,11 @@ def load_user_config():
         'username': '',
         'password': '',
         'soundpack': 'default',
+        'default_soundpack': 'default',
+        'sound_volume': 80,
+        'call_input_volume': 80,
+        'call_output_volume': 80,
+        'show_main_action_buttons': True,
         'chat_logging': {},
         'server_entries': file_entries,
         'last_server_name': file_entries[0]['name'] if file_entries else 'Default Server',
@@ -231,7 +236,9 @@ def load_user_config():
         'auto_open_received_files': True,
         'read_messages_aloud': False,
         'typing_indicators': True,
-        'announce_typing': True
+        'announce_typing': True,
+        'enter_key_action': 'send',
+        'save_chat_history_default': False
     }
 
     # 1. Load non-sensitive preferences from JSON
@@ -442,13 +449,13 @@ def _help_docs_dir():
 
 def ensure_help_docs():
     docs = {
-        "general": "<h1>Thrive Messenger Help</h1><p>Press F1 in each window for contextual help.</p>",
+        "general": "<h1>Thrive Messenger Help</h1><p>Press F1 in each window for contextual help. Press Escape or Command+W to close this help window and return.</p>",
         "login": "<h1>Login Help</h1><p>Use Server dropdown to pick a server. Use Manage Servers to add/edit endpoints. Use Set as Primary to choose your default server. Then enter username and password and sign in.</p>",
-        "main": "<h1>Contacts Window Help</h1><p>Manage contacts, statuses, files, and chats. Activate a status containing a link to open it. Use Alt shortcuts on each button.</p>",
-        "chat": "<h1>Chat Window Help</h1><p>Enter sends, Shift+Enter adds newline. Links in messages are clickable by activating message rows. Typing indicators and readout can be toggled in Settings.</p>",
-        "directory": "<h1>User Directory Help</h1><p>Shows users from current and configured servers with server labels. Activate entries to start chat or open status links.</p>",
+        "main": "<h1>Contacts Window Help</h1><p>Manage contacts, statuses, files, and chats. Default action is Start Chat for the focused contact. User actions are available from User and context menus. File Transfers window shows sent/received files and their saved locations.</p>",
+        "chat": "<h1>Chat Window Help</h1><p>Enter sends message, Ctrl+Enter sends file, and Cmd+Enter inserts a new line. Message history is keyboard navigable and links can be activated from selected items. Typing indicators and readout can be toggled in Settings.</p>",
+        "directory": "<h1>User Directory Help</h1><p>Shows users from current and configured servers with server labels. Use Sort and Filter options for contacts. If a selected server does not support a feature, the related action is dimmed and explains why.</p>",
         "admin": "<h1>Admin Commands Help</h1><p>Commands start with '/'. Example: /alert message, /create username password, /admin username.</p>",
-        "settings": "<h1>Settings Help</h1><p>Configure sounds and chat accessibility features like message readout, typing indicators, and auto-open received files.</p>",
+        "settings": "<h1>Settings Help</h1><p>Configure sound pack, default sound pack selection, sound volume, call input/output levels, and chat accessibility options. Settings are remembered by the app.</p>",
         "server_info": "<h1>Server Info Help</h1><p>Shows active server host, port, encryption state, user counts, and file policy limits.</p>",
     }
     out = {}
@@ -478,6 +485,13 @@ def open_help_docs_for_context(context, parent):
     if wxhtml2 is not None:
         try:
             dlg = wx.Dialog(parent, title="Help", size=(760, 560))
+            def _on_key(event):
+                key = event.GetKeyCode()
+                if key == wx.WXK_ESCAPE or (event.CmdDown() and key == ord('W')):
+                    dlg.EndModal(wx.ID_OK)
+                    return
+                event.Skip()
+            dlg.Bind(wx.EVT_CHAR_HOOK, _on_key)
             web = wxhtml2.WebView.New(dlg)
             web.LoadURL("file://" + target)
             s = wx.BoxSizer(wx.VERTICAL)
@@ -595,9 +609,10 @@ class ThriveTaskBarIcon(wx.adv.TaskBarIcon):
 
 class SettingsDialog(wx.Dialog):
     def __init__(self, parent, current_config):
-        super().__init__(parent, title="Settings", size=(380, 360)); self.config = current_config
+        super().__init__(parent, title="Settings", size=(430, 540)); self.config = current_config
         self.Bind(wx.EVT_CHAR_HOOK, self.on_key)
         panel = wx.Panel(self); main_sizer = wx.BoxSizer(wx.VERTICAL); sound_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "&Sound Pack")
+        call_audio_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "Call Audio Levels")
         accessibility_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "&Chat Accessibility")
         
         dark_mode_on = is_windows_dark_mode()
@@ -606,6 +621,8 @@ class SettingsDialog(wx.Dialog):
             WxMswDarkMode().enable(self); self.SetBackgroundColour(dark_color); panel.SetBackgroundColour(dark_color)
             sound_box.GetStaticBox().SetForegroundColour(light_text_color)
             sound_box.GetStaticBox().SetBackgroundColour(dark_color)
+            call_audio_box.GetStaticBox().SetForegroundColour(light_text_color)
+            call_audio_box.GetStaticBox().SetBackgroundColour(dark_color)
             accessibility_box.GetStaticBox().SetForegroundColour(light_text_color)
             accessibility_box.GetStaticBox().SetBackgroundColour(dark_color)
         
@@ -624,33 +641,77 @@ class SettingsDialog(wx.Dialog):
             self.choice.SetStringSelection(current_pack)
         else:
             self.choice.SetStringSelection('default')
+        self.default_soundpack_label = wx.StaticText(sound_box.GetStaticBox(), label=f"Current default pack: {self.config.get('default_soundpack', 'default')}")
+        self.set_selected_default_cb = wx.CheckBox(sound_box.GetStaticBox(), label="Set selected pack as default sound pack")
+        self.choice.Bind(wx.EVT_CHOICE, self.on_sound_pack_changed)
+        self.sound_volume_label = wx.StaticText(sound_box.GetStaticBox(), label="Sound pack volume")
+        self.sound_volume_slider = wx.Slider(sound_box.GetStaticBox(), value=int(self.config.get('sound_volume', 80)), minValue=0, maxValue=100, style=wx.SL_HORIZONTAL | wx.SL_LABELS)
+
+        self.call_in_label = wx.StaticText(call_audio_box.GetStaticBox(), label="Call input volume")
+        self.call_input_slider = wx.Slider(call_audio_box.GetStaticBox(), value=int(self.config.get('call_input_volume', 80)), minValue=0, maxValue=100, style=wx.SL_HORIZONTAL | wx.SL_LABELS)
+        self.call_out_label = wx.StaticText(call_audio_box.GetStaticBox(), label="Call output volume")
+        self.call_output_slider = wx.Slider(call_audio_box.GetStaticBox(), value=int(self.config.get('call_output_volume', 80)), minValue=0, maxValue=100, style=wx.SL_HORIZONTAL | wx.SL_LABELS)
         self.auto_open_files_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Auto-open received files after save")
         self.auto_open_files_cb.SetValue(bool(self.config.get('auto_open_received_files', True)))
         self.read_aloud_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Read incoming chat messages aloud")
         self.read_aloud_cb.SetValue(bool(self.config.get('read_messages_aloud', False)))
+        self.global_chat_logging_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Save chat history by default")
+        self.global_chat_logging_cb.SetValue(bool(self.config.get('save_chat_history_default', False)))
+        self.show_main_actions_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Show action buttons in main window")
+        self.show_main_actions_cb.SetValue(bool(self.config.get('show_main_action_buttons', True)))
         self.typing_indicator_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Show typing indicators")
         self.typing_indicator_cb.SetValue(bool(self.config.get('typing_indicators', True)))
         self.announce_typing_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Announce typing start/stop")
         self.announce_typing_cb.SetValue(bool(self.config.get('announce_typing', True)))
+        enter_row = wx.BoxSizer(wx.HORIZONTAL)
+        enter_row.Add(wx.StaticText(accessibility_box.GetStaticBox(), label="Enter key action:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        self.enter_action_choice = wx.Choice(accessibility_box.GetStaticBox(), choices=[
+            "Send message on Enter (default)",
+            "Insert newline on Enter",
+        ])
+        self.enter_action_choice.SetSelection(0 if self.config.get('enter_key_action', 'send') == 'send' else 1)
+        enter_row.Add(self.enter_action_choice, 1, wx.EXPAND)
 
         sound_box.Add(self.choice, 0, wx.EXPAND | wx.ALL, 5)
+        sound_box.Add(self.default_soundpack_label, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        sound_box.Add(self.set_selected_default_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        sound_box.Add(self.sound_volume_label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 5)
+        sound_box.Add(self.sound_volume_slider, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        call_audio_box.Add(self.call_in_label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 5)
+        call_audio_box.Add(self.call_input_slider, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        call_audio_box.Add(self.call_out_label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 5)
+        call_audio_box.Add(self.call_output_slider, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         accessibility_box.Add(self.auto_open_files_cb, 0, wx.ALL, 5)
         accessibility_box.Add(self.read_aloud_cb, 0, wx.ALL, 5)
+        accessibility_box.Add(self.global_chat_logging_cb, 0, wx.ALL, 5)
+        accessibility_box.Add(self.show_main_actions_cb, 0, wx.ALL, 5)
         accessibility_box.Add(self.typing_indicator_cb, 0, wx.ALL, 5)
         accessibility_box.Add(self.announce_typing_cb, 0, wx.ALL, 5)
+        accessibility_box.Add(enter_row, 0, wx.EXPAND | wx.ALL, 5)
         main_sizer.Add(sound_box, 0, wx.EXPAND | wx.ALL, 5)
+        main_sizer.Add(call_audio_box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         main_sizer.Add(accessibility_box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         btn_sizer = wx.StdDialogButtonSizer()
         ok_btn = wx.Button(panel, wx.ID_OK, label="&Apply"); ok_btn.SetDefault(); cancel_btn = wx.Button(panel, wx.ID_CANCEL)
         
         if dark_mode_on:
             self.choice.SetBackgroundColour(dark_color); self.choice.SetForegroundColour(light_text_color)
-            for cb in [self.auto_open_files_cb, self.read_aloud_cb, self.typing_indicator_cb, self.announce_typing_cb]:
+            self.default_soundpack_label.SetForegroundColour(light_text_color)
+            self.set_selected_default_cb.SetForegroundColour(light_text_color)
+            self.sound_volume_label.SetForegroundColour(light_text_color)
+            self.call_in_label.SetForegroundColour(light_text_color)
+            self.call_out_label.SetForegroundColour(light_text_color)
+            for cb in [self.auto_open_files_cb, self.read_aloud_cb, self.global_chat_logging_cb, self.show_main_actions_cb, self.typing_indicator_cb, self.announce_typing_cb]:
                 cb.SetForegroundColour(light_text_color)
+            self.enter_action_choice.SetBackgroundColour(dark_color); self.enter_action_choice.SetForegroundColour(light_text_color)
             ok_btn.SetBackgroundColour(dark_color); ok_btn.SetForegroundColour(light_text_color)
             cancel_btn.SetBackgroundColour(dark_color); cancel_btn.SetForegroundColour(light_text_color)
             
         btn_sizer.AddButton(ok_btn); btn_sizer.AddButton(cancel_btn); btn_sizer.Realize(); main_sizer.Add(btn_sizer, 0, wx.ALIGN_CENTER | wx.ALL, 10); panel.SetSizer(main_sizer)
+        self.on_sound_pack_changed(None)
+    def on_sound_pack_changed(self, _):
+        selected = self.choice.GetStringSelection().strip().lower()
+        self.set_selected_default_cb.Enable(selected not in ("none", "default"))
     def on_key(self, event):
         if event.GetKeyCode() == wx.WXK_F1:
             open_help_docs_for_context("settings", self)
@@ -755,6 +816,8 @@ class ClientApp(wx.App):
         self.user_config = load_user_config()
         self.session_password = ""
         self.active_server_entry = resolve_default_server_entry(self.user_config)
+        self.connected_server_names = set()
+        self.transfer_history = []
         if self.user_config.get('autologin') and self.user_config.get('username') and self.user_config.get('password'):
             print("Attempting auto-login...")
             selected_server = resolve_default_server_entry(self.user_config)
@@ -767,6 +830,16 @@ class ClientApp(wx.App):
                     self.user_config['autologin'] = False
                 save_user_config(self.user_config)
         return self.show_login_dialog()
+
+    def add_transfer_history(self, direction, user, filename, path="", status="ok"):
+        self.transfer_history.append({
+            "time": datetime.datetime.now().isoformat(),
+            "direction": direction,
+            "user": user,
+            "filename": filename,
+            "path": path,
+            "status": status,
+        })
     
     def _ipc_listener(self):
         while True:
@@ -881,28 +954,53 @@ class ClientApp(wx.App):
     def start_main_session(self, username, sock, sf):
         self.username = username; self.sock = sock; self.sockfile = sf; self.pending_file_paths = {}
         self.intentional_disconnect = False
+        active = normalize_server_entry(getattr(self, "active_server_entry", SERVER_CONFIG))
+        self.connected_server_names = {active.get("name") or active.get("host") or "Server"}
         self.frame = MainFrame(self.username, self.sock); self.frame.Show()
         if self.frame.current_status != "online":
             try: self.sock.sendall((json.dumps({"action": "set_status", "status_text": self.frame.current_status}) + "\n").encode())
             except Exception: pass
-        self.play_startup_sound(); threading.Thread(target=self.listen_loop, daemon=True).start()
+        wx.CallLater(250, self.play_startup_sound)
+        threading.Thread(target=self.listen_loop, daemon=True).start()
         self.frame.on_check_updates(silent=True)
 
+    def _resolved_sound_pack(self):
+        selected = str(self.user_config.get('soundpack', 'default') or 'default').strip().lower()
+        if selected == 'none':
+            return 'none'
+        if selected == 'default':
+            preferred = str(self.user_config.get('default_soundpack', 'default') or 'default').strip().lower()
+            return preferred if preferred and preferred != 'none' else 'default'
+        return selected
+
+    def _play_path_with_volume(self, path):
+        vol = int(self.user_config.get('sound_volume', 80) or 80)
+        vol = max(0, min(100, vol))
+        if vol == 0:
+            return
+        if sys.platform == 'darwin':
+            afplay = shutil.which('afplay')
+            if afplay:
+                # afplay accepts linear gain in 0.0-1.0
+                subprocess.Popen([afplay, '-v', f"{vol / 100.0:.2f}", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return
+        wx.adv.Sound.PlaySound(path, wx.adv.SOUND_ASYNC)
+
     def play_sound(self, sound_file):
-        pack = str(self.user_config.get('soundpack', 'default') or 'none').strip().lower()
+        pack = self._resolved_sound_pack()
         if pack == 'none':
             return
         sounds_root = get_sounds_dir()
         path = os.path.join(sounds_root, pack, sound_file)
         if os.path.exists(path):
-            wx.adv.Sound.PlaySound(path, wx.adv.SOUND_ASYNC)
+            self._play_path_with_volume(path)
             return
         default_path = os.path.join(sounds_root, 'default', sound_file)
         if os.path.exists(default_path):
-            wx.adv.Sound.PlaySound(default_path, wx.adv.SOUND_ASYNC)
+            self._play_path_with_volume(default_path)
 
     def play_startup_sound(self):
-        pack = str(self.user_config.get('soundpack', 'default') or 'none').strip().lower()
+        pack = self._resolved_sound_pack()
         if pack == 'none':
             return
         sounds_root = get_sounds_dir()
@@ -911,8 +1009,9 @@ class ClientApp(wx.App):
         except Exception:
             root_wavs = []
         if root_wavs:
-            wx.adv.Sound.PlaySound(random.choice(root_wavs), wx.adv.SOUND_ASYNC)
+            self._play_path_with_volume(random.choice(root_wavs))
             return
+        # Final fallback: play standard login sound from selected/default pack.
         self.play_sound("login.wav")
     
     def listen_loop(self):
@@ -1015,13 +1114,16 @@ class ClientApp(wx.App):
                     with open(fp, 'rb') as f: files_data.append({"filename": os.path.basename(fp), "data": base64.b64encode(f.read()).decode('ascii')})
                 self.sock.sendall((json.dumps({"action": "file_data", "transfer_id": transfer_id, "to": to, "files": files_data}) + "\n").encode())
                 names = [os.path.basename(fp) for fp in file_paths]
-                wx.CallAfter(self._on_files_sent, to, names)
+                wx.CallAfter(self._on_files_sent, to, names, file_paths)
             except Exception as e:
                 wx.CallAfter(self._on_file_send_error, to, e)
         threading.Thread(target=_send, daemon=True).start()
 
-    def _on_files_sent(self, to, filenames):
+    def _on_files_sent(self, to, filenames, file_paths=None):
         self.play_sound("file_send.wav")
+        path_map = {os.path.basename(p): p for p in (file_paths or [])}
+        for name in filenames:
+            wx.GetApp().add_transfer_history("sent", to, name, path_map.get(name, ""), "sent")
         chat = self.frame.get_chat(to)
         if chat:
             names = ", ".join(filenames)
@@ -1061,6 +1163,7 @@ class ClientApp(wx.App):
                 with open(save_path, 'wb') as f: f.write(base64.b64decode(data))
                 saved.append(os.path.basename(save_path))
                 saved_paths.append(save_path)
+                wx.GetApp().add_transfer_history("received", sender, os.path.basename(save_path), save_path, "received")
             except Exception as e:
                 self.play_sound("file_error.wav")
                 chat = self.frame.get_chat(sender)
@@ -1218,10 +1321,7 @@ class ServerManagerDialog(wx.Dialog):
         panel = wx.Panel(self)
         s = wx.BoxSizer(wx.VERTICAL)
 
-        self.list = wx.ListCtrl(panel, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
-        self.list.InsertColumn(0, "Name", width=180)
-        self.list.InsertColumn(1, "Host", width=200)
-        self.list.InsertColumn(2, "Port", width=80)
+        self.list = wx.ListBox(panel, style=wx.LB_SINGLE)
         self._refresh_list()
         s.Add(self.list, 1, wx.EXPAND | wx.ALL, 8)
 
@@ -1248,7 +1348,7 @@ class ServerManagerDialog(wx.Dialog):
         close_btn = wx.Button(panel, wx.ID_OK, label="Done")
         add_btn.Bind(wx.EVT_BUTTON, self.on_add_or_update)
         del_btn.Bind(wx.EVT_BUTTON, self.on_delete)
-        self.list.Bind(wx.EVT_LIST_ITEM_SELECTED, self.on_select)
+        self.list.Bind(wx.EVT_LISTBOX, self.on_select)
         btn_row.Add(add_btn, 0, wx.RIGHT, 6)
         btn_row.Add(del_btn, 0, wx.RIGHT, 6)
         btn_row.AddStretchSpacer()
@@ -1258,14 +1358,12 @@ class ServerManagerDialog(wx.Dialog):
         panel.SetSizer(s)
 
     def _refresh_list(self):
-        self.list.DeleteAllItems()
+        self.list.Clear()
         for entry in self.entries:
-            idx = self.list.InsertItem(self.list.GetItemCount(), entry['name'])
-            self.list.SetItem(idx, 1, entry['host'])
-            self.list.SetItem(idx, 2, str(entry['port']))
+            self.list.Append(f"{entry['name']}  |  {entry['host']}:{entry['port']}")
 
     def on_select(self, event):
-        index = event.GetIndex()
+        index = event.GetSelection()
         if index < 0 or index >= len(self.entries):
             return
         entry = self.entries[index]
@@ -1299,8 +1397,8 @@ class ServerManagerDialog(wx.Dialog):
         self._refresh_list()
 
     def on_delete(self, _):
-        idx = self.list.GetFirstSelected()
-        if idx == -1:
+        idx = self.list.GetSelection()
+        if idx == wx.NOT_FOUND:
             return
         if idx < len(self.entries):
             del self.entries[idx]
@@ -1512,30 +1610,109 @@ def format_size(size_bytes):
     elif size_bytes < 1073741824: return f"{size_bytes / 1048576:.1f} MB"
     else: return f"{size_bytes / 1073741824:.1f} GB"
 
+def format_duration(total_seconds):
+    total_seconds = max(0, int(total_seconds or 0))
+    days, rem = divmod(total_seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, seconds = divmod(rem, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours or parts:
+        parts.append(f"{hours}h")
+    if minutes or parts:
+        parts.append(f"{minutes}m")
+    parts.append(f"{seconds}s")
+    return " ".join(parts)
+
+def is_chat_logging_enabled(config, username):
+    per_user = config.get('chat_logging', {}) if isinstance(config.get('chat_logging', {}), dict) else {}
+    if username in per_user:
+        return bool(per_user.get(username))
+    return bool(config.get('save_chat_history_default', False))
+
 class ServerInfoDialog(wx.Dialog):
-    def __init__(self, parent, info):
-        super().__init__(parent, title="Server Information", size=(400, 300))
+    def __init__(self, parent, details_text):
+        super().__init__(parent, title="Server Information", size=(560, 420))
         dark_mode_on = is_windows_dark_mode()
         if dark_mode_on:
             dark_color = wx.Colour(40, 40, 40); light_text_color = wx.WHITE
             WxMswDarkMode().enable(self); self.SetBackgroundColour(dark_color)
         s = wx.BoxSizer(wx.VERTICAL)
-        self.lv = wx.ListCtrl(self, style=wx.LC_REPORT)
-        self.lv.InsertColumn(0, "Property", width=180); self.lv.InsertColumn(1, "Value", width=200)
+        self.details = wx.TextCtrl(self, style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_RICH2)
+        self.details.SetValue(details_text)
         if dark_mode_on:
-            self.lv.SetBackgroundColour(dark_color); self.lv.SetForegroundColour(light_text_color)
-        for prop, val in info:
-            idx = self.lv.GetItemCount(); self.lv.InsertItem(idx, prop); self.lv.SetItem(idx, 1, val)
+            self.details.SetBackgroundColour(dark_color); self.details.SetForegroundColour(light_text_color)
         btn = wx.Button(self, wx.ID_OK, label="&Close")
         if dark_mode_on:
             btn.SetBackgroundColour(dark_color); btn.SetForegroundColour(light_text_color)
-        s.Add(self.lv, 1, wx.EXPAND | wx.ALL, 5); s.Add(btn, 0, wx.ALIGN_CENTER | wx.ALL, 5); self.SetSizer(s)
+        self.details.SetToolTip("Server details view. Read-only information about the connected server.")
+        s.Add(self.details, 1, wx.EXPAND | wx.ALL, 8); s.Add(btn, 0, wx.ALIGN_CENTER | wx.ALL, 6); self.SetSizer(s)
         self.Bind(wx.EVT_CHAR_HOOK, self.on_key)
     def on_key(self, event):
         if event.GetKeyCode() == wx.WXK_F1:
             open_help_docs_for_context("server_info", self)
         elif event.GetKeyCode() == wx.WXK_ESCAPE: self.Close()
         else: event.Skip()
+
+class FileTransfersDialog(wx.Dialog):
+    def __init__(self, parent, history):
+        super().__init__(parent, title="File Transfers", size=(760, 420))
+        self.history = list(history or [])
+        self.panel = wx.Panel(self)
+        s = wx.BoxSizer(wx.VERTICAL)
+        self.lv = wx.ListCtrl(self.panel, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
+        self.lv.InsertColumn(0, "Time", width=170)
+        self.lv.InsertColumn(1, "Direction", width=80)
+        self.lv.InsertColumn(2, "User", width=130)
+        self.lv.InsertColumn(3, "File", width=160)
+        self.lv.InsertColumn(4, "Status", width=90)
+        self.lv.InsertColumn(5, "Path", width=260)
+        for row in reversed(self.history):
+            idx = self.lv.InsertItem(self.lv.GetItemCount(), format_timestamp(row.get("time")))
+            self.lv.SetItem(idx, 1, str(row.get("direction", "")))
+            self.lv.SetItem(idx, 2, str(row.get("user", "")))
+            self.lv.SetItem(idx, 3, str(row.get("filename", "")))
+            self.lv.SetItem(idx, 4, str(row.get("status", "")))
+            self.lv.SetItem(idx, 5, str(row.get("path", "")))
+        s.Add(self.lv, 1, wx.EXPAND | wx.ALL, 8)
+        btns = wx.BoxSizer(wx.HORIZONTAL)
+        self.btn_open = wx.Button(self.panel, label="Open File")
+        self.btn_folder = wx.Button(self.panel, label="Open Folder")
+        self.btn_close = wx.Button(self.panel, wx.ID_CLOSE, label="Close")
+        self.btn_open.Bind(wx.EVT_BUTTON, self.on_open_file)
+        self.btn_folder.Bind(wx.EVT_BUTTON, self.on_open_folder)
+        self.btn_close.Bind(wx.EVT_BUTTON, lambda e: self.Close())
+        self.lv.Bind(wx.EVT_LIST_ITEM_SELECTED, self.on_select)
+        btns.Add(self.btn_open, 0, wx.RIGHT, 6)
+        btns.Add(self.btn_folder, 0, wx.RIGHT, 6)
+        btns.AddStretchSpacer()
+        btns.Add(self.btn_close, 0)
+        s.Add(btns, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        self.panel.SetSizer(s)
+        self.on_select(None)
+
+    def _selected_path(self):
+        idx = self.lv.GetFirstSelected()
+        if idx == -1:
+            return ""
+        return self.lv.GetItemText(idx, 5).strip()
+
+    def on_select(self, _):
+        p = self._selected_path()
+        exists = bool(p and os.path.exists(p))
+        self.btn_open.Enable(exists and os.path.isfile(p))
+        self.btn_folder.Enable(exists)
+
+    def on_open_file(self, _):
+        p = self._selected_path()
+        if p and os.path.isfile(p):
+            open_path_or_url(p)
+
+    def on_open_folder(self, _):
+        p = self._selected_path()
+        if p and os.path.exists(p):
+            open_path_or_url(os.path.dirname(p) if os.path.isfile(p) else p)
 
 class UserDirectoryDialog(wx.Dialog):
     def __init__(self, parent_frame, users, my_username, contact_states):
@@ -1563,21 +1740,28 @@ class UserDirectoryDialog(wx.Dialog):
         self.sort_choice = wx.Choice(panel, choices=["Name (A-Z)", "Name (Z-A)", "Status (Online first)"])
         self.sort_choice.SetSelection(0)
         self.sort_choice.Bind(wx.EVT_CHOICE, self.on_sort_changed)
+        filter_label = wx.StaticText(panel, label="Filter:")
+        self.filter_choice = wx.Choice(panel, choices=["All users", "In my contacts", "Not in my contacts"])
+        self.filter_choice.SetSelection(0)
+        self.filter_choice.Bind(wx.EVT_CHOICE, self.on_sort_changed)
         sort_sizer.Add(sort_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
         sort_sizer.Add(self.sort_choice, 0, wx.RIGHT, 8)
+        sort_sizer.Add(filter_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+        sort_sizer.Add(self.filter_choice, 0, wx.RIGHT, 8)
         s.Add(sort_sizer, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         self.notebook = wx.Notebook(panel)
         self.tabs = {}
+        self.tab_display_map = {}
         for tab_name in ["Everyone", "Online", "Offline", "Admins"]:
-            lv = wx.ListCtrl(self.notebook, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
-            lv.InsertColumn(0, "Username", width=130); lv.InsertColumn(1, "Status", width=140); lv.InsertColumn(2, "Server", width=130); lv.InsertColumn(3, "Info", width=130)
-            lv.Bind(wx.EVT_LIST_ITEM_SELECTED, self.on_selection_changed)
-            lv.Bind(wx.EVT_LIST_ITEM_DESELECTED, self.on_selection_changed)
-            lv.Bind(wx.EVT_LIST_ITEM_ACTIVATED, self.on_item_activated)
+            lv = wx.ListBox(self.notebook, style=wx.LB_SINGLE)
+            lv.Bind(wx.EVT_LISTBOX, self.on_selection_changed)
+            lv.Bind(wx.EVT_LISTBOX_DCLICK, self.on_item_activated)
             lv.Bind(wx.EVT_CHAR_HOOK, self.on_list_key)
             lv.Bind(wx.EVT_CONTEXT_MENU, self.on_list_context_menu)
             if dark_mode_on: lv.SetBackgroundColour(dc); lv.SetForegroundColour(lt)
-            self.notebook.AddPage(lv, tab_name); self.tabs[tab_name] = lv
+            self.notebook.AddPage(lv, tab_name)
+            self.tabs[tab_name] = lv
+            self.tab_display_map[tab_name] = []
         self.notebook.Bind(wx.EVT_NOTEBOOK_PAGE_CHANGED, self.on_tab_changed)
         if dark_mode_on: self.notebook.SetBackgroundColour(dc); self.notebook.SetForegroundColour(lt)
         s.Add(self.notebook, 1, wx.EXPAND | wx.ALL, 5)
@@ -1602,6 +1786,7 @@ class UserDirectoryDialog(wx.Dialog):
         self.Bind(wx.EVT_CLOSE, self.on_close)
         self.search_box.SetToolTip("Search all users in the current directory tab.")
         self.sort_choice.SetToolTip("Sort users by name or online status.")
+        self.filter_choice.SetToolTip("Filter directory users by contact state.")
         self.notebook.SetToolTip("Directory tabs for Everyone, Online, Offline, and Admins.")
         self.btn_chat.SetToolTip("Start chat with selected user.")
         self.btn_file.SetToolTip("Send a file to selected user.")
@@ -1615,21 +1800,44 @@ class UserDirectoryDialog(wx.Dialog):
     def _get_selected_user(self):
         lv = self._get_active_list()
         if not lv: return None
-        sel = lv.GetFirstSelected()
-        if sel >= 0:
-            self._selected_user = lv.GetItemText(sel)
+        sel = lv.GetSelection()
+        tab_name = self.notebook.GetPageText(self.notebook.GetSelection())
+        mapping = self.tab_display_map.get(tab_name, [])
+        if sel != wx.NOT_FOUND and 0 <= sel < len(mapping):
+            self._selected_user = mapping[sel].get("user")
             return self._selected_user
         return None
+    def _selected_entry(self):
+        lv = self._get_active_list()
+        if not lv:
+            return None
+        sel = lv.GetSelection()
+        tab_name = self.notebook.GetPageText(self.notebook.GetSelection())
+        mapping = self.tab_display_map.get(tab_name, [])
+        if sel != wx.NOT_FOUND and 0 <= sel < len(mapping):
+            return mapping[sel]
+        return None
+    def _is_selected_external_server(self):
+        entry = self._selected_entry()
+        if not entry:
+            return False
+        current_server = normalize_server_entry(getattr(wx.GetApp(), "active_server_entry", {})).get("name", "")
+        selected_server = str(entry.get("server", current_server)).strip()
+        return bool(selected_server and current_server and selected_server != current_server)
     def _populate_all_tabs(self):
         query = self.search_box.GetValue().strip().lower()
+        filter_mode = self.filter_choice.GetSelection() if hasattr(self, "filter_choice") else 0
         for tab_name, lv in self.tabs.items():
-            lv.DeleteAllItems()
+            lv.Clear()
+            self.tab_display_map[tab_name] = []
             tab_users = []
             for u in self._all_users:
                 if query and query not in u["user"].lower(): continue
                 if tab_name == "Online" and not u["online"]: continue
                 if tab_name == "Offline" and u["online"]: continue
                 if tab_name == "Admins" and not u["is_admin"]: continue
+                if filter_mode == 1 and not u.get("is_contact", False): continue
+                if filter_mode == 2 and u.get("is_contact", False): continue
                 tab_users.append(u)
             mode = self.sort_choice.GetSelection()
             if mode == 1:
@@ -1644,23 +1852,36 @@ class UserDirectoryDialog(wx.Dialog):
                 if u["is_admin"]: info_parts.append("Admin")
                 if u["is_contact"]: info_parts.append("Contact")
                 if u["is_blocked"]: info_parts.append("Blocked")
-                idx = lv.InsertItem(lv.GetItemCount(), u["user"])
-                lv.SetItem(idx, 1, u["status_text"])
-                lv.SetItem(idx, 2, u.get("server", "Current"))
-                lv.SetItem(idx, 3, ", ".join(info_parts))
-                if u["is_blocked"]: lv.SetItemTextColour(idx, wx.Colour(150, 150, 150))
+                info_text = ", ".join(info_parts)
+                display = f"{u['user']}  |  {u['status_text']}  |  {u.get('server', 'Current')}"
+                if info_text:
+                    display += f"  |  {info_text}"
+                lv.Append(display)
+                self.tab_display_map[tab_name].append(u)
         self.update_button_states()
     def on_sort_changed(self, _):
         self._populate_all_tabs()
     def update_button_states(self):
         user = self._get_selected_user()
+        external = self._is_selected_external_server()
         if not user or user == self.my_username:
             self.btn_chat.Disable(); self.btn_file.Disable(); self.btn_block.Disable(); self.btn_add.Disable()
             self.btn_block.SetLabel("&Block"); return
-        self.btn_chat.Enable(); self.btn_file.Enable()
+        self.btn_chat.Enable(not external)
+        self.btn_file.Enable(not external)
         is_contact = user in self.contact_states
-        self.btn_add.Enable(not is_contact); self.btn_add.SetLabel("&Add to Contacts")
-        self.btn_block.Enable(is_contact)
+        self.btn_add.Enable((not is_contact) and (not external)); self.btn_add.SetLabel("&Add to Contacts")
+        self.btn_block.Enable(is_contact and (not external))
+        if external:
+            self.btn_chat.SetToolTip("This server does not support cross-server chat from the current connection.")
+            self.btn_file.SetToolTip("This server does not support cross-server file transfer from the current connection.")
+            self.btn_add.SetToolTip("This server does not support cross-server contacts from the current connection.")
+            self.btn_block.SetToolTip("This server does not support cross-server contact blocking from the current connection.")
+        else:
+            self.btn_chat.SetToolTip("Start chat with selected user.")
+            self.btn_file.SetToolTip("Send a file to selected user.")
+            self.btn_add.SetToolTip("Send a contact request to selected user.")
+            self.btn_block.SetToolTip("Block or unblock selected contact.")
         if is_contact:
             blocked = self.contact_states.get(user, 0) == 1
             self.btn_block.SetLabel("&Unblock" if blocked else "&Block")
@@ -1671,26 +1892,27 @@ class UserDirectoryDialog(wx.Dialog):
     def on_selection_changed(self, event): self.update_button_states(); event.Skip()
     def on_item_activated(self, event):
         self.on_selection_changed(event)
-        lv = self._get_active_list()
-        idx = event.GetIndex()
-        if lv and idx >= 0:
-            status_text = lv.GetItemText(idx, 1)
-            urls = extract_urls(status_text)
-            if urls:
-                open_path_or_url(urls[0])
-                return
         self.on_start_chat(None)
     def on_start_chat(self, _):
         user = self._selected_user
+        if self._is_selected_external_server():
+            wx.MessageBox("This server does not support cross-server chat from the current connection.", "Feature Not Supported", wx.OK | wx.ICON_INFORMATION)
+            return
         if not user or user == self.my_username: return
-        app = wx.GetApp(); logging_config = app.user_config.get('chat_logging', {}); is_logging_enabled = logging_config.get(user, False)
+        app = wx.GetApp(); is_logging_enabled = is_chat_logging_enabled(app.user_config, user)
         is_contact = user in self.contact_states
         dlg = self.parent_frame.get_chat(user) or ChatDialog(self.parent_frame, user, self.parent_frame.sock, self.parent_frame.user, is_logging_enabled, is_contact=is_contact)
-        dlg.Show(); dlg.input_ctrl.SetFocus()
+        dlg.Show(); wx.CallAfter(dlg.input_ctrl.SetFocus)
     def on_send_file(self, _):
+        if self._is_selected_external_server():
+            wx.MessageBox("This server does not support cross-server file transfer from the current connection.", "Feature Not Supported", wx.OK | wx.ICON_INFORMATION)
+            return
         if self._selected_user: wx.GetApp().send_file_to(self._selected_user)
     def on_block_toggle(self, _):
         user = self._selected_user
+        if self._is_selected_external_server():
+            wx.MessageBox("This server does not support cross-server contact blocking from the current connection.", "Feature Not Supported", wx.OK | wx.ICON_INFORMATION)
+            return
         if not user or user not in self.contact_states: return
         blocked = self.contact_states.get(user, 0) == 1
         action = "unblock_contact" if blocked else "block_contact"
@@ -1704,6 +1926,9 @@ class UserDirectoryDialog(wx.Dialog):
         self._populate_all_tabs()
     def on_add_to_contacts(self, _):
         user = self._selected_user
+        if self._is_selected_external_server():
+            wx.MessageBox("This server does not support cross-server contacts from the current connection.", "Feature Not Supported", wx.OK | wx.ICON_INFORMATION)
+            return
         if not user: return
         self.parent_frame.sock.sendall(json.dumps({"action": "add_contact", "to": user}).encode() + b"\n")
         self.btn_add.Disable(); self.btn_add.SetLabel("Adding...")
@@ -1754,24 +1979,20 @@ class UserDirectoryDialog(wx.Dialog):
 
 class InviteUserDialog(wx.Dialog):
     def __init__(self, parent, username, methods=None):
-        super().__init__(parent, title=f"Invite {username}", size=(430, 220))
+        super().__init__(parent, title=f"Invite {username}", size=(460, 260))
         self.username = username
-        self.methods = methods or ["email", "sms"]
         panel = wx.Panel(self)
         s = wx.BoxSizer(wx.VERTICAL)
-        s.Add(wx.StaticText(panel, label=f"Invite '{username}' via:"), 0, wx.ALL, 8)
-        row1 = wx.BoxSizer(wx.HORIZONTAL)
-        row1.Add(wx.StaticText(panel, label="Method:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
-        self.method = wx.Choice(panel, choices=self.methods)
-        self.method.SetSelection(0)
-        row1.Add(self.method, 0)
-        s.Add(row1, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        s.Add(wx.StaticText(panel, label=f"Invite '{username}' to this server"), 0, wx.ALL, 8)
         row2 = wx.BoxSizer(wx.HORIZONTAL)
-        row2.Add(wx.StaticText(panel, label="Destination:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        row2.Add(wx.StaticText(panel, label="Email or phone:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
         self.target = wx.TextCtrl(panel)
         row2.Add(self.target, 1, wx.EXPAND)
         s.Add(row2, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
-        hint = wx.StaticText(panel, label="Email uses SMTP. SMS uses FlexPBX module if configured.")
+        self.include_link = wx.CheckBox(panel, label="Include setup link in invite message")
+        self.include_link.SetValue(True)
+        s.Add(self.include_link, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        hint = wx.StaticText(panel, label="Enter an email address or phone number. The app sends the invite automatically.")
         s.Add(hint, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
         buttons = wx.StdDialogButtonSizer()
         ok_btn = wx.Button(panel, wx.ID_OK, label="Send Invite")
@@ -1784,10 +2005,14 @@ class InviteUserDialog(wx.Dialog):
         panel.SetSizer(s)
 
     def get_method(self):
-        return self.method.GetStringSelection().strip().lower()
+        target = self.get_target()
+        return "email" if "@" in target else "sms"
 
     def get_target(self):
         return self.target.GetValue().strip()
+
+    def should_include_link(self):
+        return self.include_link.IsChecked()
 
 class MainFrame(wx.Frame):
     def update_contact_status(self, user, online, status_text=None):
@@ -1810,7 +2035,13 @@ class MainFrame(wx.Frame):
             show_notification("Contact offline", f"{user} has gone offline.")
 
     def __init__(self, user, sock):
-        super().__init__(None, title=f"Thrive Messenger – {user}", size=(400,380)); self.user, self.sock = user, sock; self.task_bar_icon = None; self.is_exiting = False; self._directory_dlg = None
+        app = wx.GetApp()
+        active_server = normalize_server_entry(getattr(app, "active_server_entry", {}))
+        server_name = active_server.get("name") or active_server.get("host") or SERVER_CONFIG.get("host", "Server")
+        connected_names = set(getattr(app, "connected_server_names", set()) or {server_name})
+        others = max(0, len(connected_names) - 1)
+        suffix = f", and {others} other server{'s' if others != 1 else ''}" if others > 0 else ""
+        super().__init__(None, title=f"Thrive Messenger – {user} – connected to {server_name}{suffix}", size=(400,380)); self.user, self.sock = user, sock; self.task_bar_icon = None; self.is_exiting = False; self._directory_dlg = None
         self.current_status = wx.GetApp().user_config.get('status', 'online')
         self._empty_prompt_shown = False
         self._sort_mode = "name_asc"
@@ -1822,13 +2053,15 @@ class MainFrame(wx.Frame):
             WxMswDarkMode().enable(self); self.SetBackgroundColour(dark_color); panel.SetBackgroundColour(dark_color)
 
         self._all_contacts = []
+        self._contact_display_map = []
         box_contacts = wx.StaticBoxSizer(wx.VERTICAL, panel, "&Contacts")
         search_label = wx.StaticText(box_contacts.GetStaticBox(), label="Searc&h contacts:")
         self.search_box = wx.TextCtrl(box_contacts.GetStaticBox(), style=wx.TE_PROCESS_ENTER)
         self.search_box.Bind(wx.EVT_TEXT, self.on_search)
-        self.lv = wx.ListCtrl(box_contacts.GetStaticBox(), style=wx.LC_REPORT); self.lv.InsertColumn(0, "Username", width=120); self.lv.InsertColumn(1, "Status", width=160)
-        self.lv.Bind(wx.EVT_CHAR_HOOK, self.on_key); self.lv.Bind(wx.EVT_LIST_ITEM_SELECTED, self.update_button_states); self.lv.Bind(wx.EVT_LIST_ITEM_DESELECTED, self.update_button_states)
-        self.lv.Bind(wx.EVT_LIST_ITEM_ACTIVATED, self.on_contact_activated)
+        self.lv = wx.ListBox(box_contacts.GetStaticBox(), style=wx.LB_SINGLE)
+        self.lv.Bind(wx.EVT_CHAR_HOOK, self.on_key)
+        self.lv.Bind(wx.EVT_LISTBOX, self.update_button_states)
+        self.lv.Bind(wx.EVT_LISTBOX_DCLICK, self.on_contact_activated)
         self.lv.Bind(wx.EVT_CONTEXT_MENU, self.on_contact_context_menu)
 
         if dark_mode_on:
@@ -1867,12 +2100,24 @@ class MainFrame(wx.Frame):
         self.btn_logout.Bind(wx.EVT_BUTTON, self.on_logout); self.btn_exit.Bind(wx.EVT_BUTTON, self.on_exit)
         accel_entries = [(wx.ACCEL_ALT, ord('B'), self.btn_block.GetId()), (wx.ACCEL_ALT, ord('A'), self.btn_add.GetId()), (wx.ACCEL_ALT, ord('S'), self.btn_send.GetId()), (wx.ACCEL_ALT, ord('D'), self.btn_delete.GetId()), (wx.ACCEL_ALT, ord('F'), self.btn_send_file.GetId()), (wx.ACCEL_ALT, ord('I'), self.btn_info.GetId()), (wx.ACCEL_ALT, ord('U'), self.btn_status.GetId()), (wx.ACCEL_ALT, ord('Y'), self.btn_directory.GetId()), (wx.ACCEL_ALT, ord('V'), self.btn_admin.GetId()), (wx.ACCEL_ALT, ord('T'), self.btn_settings.GetId()), (wx.ACCEL_ALT, ord('P'), self.btn_update.GetId()), (wx.ACCEL_ALT, ord('O'), self.btn_logout.GetId()), (wx.ACCEL_ALT, ord('X'), self.btn_exit.GetId()),]
         accel_tbl = wx.AcceleratorTable(accel_entries); self.SetAcceleratorTable(accel_tbl)
-        gs_main = wx.GridSizer(1, 5, 5, 5); gs_main.Add(self.btn_block, 0, wx.EXPAND); gs_main.Add(self.btn_add, 0, wx.EXPAND); gs_main.Add(self.btn_send, 0, wx.EXPAND); gs_main.Add(self.btn_send_file, 0, wx.EXPAND); gs_main.Add(self.btn_delete, 0, wx.EXPAND)
-        gs_util = wx.GridSizer(1, 8, 5, 5); gs_util.Add(self.btn_info, 0, wx.EXPAND); gs_util.Add(self.btn_status, 0, wx.EXPAND); gs_util.Add(self.btn_directory, 0, wx.EXPAND); gs_util.Add(self.btn_admin, 0, wx.EXPAND); gs_util.Add(self.btn_settings, 0, wx.EXPAND); gs_util.Add(self.btn_update, 0, wx.EXPAND); gs_util.Add(self.btn_logout, 0, wx.EXPAND); gs_util.Add(self.btn_exit, 0, wx.EXPAND)
-        s = wx.BoxSizer(wx.VERTICAL); s.Add(box_contacts, 1, wx.EXPAND|wx.ALL, 5); s.Add(gs_main, 0, wx.CENTER|wx.ALL, 5); s.Add(gs_util, 0, wx.CENTER|wx.ALL, 5); panel.SetSizer(s)
+        self.gs_main = wx.GridSizer(1, 5, 5, 5); self.gs_main.Add(self.btn_block, 0, wx.EXPAND); self.gs_main.Add(self.btn_add, 0, wx.EXPAND); self.gs_main.Add(self.btn_send, 0, wx.EXPAND); self.gs_main.Add(self.btn_send_file, 0, wx.EXPAND); self.gs_main.Add(self.btn_delete, 0, wx.EXPAND)
+        self.gs_util = wx.GridSizer(1, 8, 5, 5); self.gs_util.Add(self.btn_info, 0, wx.EXPAND); self.gs_util.Add(self.btn_status, 0, wx.EXPAND); self.gs_util.Add(self.btn_directory, 0, wx.EXPAND); self.gs_util.Add(self.btn_admin, 0, wx.EXPAND); self.gs_util.Add(self.btn_settings, 0, wx.EXPAND); self.gs_util.Add(self.btn_update, 0, wx.EXPAND); self.gs_util.Add(self.btn_logout, 0, wx.EXPAND); self.gs_util.Add(self.btn_exit, 0, wx.EXPAND)
+        s = wx.BoxSizer(wx.VERTICAL); s.Add(box_contacts, 1, wx.EXPAND|wx.ALL, 5); s.Add(self.gs_main, 0, wx.CENTER|wx.ALL, 5); s.Add(self.gs_util, 0, wx.CENTER|wx.ALL, 5); panel.SetSizer(s)
+        self._root_sizer = s
         self._build_menu_bar()
         self._apply_voiceover_hints(search_label)
+        self.apply_action_button_layout()
         self.update_button_states()
+
+    def apply_action_button_layout(self):
+        show_actions = bool(wx.GetApp().user_config.get('show_main_action_buttons', True))
+        for btn in [self.btn_block, self.btn_send, self.btn_send_file, self.btn_delete, self.btn_info, self.btn_status, self.btn_directory, self.btn_settings, self.btn_update, self.btn_logout, self.btn_exit]:
+            btn.Show(show_actions)
+        # Keep add contact and admin visible for keyboard/tab workflow.
+        self.btn_add.Show(True)
+        self.btn_admin.Show(True)
+        if self._root_sizer:
+            self._root_sizer.Layout()
 
     def _build_menu_bar(self):
         menubar = wx.MenuBar()
@@ -1881,6 +2126,7 @@ class MainFrame(wx.Frame):
         self.mi_add_contact = file_menu.Append(wx.ID_ANY, "Add Contact\tAlt+A")
         self.mi_delete_contact = file_menu.Append(wx.ID_ANY, "Delete Contact\tDelete")
         self.mi_send_file = file_menu.Append(wx.ID_ANY, "Send File\tAlt+F")
+        self.mi_file_transfers = file_menu.Append(wx.ID_ANY, "File Transfers")
         file_menu.AppendSeparator()
         self.mi_user_directory = file_menu.Append(wx.ID_ANY, "User Directory\tAlt+Y")
         self.mi_server_info = file_menu.Append(wx.ID_ANY, "Server Info\tAlt+I")
@@ -1891,7 +2137,16 @@ class MainFrame(wx.Frame):
 
         contacts_menu = wx.Menu()
         self.mi_block_toggle = contacts_menu.Append(wx.ID_ANY, "Block/Unblock\tAlt+B")
+        self.mi_toggle_chat_log = contacts_menu.Append(wx.ID_ANY, "Toggle Chat History For Selected Contact")
         self.mi_refresh_directory = contacts_menu.Append(wx.ID_ANY, "Refresh Directory")
+        user_menu = wx.Menu()
+        self.mi_user_start_chat = user_menu.Append(wx.ID_ANY, "Start Chat")
+        self.mi_user_send_file = user_menu.Append(wx.ID_ANY, "Send File")
+        self.mi_user_transfers = user_menu.Append(wx.ID_ANY, "File Transfers")
+        self.mi_user_add_contact = user_menu.Append(wx.ID_ANY, "Add Contact")
+        self.mi_user_toggle_block = user_menu.Append(wx.ID_ANY, "Block/Unblock")
+        self.mi_user_toggle_history = user_menu.Append(wx.ID_ANY, "Toggle Chat History")
+        self.mi_user_delete_contact = user_menu.Append(wx.ID_ANY, "Delete Contact")
 
         view_menu = wx.Menu()
         self.mi_sort_name_asc = view_menu.AppendRadioItem(wx.ID_ANY, "Sort: Name (A-Z)")
@@ -1904,6 +2159,7 @@ class MainFrame(wx.Frame):
 
         menubar.Append(file_menu, "&File")
         menubar.Append(contacts_menu, "&Contacts")
+        menubar.Append(user_menu, "&User")
         menubar.Append(view_menu, "&View")
         menubar.Append(help_menu, "&Help")
         self.SetMenuBar(menubar)
@@ -1912,13 +2168,22 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.on_add, self.mi_add_contact)
         self.Bind(wx.EVT_MENU, self.on_delete, self.mi_delete_contact)
         self.Bind(wx.EVT_MENU, self.on_send_file, self.mi_send_file)
+        self.Bind(wx.EVT_MENU, self.on_file_transfers, self.mi_file_transfers)
         self.Bind(wx.EVT_MENU, self.on_user_directory, self.mi_user_directory)
         self.Bind(wx.EVT_MENU, self.on_server_info, self.mi_server_info)
         self.Bind(wx.EVT_MENU, self.on_settings, self.mi_settings)
         self.Bind(wx.EVT_MENU, self.on_logout, self.mi_logout)
         self.Bind(wx.EVT_MENU, self.on_exit, self.mi_exit)
         self.Bind(wx.EVT_MENU, self.on_block_toggle, self.mi_block_toggle)
+        self.Bind(wx.EVT_MENU, self.on_toggle_selected_chat_logging, self.mi_toggle_chat_log)
         self.Bind(wx.EVT_MENU, self.on_user_directory, self.mi_refresh_directory)
+        self.Bind(wx.EVT_MENU, self.on_send, self.mi_user_start_chat)
+        self.Bind(wx.EVT_MENU, self.on_send_file, self.mi_user_send_file)
+        self.Bind(wx.EVT_MENU, self.on_file_transfers, self.mi_user_transfers)
+        self.Bind(wx.EVT_MENU, self.on_add, self.mi_user_add_contact)
+        self.Bind(wx.EVT_MENU, self.on_block_toggle, self.mi_user_toggle_block)
+        self.Bind(wx.EVT_MENU, self.on_toggle_selected_chat_logging, self.mi_user_toggle_history)
+        self.Bind(wx.EVT_MENU, self.on_delete, self.mi_user_delete_contact)
         self.Bind(wx.EVT_MENU, lambda e: self._set_sort_mode("name_asc"), self.mi_sort_name_asc)
         self.Bind(wx.EVT_MENU, lambda e: self._set_sort_mode("name_desc"), self.mi_sort_name_desc)
         self.Bind(wx.EVT_MENU, lambda e: self._set_sort_mode("status"), self.mi_sort_status)
@@ -1956,24 +2221,30 @@ class MainFrame(wx.Frame):
             self.on_add(None)
 
     def _selected_contact_name(self):
-        sel = self.lv.GetFirstSelected()
-        if sel < 0:
+        sel = self.lv.GetSelection()
+        if sel == wx.NOT_FOUND or sel >= len(self._contact_display_map):
             return None
-        name = self.lv.GetItemText(sel)
-        if name in self.contact_states:
-            return name
-        return None
+        return self._contact_display_map[sel]
     def on_settings(self, event):
         app = wx.GetApp()
         with SettingsDialog(self, app.user_config) as dlg:
             if dlg.ShowModal() == wx.ID_OK:
                 selected_pack = dlg.choice.GetStringSelection()
                 app.user_config['soundpack'] = selected_pack
+                if dlg.set_selected_default_cb.IsChecked() and selected_pack not in ("default", "none"):
+                    app.user_config['default_soundpack'] = selected_pack
+                app.user_config['sound_volume'] = int(dlg.sound_volume_slider.GetValue())
+                app.user_config['call_input_volume'] = int(dlg.call_input_slider.GetValue())
+                app.user_config['call_output_volume'] = int(dlg.call_output_slider.GetValue())
                 app.user_config['auto_open_received_files'] = dlg.auto_open_files_cb.IsChecked()
                 app.user_config['read_messages_aloud'] = dlg.read_aloud_cb.IsChecked()
+                app.user_config['save_chat_history_default'] = dlg.global_chat_logging_cb.IsChecked()
+                app.user_config['show_main_action_buttons'] = dlg.show_main_actions_cb.IsChecked()
                 app.user_config['typing_indicators'] = dlg.typing_indicator_cb.IsChecked()
                 app.user_config['announce_typing'] = dlg.announce_typing_cb.IsChecked()
+                app.user_config['enter_key_action'] = 'send' if dlg.enter_action_choice.GetSelection() == 0 else 'newline'
                 save_user_config(app.user_config)
+                self.apply_action_button_layout()
                 wx.MessageBox("Settings have been applied.", "Settings Saved", wx.OK | wx.ICON_INFORMATION)
     def on_user_directory(self, _):
         if self._directory_dlg:
@@ -2004,21 +2275,59 @@ class MainFrame(wx.Frame):
         self.sock.sendall(json.dumps({"action": "server_info"}).encode() + b"\n")
     def on_server_info_response(self, msg):
         encrypted = isinstance(self.sock, ssl.SSLSocket)
+        app = wx.GetApp()
+        active = normalize_server_entry(getattr(app, "active_server_entry", {}))
         size_limit = msg.get("size_limit", 0)
         size_str = format_size(size_limit) if size_limit > 0 else "No limit"
         blackfiles = msg.get("blackfiles", [])
         blackfiles_str = ", ".join(f".{ext}" for ext in blackfiles) if blackfiles else "None"
         max_status_len = msg.get("max_status_length", "N/A")
-        info = [("Hostname", SERVER_CONFIG['host']), ("Port", str(msg.get("port", SERVER_CONFIG['port']))), ("Encrypted", "Yes" if encrypted else "No"), ("Registered Users", str(msg.get("total_users", "N/A"))), ("Users Online", str(msg.get("online_users", "N/A"))), ("File Size Limit", size_str), ("Blacklisted Extensions", blackfiles_str), ("Max Status Length", str(max_status_len))]
-        with ServerInfoDialog(self, info) as dlg: dlg.ShowModal()
+        lines = [
+            "Connected Server",
+            f"Name: {active.get('name', 'Current Server')}",
+            f"Host: {active.get('host', SERVER_CONFIG.get('host', 'Unknown'))}",
+            f"Port: {msg.get('port', active.get('port', SERVER_CONFIG.get('port', 'N/A')))}",
+            f"Encryption: {'Yes' if encrypted else 'No'}",
+            "",
+            "Server Status",
+            f"Registered users: {msg.get('total_users', 'N/A')}",
+            f"Users online: {msg.get('online_users', 'N/A')}",
+            f"Admins online: {msg.get('online_admin_users', 'N/A')}",
+            f"Uptime: {format_duration(int(msg.get('uptime_seconds', 0) or 0))}",
+            "",
+            "File Policy",
+            f"File size limit: {size_str}",
+            f"Blocked file extensions: {blackfiles_str}",
+            f"Max status length: {max_status_len}",
+        ]
+        with ServerInfoDialog(self, "\n".join(lines)) as dlg: dlg.ShowModal()
     def update_button_states(self, event=None):
         selected_contact = self._selected_contact_name()
         is_selection = selected_contact is not None
-        self.btn_send.Enable(is_selection); self.btn_delete.Enable(is_selection); self.btn_block.Enable(is_selection); self.btn_send_file.Enable(is_selection)
+        is_contact_selection = selected_contact is not None and selected_contact in self.contact_states
+        self.btn_send.Enable(is_contact_selection)
+        self.btn_delete.Enable(is_contact_selection)
+        self.btn_block.Enable(is_contact_selection)
+        self.btn_send_file.Enable(is_contact_selection)
         if is_selection:
             contact_name = selected_contact
             is_blocked = self.contact_states.get(contact_name, 0); self.btn_block.SetLabel("&Unblock" if is_blocked else "&Block")
         else: self.btn_block.SetLabel("&Block")
+        if hasattr(self, "mi_delete_contact"):
+            self.mi_delete_contact.Enable(is_contact_selection)
+        if hasattr(self, "mi_user_delete_contact"):
+            self.mi_user_delete_contact.Enable(is_contact_selection)
+        if selected_contact and is_contact_selection:
+            self.btn_send.SetLabel(f"&Start Chat with {selected_contact}")
+            self.btn_send_file.SetLabel(f"Send &File to {selected_contact}")
+            self.btn_block.SetLabel(f"{'&Unblock' if self.contact_states.get(selected_contact, 0) else '&Block'} {selected_contact}")
+            self.btn_delete.SetLabel(f"&Delete {selected_contact}")
+        else:
+            self.btn_send.SetLabel("&Start Chat")
+            self.btn_send_file.SetLabel("Send &File")
+            self.btn_delete.SetLabel("&Delete Contact")
+            if not is_selection:
+                self.btn_block.SetLabel("&Block")
         if event: event.Skip()
     def on_set_status(self, event):
         with StatusDialog(self, self.current_status) as dlg:
@@ -2093,6 +2402,7 @@ class MainFrame(wx.Frame):
                     "username": username,
                     "method": dlg.get_method(),
                     "target": dlg.get_target(),
+                    "include_link": dlg.should_include_link(),
                 }
                 try:
                     self.sock.sendall((json.dumps(payload) + "\n").encode())
@@ -2115,7 +2425,7 @@ class MainFrame(wx.Frame):
         if not suggest_invite and not invite_methods:
             invite_methods = ["email", "sms"]
         res = wx.MessageBox(
-            f"{missing_user} does not have an account yet. Would you like to invite them?",
+            f"{missing_user} does not have an account on this server yet. Would you like to send an invite?",
             "Invite User",
             wx.YES_NO | wx.ICON_QUESTION,
             self
@@ -2138,7 +2448,9 @@ class MainFrame(wx.Frame):
         self._all_contacts.append({"user": c["user"], "status": status, "blocked": c["blocked"]})
         self._apply_search_filter()
         chat = self.get_chat(c["user"])
-        if chat: chat.hide_add_button()
+        if chat:
+            chat.hide_add_button()
+            chat.send_pending_after_contact_added()
         if self._directory_dlg:
             for u in self._directory_dlg._all_users:
                 if u["user"] == c["user"]: u["is_contact"] = True; u["is_blocked"] = c["blocked"] == 1; break
@@ -2146,6 +2458,9 @@ class MainFrame(wx.Frame):
     def on_server_alert(self, message):
         wx.GetApp().play_sound("receive.wav")
         show_notification("Server Alert", message, timeout=8)
+    def on_file_transfers(self, _):
+        with FileTransfersDialog(self, wx.GetApp().transfer_history) as dlg:
+            dlg.ShowModal()
     def on_add(self, _):
         with wx.TextEntryDialog(self, "Enter the username of the contact you wish to add:", "Add Contact") as dlg:
             if dlg.ShowModal() == wx.ID_OK:
@@ -2167,7 +2482,8 @@ class MainFrame(wx.Frame):
             wx.CallAfter(self.on_user_directory, None)
     def _apply_search_filter(self):
         query = self.search_box.GetValue().strip().lower()
-        self.lv.DeleteAllItems()
+        self.lv.Clear()
+        self._contact_display_map = []
         first_real_idx = -1
         contacts = list(self._all_contacts)
         if self._sort_mode == "name_desc":
@@ -2178,24 +2494,24 @@ class MainFrame(wx.Frame):
             contacts = sorted(contacts, key=lambda c: c["user"].lower())
         for c in contacts:
             if query and query not in c["user"].lower(): continue
-            idx = self.lv.InsertItem(self.lv.GetItemCount(), c["user"])
-            self.lv.SetItem(idx, 1, c["status"])
-            if c["blocked"]: self.lv.SetItemTextColour(idx, wx.Colour(150,150,150))
+            display = f"{c['user']}  |  {c['status']}"
+            self.lv.Append(display)
+            idx = self.lv.GetCount() - 1
+            self._contact_display_map.append(c["user"])
             if first_real_idx == -1:
                 first_real_idx = idx
-        if self.lv.GetItemCount() == 0:
-            idx = self.lv.InsertItem(0, "(No contacts)")
-            self.lv.SetItem(idx, 1, "Press Alt+A to add a contact")
-            self.lv.SetItemTextColour(idx, wx.Colour(140, 140, 140))
+        if self.lv.GetCount() == 0:
+            self.lv.Append("(No contacts)  |  Press Alt+A to add a contact")
+            self._contact_display_map.append(None)
         elif first_real_idx >= 0:
-            self.lv.Select(first_real_idx)
-            self.lv.Focus(first_real_idx)
+            self.lv.SetSelection(first_real_idx)
         self.update_button_states()
     def on_contact_context_menu(self, _):
         menu = wx.Menu()
         mi_chat = menu.Append(wx.ID_ANY, "Start Chat")
         mi_add = menu.Append(wx.ID_ANY, "Add Contact")
         mi_file = menu.Append(wx.ID_ANY, "Send File")
+        mi_log = menu.Append(wx.ID_ANY, "Toggle Chat History")
         mi_block = menu.Append(wx.ID_ANY, "Block/Unblock")
         mi_delete = menu.Append(wx.ID_ANY, "Delete Contact")
         menu.AppendSeparator()
@@ -2203,11 +2519,24 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.on_send, mi_chat)
         self.Bind(wx.EVT_MENU, self.on_add, mi_add)
         self.Bind(wx.EVT_MENU, self.on_send_file, mi_file)
+        self.Bind(wx.EVT_MENU, self.on_toggle_selected_chat_logging, mi_log)
         self.Bind(wx.EVT_MENU, self.on_block_toggle, mi_block)
         self.Bind(wx.EVT_MENU, self.on_delete, mi_delete)
         self.Bind(wx.EVT_MENU, self.on_user_directory, mi_dir)
         self.PopupMenu(menu)
         menu.Destroy()
+    def on_toggle_selected_chat_logging(self, _):
+        c = self._selected_contact_name()
+        if not c:
+            return
+        app = wx.GetApp()
+        if 'chat_logging' not in app.user_config or not isinstance(app.user_config.get('chat_logging'), dict):
+            app.user_config['chat_logging'] = {}
+        current = is_chat_logging_enabled(app.user_config, c)
+        app.user_config['chat_logging'][c] = not current
+        save_user_config(app.user_config)
+        state = "enabled" if not current else "disabled"
+        show_notification("Chat history", f"Chat history {state} for {c}.", timeout=5)
     def on_search(self, event):
         self._apply_search_filter()
     def on_admin_status_change(self, user, is_admin):
@@ -2276,7 +2605,8 @@ class MainFrame(wx.Frame):
         self._apply_search_filter()
     def on_delete(self, _):
         c = self._selected_contact_name()
-        if not c: return
+        if not c or c not in self.contact_states:
+            return
         self.sock.sendall(json.dumps({"action":"delete_contact","to":c}).encode()+b"\n"); self.contact_states.pop(c, None)
         self._all_contacts = [entry for entry in self._all_contacts if entry["user"] != c]
         self._apply_search_filter()
@@ -2286,22 +2616,22 @@ class MainFrame(wx.Frame):
             if not self._all_contacts:
                 self._show_add_contact_prompt()
             return
-        app = wx.GetApp(); logging_config = app.user_config.get('chat_logging', {}); is_logging_enabled = logging_config.get(c, False)
+        app = wx.GetApp(); is_logging_enabled = is_chat_logging_enabled(app.user_config, c)
         dlg = self.get_chat(c) or ChatDialog(self, c, self.sock, self.user, is_logging_enabled)
-        dlg.Show(); dlg.input_ctrl.SetFocus()
+        dlg.Show(); wx.CallAfter(dlg.input_ctrl.SetFocus)
     def on_send_file(self, _):
         c = self._selected_contact_name()
         if not c: return
         wx.GetApp().send_file_to(c)
     def on_contact_activated(self, event):
-        idx = event.GetIndex()
-        if idx < 0:
+        idx = self.lv.GetSelection()
+        if idx == wx.NOT_FOUND:
             return
-        contact = self.lv.GetItemText(idx, 0)
+        contact = self._selected_contact_name()
         if contact not in self.contact_states:
             self._show_add_contact_prompt()
             return
-        status = self.lv.GetItemText(idx, 1)
+        status = next((c["status"] for c in self._all_contacts if c["user"] == contact), "")
         urls = extract_urls(status)
         if urls:
             open_path_or_url(urls[0])
@@ -2309,12 +2639,12 @@ class MainFrame(wx.Frame):
         self.on_send(None)
     def receive_message(self, msg):
         wx.GetApp().play_sound("receive.wav");
-        app = wx.GetApp(); logging_config = app.user_config.get('chat_logging', {}); is_logging_enabled = logging_config.get(msg["from"], False)
+        app = wx.GetApp(); is_logging_enabled = is_chat_logging_enabled(app.user_config, msg["from"])
         dlg = self.get_chat(msg["from"])
         if not dlg:
             is_contact = msg["from"] in self.contact_states
             dlg = ChatDialog(self, msg["from"], self.sock, self.user, is_logging_enabled, is_contact=is_contact)
-        dlg.Show(); dlg.append(msg["msg"], msg["from"], msg["time"]); dlg.input_ctrl.SetFocus(); self.RequestUserAttention()
+        dlg.Show(); dlg.append(msg["msg"], msg["from"], msg["time"]); wx.CallAfter(dlg.input_ctrl.SetFocus); self.RequestUserAttention()
     def on_typing_event(self, msg):
         from_user = msg.get("from")
         is_typing = bool(msg.get("typing", False))
@@ -2375,8 +2705,12 @@ class ChatDialog(wx.Dialog):
     def __init__(self, parent, contact, sock, user, logging_enabled=False, is_contact=True):
         super().__init__(parent, title=f"Chat with {contact}", size=(450, 450))
         self.contact, self.sock, self.user = contact, sock, user
+        self.is_contact = bool(is_contact)
+        self._pending_message_after_add = None
         self.Bind(wx.EVT_CHAR_HOOK, self.on_key)
         self.Bind(wx.EVT_CLOSE, self.on_close)
+        self.Bind(wx.EVT_SHOW, self.on_show_dialog)
+        self.Bind(wx.EVT_ACTIVATE, self.on_activate_dialog)
         self._sent_typing = False
         self._typing_timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self.on_typing_timeout, self._typing_timer)
@@ -2392,15 +2726,15 @@ class ChatDialog(wx.Dialog):
         if dark_mode_on:
             self.btn_add_contact.SetBackgroundColour(dark_color); self.btn_add_contact.SetForegroundColour(light_text_color)
         s.Add(self.btn_add_contact, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 5)
-        if is_contact: self.btn_add_contact.Hide()
-        self.hist = wx.ListCtrl(self, style=wx.LC_REPORT)
-        self.hist.InsertColumn(0, "Sender", width=80); self.hist.InsertColumn(1, "Message", width=160); self.hist.InsertColumn(2, "Time", width=180)
-        self.hist.Bind(wx.EVT_LIST_ITEM_ACTIVATED, self.on_history_item_activated)
-        self.save_hist_cb = wx.CheckBox(self, label="Sa&ve chat history")
-        self.save_hist_cb.SetValue(logging_enabled); self.save_hist_cb.Bind(wx.EVT_CHECKBOX, self.on_toggle_save)
+        if self.is_contact: self.btn_add_contact.Hide()
+        self.logging_enabled = bool(logging_enabled)
+        self.hist = wx.ListBox(self, style=wx.LB_SINGLE)
+        self._history_rows = []
+        self.hist.Bind(wx.EVT_LISTBOX_DCLICK, self.on_history_item_activated)
+        self.hist.Bind(wx.EVT_KEY_DOWN, self.on_history_key)
         self.typing_lbl = wx.StaticText(self, label="")
         self.typing_lbl.SetForegroundColour(wx.Colour(120, 180, 255))
-        box_msg = wx.StaticBoxSizer(wx.VERTICAL, self, "Type &message (Shift+Enter for newline)")
+        box_msg = wx.StaticBoxSizer(wx.VERTICAL, self, "Type &message")
         self.input_ctrl = wx.TextCtrl(box_msg.GetStaticBox(), style=wx.TE_MULTILINE)
         btn = wx.Button(self, label="&Send")
         btn_file = wx.Button(self, label="Send &File")
@@ -2414,9 +2748,9 @@ class ChatDialog(wx.Dialog):
             btn_file.SetBackgroundColour(dark_color); btn_file.SetForegroundColour(light_text_color)
 
         s.Add(self.hist, 1, wx.EXPAND|wx.ALL, 5)
-        s.Add(self.save_hist_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         s.Add(self.typing_lbl, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
         self.input_ctrl.Bind(wx.EVT_KEY_DOWN, self.on_input_key)
+        self.input_ctrl.Bind(wx.EVT_CHAR_HOOK, self.on_input_key)
         self.input_ctrl.Bind(wx.EVT_TEXT, self.on_input_text)
         box_msg.Add(self.input_ctrl, 1, wx.EXPAND|wx.ALL, 5)
         s.Add(box_msg, 1, wx.EXPAND|wx.ALL, 5)
@@ -2428,11 +2762,18 @@ class ChatDialog(wx.Dialog):
         btn_sizer.Add(btn_file, 1, wx.EXPAND | wx.ALL, 5)
         s.Add(btn_sizer, 0, wx.EXPAND|wx.ALL, 5)
         self.SetSizer(s)
-    def on_toggle_save(self, event):
-        app = wx.GetApp(); is_enabled = self.save_hist_cb.IsChecked()
-        if 'chat_logging' not in app.user_config: app.user_config['chat_logging'] = {}
-        app.user_config['chat_logging'][self.contact] = is_enabled
-        save_user_config(app.user_config)
+        self._focus_input()
+    def _focus_input(self):
+        wx.CallAfter(self.input_ctrl.SetFocus)
+        wx.CallLater(120, self.input_ctrl.SetFocus)
+    def on_show_dialog(self, event):
+        if event.IsShown():
+            self._focus_input()
+        event.Skip()
+    def on_activate_dialog(self, event):
+        if event.GetActive():
+            self._focus_input()
+        event.Skip()
     def _save_message_to_log(self, formatted_log_line):
         try:
             docs_path = os.path.join(os.path.expanduser('~'), 'Documents')
@@ -2445,9 +2786,20 @@ class ChatDialog(wx.Dialog):
     def on_input_key(self, event):
         keycode = event.GetKeyCode()
         if keycode in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
-            if event.ShiftDown(): self.input_ctrl.WriteText('\n')
-            else: self.on_send(None)
-        else: event.Skip()
+            if event.ControlDown():
+                self.on_send_file(None)
+                return
+            elif event.CmdDown():
+                self.input_ctrl.WriteText('\n')
+                return
+            else:
+                enter_action = wx.GetApp().user_config.get('enter_key_action', 'send')
+                if enter_action == 'newline':
+                    self.input_ctrl.WriteText('\n')
+                else:
+                    self.on_send(None)
+                return
+        event.Skip()
     def on_input_text(self, event):
         app = wx.GetApp()
         if app.user_config.get('typing_indicators', True):
@@ -2477,11 +2829,27 @@ class ChatDialog(wx.Dialog):
     def on_key(self, event):
         if event.GetKeyCode() == wx.WXK_F1:
             open_help_docs_for_context("chat", self)
+        elif event.CmdDown() and event.GetKeyCode() == ord(','):
+            parent = self.GetParent()
+            if parent and hasattr(parent, "on_settings"):
+                wx.CallAfter(parent.on_settings, None)
         elif event.GetKeyCode() == wx.WXK_ESCAPE: self.Close()
         else: event.Skip()
     def on_send(self, _):
         txt = self.input_ctrl.GetValue().strip()
         if not txt: return
+        if not self.is_contact:
+            res = wx.MessageBox(
+                f"{self.contact} is not in your contacts.\n\nAdd this user to contacts before sending?",
+                "Add Contact First",
+                wx.YES_NO | wx.ICON_QUESTION,
+                self,
+            )
+            if res != wx.YES:
+                return
+            self._pending_message_after_add = txt
+            self.on_add_contact(None)
+            return
         self._send_stop_typing()
         ts = datetime.datetime.now().isoformat()
         msg = {"action":"msg","to":self.contact,"from":self.user,"time":ts,"msg":txt}
@@ -2495,15 +2863,26 @@ class ChatDialog(wx.Dialog):
         self.sock.sendall(json.dumps({"action": "add_contact", "to": self.contact}).encode() + b"\n")
         self.btn_add_contact.Disable(); self.btn_add_contact.SetLabel("Adding...")
     def hide_add_button(self):
+        self.is_contact = True
         self.btn_add_contact.Hide(); self.GetSizer().Layout()
+    def send_pending_after_contact_added(self):
+        if not self._pending_message_after_add:
+            return
+        pending = self._pending_message_after_add
+        self._pending_message_after_add = None
+        self.input_ctrl.SetValue(pending)
+        self.on_send(None)
     def append(self, text, sender, ts, is_error=False):
-        idx = self.hist.GetItemCount(); self.hist.InsertItem(idx, sender); self.hist.SetItem(idx, 1, text)
-        formatted_time = format_timestamp(ts); self.hist.SetItem(idx, 2, formatted_time)
-        if is_error: self.hist.SetItemTextColour(idx, wx.RED)
+        formatted_time = format_timestamp(ts)
+        prefix = "Error" if is_error else sender
+        display = f"[{formatted_time}] {prefix}: {text}"
+        self.hist.Append(display)
+        self._history_rows.append({"sender": sender, "text": text, "time": ts, "error": is_error})
+        self.hist.SetSelection(self.hist.GetCount() - 1)
         app = wx.GetApp()
         if sender not in (self.user, "System") and app.user_config.get('read_messages_aloud', False):
             speak_text(f"{sender} says {text}")
-        if self.save_hist_cb.IsChecked():
+        if self.logging_enabled:
             log_line = f"[{formatted_time}] {sender}: {text}\n"
             self._save_message_to_log(log_line)
     def append_error(self, reason):
@@ -2512,10 +2891,12 @@ class ChatDialog(wx.Dialog):
         self.input_ctrl.SetFocus()
 
     def on_history_item_activated(self, event):
-        idx = event.GetIndex()
-        if idx < 0:
+        idx = self.hist.GetSelection()
+        if idx == wx.NOT_FOUND or idx < 0:
             return
-        message_text = self.hist.GetItemText(idx, 1)
+        if idx >= len(self._history_rows):
+            return
+        message_text = self._history_rows[idx].get("text", "")
         urls = extract_urls(message_text)
         if not urls:
             return
@@ -2526,6 +2907,13 @@ class ChatDialog(wx.Dialog):
         # Keep interaction simple for screen-reader flow: open first URL and notify user.
         wx.MessageBox(f"Multiple links found. Opening first link:\n{chosen}", "Open Link", wx.OK | wx.ICON_INFORMATION)
         open_path_or_url(chosen)
+    def on_history_key(self, event):
+        if event.GetKeyCode() in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
+            idx = self.hist.GetSelection()
+            if idx != wx.NOT_FOUND:
+                self.on_history_item_activated(event)
+            return
+        event.Skip()
     def set_typing_state(self, username, is_typing):
         app = wx.GetApp()
         if not app.user_config.get('typing_indicators', True):
