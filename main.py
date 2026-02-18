@@ -24,7 +24,12 @@ def speak_message(message):
         print(f"Error speaking message: {e}")
 
 def show_notification(title, message, timeout=5):
+    """Show OS notification if enabled in user preferences."""
     try:
+        # Check if notifications are enabled in user config
+        if wx.GetApp() and not wx.GetApp().user_config.get('show_notifications', True):
+            return
+        
         if sys.platform == 'win32':
             toast = _WinNotification(app_id="Thrive Messenger", title=title, msg=message, duration="short")
             toast.show()
@@ -129,6 +134,7 @@ def load_user_config():
         'password': '',
         'soundpack': 'default',
         'speech_feedback': False,
+        'show_notifications': True,
         'chat_logging': {}
     }
 
@@ -291,7 +297,7 @@ class ThriveTaskBarIcon(wx.adv.TaskBarIcon):
 
 class SettingsDialog(wx.Dialog):
     def __init__(self, parent, current_config):
-        super().__init__(parent, title="Settings", size=(300, 200)); self.config = current_config
+        super().__init__(parent, title="Settings", size=(300, 250)); self.config = current_config
         panel = wx.Panel(self); main_sizer = wx.BoxSizer(wx.VERTICAL); sound_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "&Sound Pack")
         
         dark_mode_on = is_windows_dark_mode()
@@ -312,13 +318,30 @@ class SettingsDialog(wx.Dialog):
         
         sound_box.Add(self.choice, 0, wx.EXPAND | wx.ALL, 5); main_sizer.Add(sound_box, 0, wx.EXPAND | wx.ALL, 5)
         
-        # Add speech feedback checkbox
-        self.speech_checkbox = wx.CheckBox(panel, label="Enable &speech feedback for online/offline status")
-        self.speech_checkbox.SetValue(self.config.get('speech_feedback', False))
+        # Add CheckListBox for notification options
+        notification_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "&Notification Options")
         if dark_mode_on:
-            self.speech_checkbox.SetBackgroundColour(dark_color)
-            self.speech_checkbox.SetForegroundColour(light_text_color)
-        main_sizer.Add(self.speech_checkbox, 0, wx.EXPAND | wx.ALL, 5)
+            notification_box.GetStaticBox().SetForegroundColour(light_text_color)
+            notification_box.GetStaticBox().SetBackgroundColour(dark_color)
+        
+        notification_options = [
+            "Speech feedback for online/offline status",
+            "Show OS notifications"
+        ]
+        self.notification_checklist = wx.CheckListBox(notification_box.GetStaticBox(), choices=notification_options)
+        
+        # Set initial checked state from config
+        if self.config.get('speech_feedback', False):
+            self.notification_checklist.Check(0, True)
+        if self.config.get('show_notifications', True):
+            self.notification_checklist.Check(1, True)
+        
+        if dark_mode_on:
+            self.notification_checklist.SetBackgroundColour(dark_color)
+            self.notification_checklist.SetForegroundColour(light_text_color)
+        
+        notification_box.Add(self.notification_checklist, 1, wx.EXPAND | wx.ALL, 5)
+        main_sizer.Add(notification_box, 1, wx.EXPAND | wx.ALL, 5)
         
         btn_sizer = wx.StdDialogButtonSizer()
         ok_btn = wx.Button(panel, wx.ID_OK, label="&Apply"); ok_btn.SetDefault(); cancel_btn = wx.Button(panel, wx.ID_CANCEL)
@@ -1121,7 +1144,9 @@ class MainFrame(wx.Frame):
         with SettingsDialog(self, app.user_config) as dlg:
             if dlg.ShowModal() == wx.ID_OK:
                 selected_pack = dlg.choice.GetStringSelection(); app.user_config['soundpack'] = selected_pack
-                app.user_config['speech_feedback'] = dlg.speech_checkbox.GetValue()
+                # Get checked states from CheckListBox
+                app.user_config['speech_feedback'] = dlg.notification_checklist.IsChecked(0)
+                app.user_config['show_notifications'] = dlg.notification_checklist.IsChecked(1)
                 save_user_config(app.user_config)
                 wx.MessageBox("Settings have been applied.", "Settings Saved", wx.OK | wx.ICON_INFORMATION)
     def on_user_directory(self, _):
