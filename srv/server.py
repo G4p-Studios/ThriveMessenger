@@ -544,7 +544,6 @@ def handle_client(cs, addr):
                         alert_message = " ".join(cmd_parts[1:])
                         broadcast_alert(alert_message)
                         response = "Alert sent to all online users."
-<<<<<<< HEAD
                     elif command == "create" and len(cmd_parts) in (3, 4):
                         email = cmd_parts[3] if len(cmd_parts) == 4 else ""
                         if handle_create(cmd_parts[1], cmd_parts[2], email):
@@ -768,6 +767,30 @@ def handle_client(cs, addr):
                 status_text = msg.get("status_text", "online")[:max_status_length]
                 with lock: client_statuses[user] = status_text
                 broadcast_contact_status(user, True)
+
+            elif action == "change_password":
+                cur_pass = msg.get("current_pass", "")
+                new_pass = msg.get("new_pass", "")
+                if not cur_pass or not new_pass:
+                    sock.sendall((json.dumps({"action": "change_password_result", "ok": False, "reason": "Missing fields."}) + "\n").encode())
+                else:
+                    con = sqlite3.connect(DB)
+                    row = con.execute("SELECT password FROM users WHERE username=?", (user,)).fetchone()
+                    stored = row[0] if row else None
+                    ok = False
+                    if stored:
+                        if stored.startswith("$argon2"):
+                            try: _ph.verify(stored, cur_pass); ok = True
+                            except (VerifyMismatchError, VerificationError, InvalidHashError): pass
+                        else:
+                            ok = (stored == cur_pass)
+                    if ok:
+                        con.execute("UPDATE users SET password=? WHERE username=?", (_ph.hash(new_pass), user))
+                        con.commit(); con.close()
+                        sock.sendall((json.dumps({"action": "change_password_result", "ok": True}) + "\n").encode())
+                    else:
+                        con.close()
+                        sock.sendall((json.dumps({"action": "change_password_result", "ok": False, "reason": "Current password is incorrect."}) + "\n").encode())
 
             elif action == "logout": break
     except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):

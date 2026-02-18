@@ -916,7 +916,6 @@ class SettingsDialog(wx.Dialog):
         esc_val = str(self.config.get('escape_main_action', 'none') or 'none')
         self.escape_action_choice.SetSelection(0 if esc_val == 'none' else (1 if esc_val == 'minimize' else 2))
         escape_row.Add(self.escape_action_choice, 1, wx.EXPAND)
-
         sound_box.Add(self.choice, 0, wx.EXPAND | wx.ALL, 5)
         sound_box.Add(self.default_soundpack_label, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         sound_box.Add(self.set_selected_default_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
@@ -937,6 +936,9 @@ class SettingsDialog(wx.Dialog):
         main_sizer.Add(sound_box, 0, wx.EXPAND | wx.ALL, 5)
         main_sizer.Add(call_audio_box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         main_sizer.Add(accessibility_box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        self.btn_chpass = wx.Button(panel, label="C&hange Password...")
+        self.btn_chpass.Bind(wx.EVT_BUTTON, self.on_change_password)
+        main_sizer.Add(self.btn_chpass, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         btn_sizer = wx.StdDialogButtonSizer()
         ok_btn = wx.Button(panel, wx.ID_OK, label="&Apply"); ok_btn.SetDefault(); cancel_btn = wx.Button(panel, wx.ID_CANCEL)
         
@@ -951,6 +953,7 @@ class SettingsDialog(wx.Dialog):
                 cb.SetForegroundColour(light_text_color)
             self.enter_action_choice.SetBackgroundColour(dark_color); self.enter_action_choice.SetForegroundColour(light_text_color)
             self.escape_action_choice.SetBackgroundColour(dark_color); self.escape_action_choice.SetForegroundColour(light_text_color)
+            self.btn_chpass.SetBackgroundColour(dark_color); self.btn_chpass.SetForegroundColour(light_text_color)
             ok_btn.SetBackgroundColour(dark_color); ok_btn.SetForegroundColour(light_text_color)
             cancel_btn.SetBackgroundColour(dark_color); cancel_btn.SetForegroundColour(light_text_color)
             
@@ -964,6 +967,85 @@ class SettingsDialog(wx.Dialog):
             open_help_docs_for_context("settings", self)
             return
         event.Skip()
+    def on_change_password(self, _):
+        with ChangePasswordDialog(self) as dlg:
+            if dlg.ShowModal() == wx.ID_OK:
+                cur = dlg.cur_ctrl.GetValue(); new = dlg.new_ctrl.GetValue()
+                frame = self.GetParent()
+                try: frame.sock.sendall((json.dumps({"action": "change_password", "current_pass": cur, "new_pass": new}) + "\n").encode())
+                except Exception as e: wx.MessageBox(f"Failed to send request: {e}", "Error", wx.ICON_ERROR)
+
+class ReconnectDialog(wx.Dialog):
+    def __init__(self):
+        super().__init__(None, title="Connection Lost", style=wx.DEFAULT_DIALOG_STYLE | wx.STAY_ON_TOP)
+        self.cancelled = False
+        panel = wx.Panel(self); sizer = wx.BoxSizer(wx.VERTICAL)
+
+        dark_mode_on = is_windows_dark_mode()
+        if dark_mode_on:
+            dark_color = wx.Colour(40, 40, 40); light_text_color = wx.WHITE
+            WxMswDarkMode().enable(self); self.SetBackgroundColour(dark_color); panel.SetBackgroundColour(dark_color)
+
+        self.status_label = wx.StaticText(panel, label="Connection to the server was lost.")
+        give_up_btn = wx.Button(panel, label="Give Up")
+        give_up_btn.Bind(wx.EVT_BUTTON, self.on_give_up)
+
+        if dark_mode_on:
+            self.status_label.SetForegroundColour(light_text_color); self.status_label.SetBackgroundColour(dark_color)
+            give_up_btn.SetBackgroundColour(dark_color); give_up_btn.SetForegroundColour(light_text_color)
+
+        sizer.Add(self.status_label, 0, wx.ALL, 15)
+        sizer.Add(give_up_btn, 0, wx.ALIGN_CENTER | wx.BOTTOM, 10)
+        panel.SetSizer(sizer); self.Fit(); self.Centre()
+
+    def set_status(self, text):
+        self.status_label.SetLabel(text); self.Layout(); self.Fit()
+
+    def on_give_up(self, _):
+        self.cancelled = True; self.EndModal(wx.ID_CANCEL)
+
+class ChangePasswordDialog(wx.Dialog):
+    def __init__(self, parent):
+        super().__init__(parent, title="Change Password", size=(300, 220))
+        panel = wx.Panel(self); sizer = wx.BoxSizer(wx.VERTICAL)
+        dark_mode_on = is_windows_dark_mode()
+        if dark_mode_on:
+            dark_color = wx.Colour(40, 40, 40); light_text_color = wx.WHITE
+            WxMswDarkMode().enable(self); self.SetBackgroundColour(dark_color); panel.SetBackgroundColour(dark_color)
+        cur_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "&Current Password")
+        self.cur_ctrl = wx.TextCtrl(cur_box.GetStaticBox(), style=wx.TE_PASSWORD)
+        new_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "&New Password")
+        self.new_ctrl = wx.TextCtrl(new_box.GetStaticBox(), style=wx.TE_PASSWORD)
+        conf_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "Con&firm New Password")
+        self.conf_ctrl = wx.TextCtrl(conf_box.GetStaticBox(), style=wx.TE_PASSWORD)
+        btn_sizer = wx.StdDialogButtonSizer()
+        ok_btn = wx.Button(panel, wx.ID_OK, label="&Change"); ok_btn.SetDefault()
+        cancel_btn = wx.Button(panel, wx.ID_CANCEL)
+        ok_btn.Bind(wx.EVT_BUTTON, self.on_ok)
+        if dark_mode_on:
+            for box in [cur_box, new_box, conf_box]:
+                box.GetStaticBox().SetForegroundColour(light_text_color); box.GetStaticBox().SetBackgroundColour(dark_color)
+            for ctrl in [self.cur_ctrl, self.new_ctrl, self.conf_ctrl]:
+                ctrl.SetBackgroundColour(dark_color); ctrl.SetForegroundColour(light_text_color)
+            ok_btn.SetBackgroundColour(dark_color); ok_btn.SetForegroundColour(light_text_color)
+            cancel_btn.SetBackgroundColour(dark_color); cancel_btn.SetForegroundColour(light_text_color)
+        cur_box.Add(self.cur_ctrl, 0, wx.EXPAND | wx.ALL, 5)
+        new_box.Add(self.new_ctrl, 0, wx.EXPAND | wx.ALL, 5)
+        conf_box.Add(self.conf_ctrl, 0, wx.EXPAND | wx.ALL, 5)
+        sizer.Add(cur_box, 0, wx.EXPAND | wx.ALL, 5)
+        sizer.Add(new_box, 0, wx.EXPAND | wx.ALL, 5)
+        sizer.Add(conf_box, 0, wx.EXPAND | wx.ALL, 5)
+        btn_sizer.AddButton(ok_btn); btn_sizer.AddButton(cancel_btn); btn_sizer.Realize()
+        sizer.Add(btn_sizer, 0, wx.ALIGN_CENTER | wx.ALL, 5)
+        panel.SetSizer(sizer)
+    def on_ok(self, _):
+        if not self.cur_ctrl.GetValue():
+            wx.MessageBox("Please enter your current password.", "Error", wx.ICON_ERROR); return
+        if not self.new_ctrl.GetValue():
+            wx.MessageBox("Please enter a new password.", "Error", wx.ICON_ERROR); return
+        if self.new_ctrl.GetValue() != self.conf_ctrl.GetValue():
+            wx.MessageBox("New passwords do not match.", "Error", wx.ICON_ERROR); return
+        self.EndModal(wx.ID_OK)
 
 STATUS_PRESETS = ["online", "offline", "busy", "away", "on the phone", "doing homework", "in the shower", "watching TV", "hiding from the parents", "fixing my PC", "battery about to die"]
 
@@ -1311,6 +1393,7 @@ class ClientApp(wx.App):
                 elif act == "file_declined": wx.CallAfter(self.on_file_declined, msg)
                 elif act == "file_data": wx.CallAfter(self.on_file_data, msg)
                 elif act == "invite_result": wx.CallAfter(self.frame.on_invite_result, msg)
+                elif act == "change_password_result": wx.CallAfter(self.frame.on_change_password_result, msg)
                 elif act == "banned_kick": wx.CallAfter(self.on_banned); handled = True; break
         except (IOError, json.JSONDecodeError, ValueError):
             print("Disconnected from server.")
@@ -2562,6 +2645,13 @@ class MainFrame(wx.Frame):
                 save_user_config(app.user_config)
                 self.apply_action_button_layout()
                 wx.MessageBox("Settings have been applied.", "Settings Saved", wx.OK | wx.ICON_INFORMATION)
+
+    def on_change_password_result(self, msg):
+        if msg.get("ok"):
+            wx.MessageBox("Password changed successfully.", "Success", wx.OK | wx.ICON_INFORMATION)
+        else:
+            reason = msg.get("reason", "Unknown error.")
+            wx.MessageBox(f"Could not change password: {reason}", "Error", wx.ICON_ERROR)
     def on_user_directory(self, _):
         if self._directory_dlg:
             self._directory_dlg.Raise(); self._directory_dlg.SetFocus(); return
