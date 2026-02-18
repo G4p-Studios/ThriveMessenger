@@ -328,7 +328,7 @@ class SettingsDialog(wx.Dialog):
             "Speech feedback for online/offline status",
             "Show OS notifications"
         ]
-        self.notification_checklist = wx.CheckListBox(notification_box.GetStaticBox(), choices=notification_options)
+        self.notification_checklist = wx.CheckListBox(panel, choices=notification_options)
         
         # Set initial checked state from config
         if self.config.get('speech_feedback', False):
