@@ -318,30 +318,30 @@ class SettingsDialog(wx.Dialog):
         
         sound_box.Add(self.choice, 0, wx.EXPAND | wx.ALL, 5); main_sizer.Add(sound_box, 0, wx.EXPAND | wx.ALL, 5)
         
-        # Add CheckListBox for notification options
+        # Add individual CheckBox controls for notification options
         notification_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "&Notification Options")
         if dark_mode_on:
             notification_box.GetStaticBox().SetForegroundColour(light_text_color)
             notification_box.GetStaticBox().SetBackgroundColour(dark_color)
         
-        notification_options = [
-            "Speech feedback for online/offline status",
-            "Show OS notifications"
-        ]
-        self.notification_checklist = wx.CheckListBox(panel, choices=notification_options)
+        # Create individual checkbox controls
+        self.speech_checkbox = wx.CheckBox(panel, label="Speech feedback for online/offline status")
+        self.speech_checkbox.SetValue(self.config.get('speech_feedback', False))
         
-        # Set initial checked state from config
-        if self.config.get('speech_feedback', False):
-            self.notification_checklist.Check(0, True)
-        if self.config.get('show_notifications', True):
-            self.notification_checklist.Check(1, True)
+        self.notifications_checkbox = wx.CheckBox(panel, label="Show OS notifications")
+        self.notifications_checkbox.SetValue(self.config.get('show_notifications', True))
         
+        # Apply dark mode styling to checkboxes
         if dark_mode_on:
-            self.notification_checklist.SetBackgroundColour(dark_color)
-            self.notification_checklist.SetForegroundColour(light_text_color)
+            self.speech_checkbox.SetBackgroundColour(dark_color)
+            self.speech_checkbox.SetForegroundColour(light_text_color)
+            self.notifications_checkbox.SetBackgroundColour(dark_color)
+            self.notifications_checkbox.SetForegroundColour(light_text_color)
         
-        notification_box.Add(self.notification_checklist, 1, wx.EXPAND | wx.ALL, 5)
-        main_sizer.Add(notification_box, 1, wx.EXPAND | wx.ALL, 5)
+        # Add checkboxes to the notification box
+        notification_box.Add(self.speech_checkbox, 0, wx.ALL, 5)
+        notification_box.Add(self.notifications_checkbox, 0, wx.ALL, 5)
+        main_sizer.Add(notification_box, 0, wx.EXPAND | wx.ALL, 5)
         
         btn_sizer = wx.StdDialogButtonSizer()
         ok_btn = wx.Button(panel, wx.ID_OK, label="&Apply"); ok_btn.SetDefault(); cancel_btn = wx.Button(panel, wx.ID_CANCEL)
@@ -1144,9 +1144,9 @@ class MainFrame(wx.Frame):
         with SettingsDialog(self, app.user_config) as dlg:
             if dlg.ShowModal() == wx.ID_OK:
                 selected_pack = dlg.choice.GetStringSelection(); app.user_config['soundpack'] = selected_pack
-                # Get checked states from CheckListBox
-                app.user_config['speech_feedback'] = dlg.notification_checklist.IsChecked(0)
-                app.user_config['show_notifications'] = dlg.notification_checklist.IsChecked(1)
+                # Get checked states from individual checkboxes
+                app.user_config['speech_feedback'] = dlg.speech_checkbox.GetValue()
+                app.user_config['show_notifications'] = dlg.notifications_checkbox.GetValue()
                 save_user_config(app.user_config)
                 wx.MessageBox("Settings have been applied.", "Settings Saved", wx.OK | wx.ICON_INFORMATION)
     def on_user_directory(self, _):
