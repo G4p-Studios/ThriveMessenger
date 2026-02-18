@@ -950,6 +950,8 @@ class ClientApp(wx.App):
             wx.CallAfter(show_notification, "Connected", f"Signed in to {normalized['name']}")
 
     def send_json_to_server(self, server_name, payload):
+        if not server_name:
+            server_name = normalize_server_entry(getattr(self, "active_server_entry", {})).get("name", "Current Server")
         session = self.server_sessions.get(server_name)
         if not session:
             return False
@@ -1016,11 +1018,11 @@ class ClientApp(wx.App):
                 elif act == "admin_status_change" and is_primary: wx.CallAfter(self.frame.on_admin_status_change, msg["user"], msg["is_admin"])
                 elif act == "server_alert" and is_primary: wx.CallAfter(self.frame.on_server_alert, msg["message"])
                 elif act == "typing": wx.CallAfter(self.frame.on_typing_event, msg)
-                elif act == "file_offer" and is_primary: wx.CallAfter(self.on_file_offer, msg)
-                elif act == "file_offer_failed" and is_primary: wx.CallAfter(self.on_file_offer_failed, msg)
-                elif act == "file_accepted" and is_primary: wx.CallAfter(self.on_file_accepted, msg)
-                elif act == "file_declined" and is_primary: wx.CallAfter(self.on_file_declined, msg)
-                elif act == "file_data" and is_primary: wx.CallAfter(self.on_file_data, msg)
+                elif act == "file_offer": wx.CallAfter(self.on_file_offer, msg)
+                elif act == "file_offer_failed": wx.CallAfter(self.on_file_offer_failed, msg)
+                elif act == "file_accepted": wx.CallAfter(self.on_file_accepted, msg)
+                elif act == "file_declined": wx.CallAfter(self.on_file_declined, msg)
+                elif act == "file_data": wx.CallAfter(self.on_file_data, msg)
                 elif act == "banned_kick":
                     if is_primary:
                         wx.CallAfter(self.on_banned)
@@ -1058,9 +1060,9 @@ class ClientApp(wx.App):
         if not result: self.ExitMainLoop()
 
     def on_file_offer(self, msg):
-        sender = msg["from"]; files = msg["files"]; transfer_id = msg["transfer_id"]
+        sender = msg["from"]; files = msg["files"]; transfer_id = msg["transfer_id"]; server_name = msg.get("server")
         self.play_sound("file_receive.wav")
-        parent = self.frame.get_chat(sender) or self.frame
+        parent = self.frame.get_chat(sender, server_name) or self.frame
         if len(files) == 1:
             f = files[0]; size = f.get("size", 0)
             prompt = f"{sender} wants to send you a file:\n\n{f['filename']} ({format_size(size)})\n\nDo you want to accept?"
@@ -1068,69 +1070,76 @@ class ClientApp(wx.App):
             total_size = sum(f.get("size", 0) for f in files)
             file_list = "\n".join(f"  {f['filename']} ({format_size(f.get('size', 0))})" for f in files)
             prompt = f"{sender} wants to send you {len(files)} files ({format_size(total_size)} total):\n\n{file_list}\n\nDo you want to accept?"
+        if server_name:
+            prompt = f"Server: {server_name}\n\n{prompt}"
         result = wx.MessageBox(prompt, "File Transfer Request", wx.YES_NO | wx.ICON_QUESTION, parent)
         if result == wx.YES:
-            self.sock.sendall((json.dumps({"action": "file_accept", "transfer_id": transfer_id}) + "\n").encode())
-            chat = self.frame.get_chat(sender)
+            self.send_json_to_server(server_name, {"action": "file_accept", "transfer_id": transfer_id})
+            chat = self.frame.get_chat(sender, server_name)
             if chat:
                 names = ", ".join(f["filename"] for f in files)
                 chat.append(f"Accepting {len(files)} file(s): {names}...", "System", datetime.datetime.now().isoformat())
         else:
-            self.sock.sendall((json.dumps({"action": "file_decline", "transfer_id": transfer_id}) + "\n").encode())
-            chat = self.frame.get_chat(sender)
+            self.send_json_to_server(server_name, {"action": "file_decline", "transfer_id": transfer_id})
+            chat = self.frame.get_chat(sender, server_name)
             if chat: chat.append(f"Declined {len(files)} file(s) from {sender}", "System", datetime.datetime.now().isoformat())
 
     def on_file_offer_failed(self, msg):
         self.play_sound("file_error.wav")
-        to = msg.get("to", ""); reason = msg.get("reason", "Unknown error")
-        chat = self.frame.get_chat(to)
+        to = msg.get("to", ""); reason = msg.get("reason", "Unknown error"); server_name = msg.get("server")
+        chat = self.frame.get_chat(to, server_name)
         if chat: chat.append_error(f"File transfer failed: {reason}")
         else: wx.MessageBox(f"File transfer failed: {reason}", "File Transfer Error", wx.ICON_ERROR)
 
     def on_file_accepted(self, msg):
-        transfer_id = msg["transfer_id"]; to = msg["to"]; files_info = msg["files"]
-        file_paths = self.pending_file_paths.pop(transfer_id, None)
-        if not file_paths:
-            chat = self.frame.get_chat(to)
+        transfer_id = msg["transfer_id"]; to = msg["to"]; server_name = msg.get("server")
+        transfer_state = self.pending_file_paths.pop(transfer_id, None)
+        if not transfer_state:
+            chat = self.frame.get_chat(to, server_name)
             if chat: chat.append_error("File transfer error: files no longer available.")
             return
+        file_paths = transfer_state.get("paths", [])
+        send_server = transfer_state.get("server") or server_name
         def _send():
             try:
                 files_data = []
                 for fp in file_paths:
                     with open(fp, 'rb') as f: files_data.append({"filename": os.path.basename(fp), "data": base64.b64encode(f.read()).decode('ascii')})
-                self.sock.sendall((json.dumps({"action": "file_data", "transfer_id": transfer_id, "to": to, "files": files_data}) + "\n").encode())
+                ok = self.send_json_to_server(send_server, {"action": "file_data", "transfer_id": transfer_id, "to": to, "files": files_data})
+                if not ok:
+                    raise RuntimeError("session disconnected")
                 names = [os.path.basename(fp) for fp in file_paths]
-                wx.CallAfter(self._on_files_sent, to, names)
+                wx.CallAfter(self._on_files_sent, to, names, send_server)
             except Exception as e:
-                wx.CallAfter(self._on_file_send_error, to, e)
+                wx.CallAfter(self._on_file_send_error, to, e, send_server)
         threading.Thread(target=_send, daemon=True).start()
 
-    def _on_files_sent(self, to, filenames):
+    def _on_files_sent(self, to, filenames, server_name=None):
         self.play_sound("file_send.wav")
-        chat = self.frame.get_chat(to)
+        chat = self.frame.get_chat(to, server_name)
         if chat:
             names = ", ".join(filenames)
             chat.append(f"{len(filenames)} file(s) sent: {names}", "System", datetime.datetime.now().isoformat())
 
-    def _on_file_send_error(self, to, error):
+    def _on_file_send_error(self, to, error, server_name=None):
         self.play_sound("file_error.wav")
-        chat = self.frame.get_chat(to)
+        chat = self.frame.get_chat(to, server_name)
         if chat: chat.append_error(f"Failed to send file(s): {error}")
 
     def on_file_declined(self, msg):
-        transfer_id = msg["transfer_id"]; to = msg["to"]; files = msg["files"]
+        transfer_id = msg["transfer_id"]; to = msg["to"]; files = msg["files"]; server_name = msg.get("server")
         self.pending_file_paths.pop(transfer_id, None)
         self.play_sound("file_error.wav")
         names = ", ".join(f["filename"] for f in files)
-        chat = self.frame.get_chat(to)
+        chat = self.frame.get_chat(to, server_name)
         if chat: chat.append(f"{to} declined your file(s): {names}", "System", datetime.datetime.now().isoformat())
         else: wx.MessageBox(f"{to} declined your file(s): {names}", "File Declined", wx.ICON_INFORMATION)
 
     def on_file_data(self, msg):
-        sender = msg["from"]; files = msg["files"]
+        sender = msg["from"]; files = msg["files"]; server_name = msg.get("server")
         docs_path = os.path.join(os.path.expanduser('~'), 'Documents')
-        save_dir = os.path.join(docs_path, 'ThriveMessenger', 'files')
+        server_folder = server_name if server_name else "primary"
+        save_dir = os.path.join(docs_path, 'ThriveMessenger', 'files', server_folder)
         os.makedirs(save_dir, exist_ok=True)
         saved = []
         saved_paths = []
@@ -1149,21 +1158,26 @@ class ClientApp(wx.App):
                 saved_paths.append(save_path)
             except Exception as e:
                 self.play_sound("file_error.wav")
-                chat = self.frame.get_chat(sender)
+                chat = self.frame.get_chat(sender, server_name)
                 if chat: chat.append_error(f"Failed to save file '{filename}': {e}")
         if saved:
             self.play_sound("file_receive.wav")
-            chat = self.frame.get_chat(sender)
+            chat = self.frame.get_chat(sender, server_name)
             names = ", ".join(saved)
             if chat: chat.append(f"{len(saved)} file(s) received and saved: {names}", "System", datetime.datetime.now().isoformat())
             else:
-                show_notification("Files Received", f"{sender} sent you {len(saved)} file(s)")
+                note = f"{sender} sent you {len(saved)} file(s)"
+                if server_name:
+                    note = f"[{server_name}] {note}"
+                show_notification("Files Received", note)
             if self.user_config.get('auto_open_received_files', True):
                 for path in saved_paths:
                     open_path_or_url(path)
 
-    def send_file_to(self, contact, parent=None):
-        if parent is None: parent = self.frame.get_chat(contact) or self.frame
+    def send_file_to(self, contact, parent=None, server_name=None):
+        if server_name is None:
+            server_name = normalize_server_entry(getattr(self, "active_server_entry", {})).get("name", "Current Server")
+        if parent is None: parent = self.frame.get_chat(contact, server_name) or self.frame
         with wx.FileDialog(parent, "Choose file(s) to send", wildcard="All files (*.*)|*.*", style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST | wx.FD_MULTIPLE) as dlg:
             if dlg.ShowModal() == wx.ID_CANCEL: return
             file_paths = dlg.GetPaths()
@@ -1177,9 +1191,13 @@ class ClientApp(wx.App):
             valid_paths.append(file_path)
         if not files: return
         transfer_id = str(uuid.uuid4())
-        self.pending_file_paths[transfer_id] = valid_paths
-        self.sock.sendall((json.dumps({"action": "file_offer", "to": contact, "files": files, "transfer_id": transfer_id}) + "\n").encode())
-        chat = self.frame.get_chat(contact)
+        self.pending_file_paths[transfer_id] = {"paths": valid_paths, "server": server_name}
+        ok = self.send_json_to_server(server_name, {"action": "file_offer", "to": contact, "files": files, "transfer_id": transfer_id})
+        if not ok:
+            self.pending_file_paths.pop(transfer_id, None)
+            wx.MessageBox(f"Could not send file offer on {server_name}.", "File Transfer Error", wx.ICON_ERROR)
+            return
+        chat = self.frame.get_chat(contact, server_name)
         if chat:
             names = ", ".join(f["filename"] for f in files)
             chat.append(f"Sending file offer ({len(files)} file(s)): {names}...", "System", datetime.datetime.now().isoformat())
@@ -1778,11 +1796,6 @@ class UserDirectoryDialog(wx.Dialog):
             self.btn_chat.Disable(); self.btn_file.Disable(); self.btn_block.Disable(); self.btn_add.Disable()
             self.btn_block.SetLabel("&Block"); return
         self.btn_chat.Enable(); self.btn_file.Enable()
-        selected_server = self._get_selected_server()
-        app = wx.GetApp()
-        primary_server = normalize_server_entry(getattr(app, "active_server_entry", {})).get("name", "Current Server")
-        if selected_server and selected_server != primary_server:
-            self.btn_file.Disable()
         is_contact = user in self.contact_states
         self.btn_add.Enable(not is_contact); self.btn_add.SetLabel("&Add to Contacts")
         self.btn_block.Enable(is_contact)
@@ -1818,11 +1831,7 @@ class UserDirectoryDialog(wx.Dialog):
         if not self._selected_user:
             return
         selected_server = self._get_selected_server()
-        primary_server = normalize_server_entry(getattr(wx.GetApp(), "active_server_entry", {})).get("name", "Current Server")
-        if selected_server and selected_server != primary_server:
-            wx.MessageBox("File transfer is currently available only on your primary server session.", "File Transfer", wx.OK | wx.ICON_INFORMATION)
-            return
-        wx.GetApp().send_file_to(self._selected_user)
+        wx.GetApp().send_file_to(self._selected_user, server_name=selected_server)
     def on_block_toggle(self, _):
         user = self._selected_user
         if not user or user not in self.contact_states: return
@@ -2219,7 +2228,8 @@ class MainFrame(wx.Frame):
         sel = self.lv.GetFirstSelected()
         if sel < 0: return
         c = self.lv.GetItemText(sel)
-        wx.GetApp().send_file_to(c)
+        primary_server = normalize_server_entry(getattr(wx.GetApp(), "active_server_entry", {})).get("name", "Current Server")
+        wx.GetApp().send_file_to(c, server_name=primary_server)
     def on_contact_activated(self, event):
         idx = event.GetIndex()
         if idx < 0:
@@ -2550,7 +2560,7 @@ class ChatDialog(wx.Dialog):
         wx.GetApp().play_sound("send.wav")
         self.input_ctrl.Clear(); self.input_ctrl.SetFocus()
     def on_send_file(self, _):
-        wx.GetApp().send_file_to(self.contact)
+        wx.GetApp().send_file_to(self.contact, server_name=self.server_name)
     def on_add_contact(self, _):
         if not self._send_json({"action": "add_contact", "to": self.contact}):
             self.append_error("Could not add contact on this server.")
