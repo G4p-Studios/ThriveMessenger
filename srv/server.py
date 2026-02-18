@@ -1,5 +1,6 @@
 import sqlite3, threading, socket, json, datetime, sys, configparser, ssl, os, uuid, base64, time
 import smtplib, random, string
+import urllib.request, urllib.parse
 from email.mime.text import MIMEText
 
 DB = 'thrive.db'
@@ -8,6 +9,7 @@ clients = {}
 client_statuses = {}
 lock = threading.Lock()
 smtp_config = {}
+flexpbx_config = {}
 file_config = {}
 shutdown_timeout = 5
 max_status_length = 50
@@ -15,6 +17,44 @@ pending_transfers = {}
 transfer_lock = threading.Lock()
 server_port = 0
 use_ssl = False
+server_started_at = time.time()
+bot_usernames = set()
+
+def _active_usernames():
+    with lock:
+        return set(clients.keys()) | set(bot_usernames)
+
+def _is_online_user(username):
+    return username in _active_usernames()
+
+def _status_for_user(username):
+    if username in bot_usernames:
+        return "online"
+    with lock:
+        return client_statuses.get(username, "online" if username in clients else "offline")
+
+def _maybe_send_bot_reply(sender_sock, sender_user, to_user, text):
+    if to_user not in bot_usernames:
+        return False
+    lower = (text or "").strip().lower()
+    if not lower:
+        reply = "I'm online and ready. Ask me anything."
+    elif lower in ("hi", "hello", "hey"):
+        reply = f"Hi {sender_user}, I'm {to_user}. I'm online."
+    else:
+        reply = f"{to_user}: I got your message: {text}"
+    payload = {
+        "action": "msg",
+        "from": to_user,
+        "to": sender_user,
+        "time": datetime.datetime.now().isoformat(),
+        "msg": reply,
+    }
+    try:
+        sender_sock.sendall((json.dumps(payload) + "\n").encode())
+    except Exception:
+        pass
+    return True
 
 class EmailManager:
     @staticmethod
@@ -38,6 +78,39 @@ class EmailManager:
     @staticmethod
     def generate_code(length=6):
         return ''.join(random.choices(string.digits, k=length))
+
+class FlexPBXManager:
+    @staticmethod
+    def send_sms(to_number, message):
+        if not flexpbx_config.get('enabled', False):
+            return False, "SMS module is not enabled."
+        api_url = flexpbx_config.get('api_url', '').strip()
+        api_token = flexpbx_config.get('api_token', '').strip()
+        from_number = flexpbx_config.get('from_number', '').strip()
+        if not api_url or not api_token:
+            return False, "FlexPBX API is not configured."
+        payload = urllib.parse.urlencode({
+            "to": to_number,
+            "from": from_number,
+            "message": message,
+        }).encode()
+        req = urllib.request.Request(
+            api_url,
+            data=payload,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {api_token}",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                body = resp.read().decode(errors='ignore')
+                if resp.status >= 200 and resp.status < 300:
+                    return True, body
+                return False, body or f"HTTP {resp.status}"
+        except Exception as e:
+            return False, str(e)
 
 def get_admins():
     try:
@@ -90,6 +163,13 @@ def load_config():
         'email': config.get('smtp', 'email', fallback=''),
         'password': config.get('smtp', 'password', fallback='')
     }
+    global flexpbx_config
+    flexpbx_config = {
+        'enabled': config.getboolean('flexpbx', 'enabled', fallback=False),
+        'api_url': config.get('flexpbx', 'api_url', fallback=''),
+        'api_token': config.get('flexpbx', 'api_token', fallback=''),
+        'from_number': config.get('flexpbx', 'from_number', fallback=''),
+    }
     global file_config
     file_config = {
         'size_limit': config.getint('server', 'size_limit', fallback=0),
@@ -107,6 +187,9 @@ def load_config():
         'pre_login': config.get('welcome', 'pre_login', fallback=''),
         'post_login': config.get('welcome', 'post_login', fallback=''),
     }
+    global bot_usernames
+    raw_bots = config.get('bots', 'names', fallback='assistant-bot,helper-bot')
+    bot_usernames = {name.strip() for name in raw_bots.split(',') if name.strip()}
     return {
         'port': config.getint('server', 'port', fallback=5005),
         'certfile': config.get('server', 'certfile', fallback='server.crt'),
@@ -220,6 +303,12 @@ def handle_client(cs, addr):
                     sock.sendall((json.dumps({"action": "create_account_failed", "reason": "Could not send verification email."}) + "\n").encode())
             else:
                 sock.sendall((json.dumps({"action": "create_account_success"}) + "\n").encode())
+                if email:
+                    EmailManager.send_email(
+                        email,
+                        "Welcome to Thrive Messenger",
+                        f"Hi {new_user}, your account is ready to use on {server_identity}."
+                    )
             return
 
         # --- Verify Account ---
@@ -312,8 +401,7 @@ def handle_client(cs, addr):
 
         admins = get_admins()
         rows = db.execute("SELECT contact,blocked FROM contacts WHERE owner=?", (user,)).fetchall()
-        with lock:
-            contacts = [{"user":c, "blocked":b, "online": (c in clients), "is_admin": (c in admins), "status_text": client_statuses.get(c, "offline") if c in clients else "offline"} for c,b in rows]
+        contacts = [{"user":c, "blocked":b, "online": _is_online_user(c), "is_admin": (c in admins), "status_text": _status_for_user(c)} for c,b in rows]
         sock.sendall((json.dumps({"action":"contact_list","contacts":contacts})+"\n").encode())
         db.close()
         
@@ -331,19 +419,58 @@ def handle_client(cs, addr):
                     continue
                 con = sqlite3.connect(DB)
                 exists = con.execute("SELECT 1 FROM users WHERE username=?", (contact_to_add,)).fetchone()
-                if not exists: 
+                if not exists and contact_to_add not in bot_usernames:
                     reason = f"User '{contact_to_add}' does not exist."
-                    sock.sendall((json.dumps({"action": "add_contact_failed", "reason": reason}) + "\n").encode())
+                    sock.sendall((json.dumps({
+                        "action": "add_contact_failed",
+                        "reason": reason,
+                        "suggest_invite": True,
+                        "invite_methods": [
+                            m for m, ok in [("email", smtp_config.get("enabled", False)), ("sms", flexpbx_config.get("enabled", False))] if ok
+                        ],
+                    }) + "\n").encode())
                 else:
                     con.execute("INSERT OR IGNORE INTO contacts(owner,contact) VALUES(?,?)", (user, contact_to_add))
                     con.commit()
-                    with lock:
-                        is_online = contact_to_add in clients
-                        contact_status_text = client_statuses.get(contact_to_add, "offline") if is_online else "offline"
+                    is_online = _is_online_user(contact_to_add)
+                    contact_status_text = _status_for_user(contact_to_add)
                     admins = get_admins()
                     contact_data = {"user": contact_to_add, "blocked": 0, "online": is_online, "is_admin": contact_to_add in admins, "status_text": contact_status_text}
                     sock.sendall((json.dumps({"action": "add_contact_success", "contact": contact_data}) + "\n").encode())
                 con.close()
+
+            elif action == "invite_user":
+                target_user = str(msg.get("username", "")).strip()
+                method = str(msg.get("method", "email")).strip().lower()
+                target = str(msg.get("target", "")).strip()
+                if not target_user or not target:
+                    sock.sendall((json.dumps({
+                        "action": "invite_result",
+                        "ok": False,
+                        "method": method,
+                        "target": target,
+                        "reason": "Invite target username and destination are required."
+                    }) + "\n").encode())
+                    continue
+                invite_text = (
+                    f"{user} invited you to join Thrive Messenger on {server_identity}. "
+                    f"Visit https://im.tappedin.fm/ for setup and sign-in."
+                )
+                ok = False
+                reason = "Unsupported invite method."
+                if method == "email":
+                    ok = EmailManager.send_email(target, "You're invited to Thrive Messenger", invite_text)
+                    reason = "Invite email sent." if ok else "Email module is not enabled or delivery failed."
+                elif method == "sms":
+                    ok, sms_reason = FlexPBXManager.send_sms(target, invite_text)
+                    reason = "Invite SMS sent." if ok else sms_reason
+                sock.sendall((json.dumps({
+                    "action": "invite_result",
+                    "ok": ok,
+                    "method": method,
+                    "target": target,
+                    "reason": reason
+                }) + "\n").encode())
                 
             elif action in ("block_contact","unblock_contact"):
                 flag = 1 if action=="block_contact" else 0
@@ -428,8 +555,22 @@ def handle_client(cs, addr):
                 con = sqlite3.connect(DB)
                 total_users = con.execute("SELECT COUNT(*) FROM users").fetchone()[0]
                 con.close()
-                with lock: online_count = len(clients)
-                info = {"action": "server_info_response", "port": server_port, "ssl": use_ssl, "total_users": total_users, "online_users": online_count, "size_limit": file_config.get('size_limit', 0), "blackfiles": file_config.get('blackfiles', []), "max_status_length": max_status_length}
+                with lock:
+                    online_count = len(clients)
+                    online_admins = sum(1 for uname in clients.keys() if uname in get_admins())
+                uptime_seconds = int(max(0, time.time() - server_started_at))
+                info = {
+                    "action": "server_info_response",
+                    "port": server_port,
+                    "ssl": use_ssl,
+                    "total_users": total_users,
+                    "online_users": online_count,
+                    "online_admin_users": online_admins,
+                    "uptime_seconds": uptime_seconds,
+                    "size_limit": file_config.get('size_limit', 0),
+                    "blackfiles": file_config.get('blackfiles', []),
+                    "max_status_length": max_status_length
+                }
                 try: sock.sendall((json.dumps(info) + "\n").encode())
                 except: pass
 
@@ -440,10 +581,17 @@ def handle_client(cs, addr):
                 con.close()
                 admins = get_admins()
                 directory = []
-                with lock:
-                    for (uname,) in all_users:
-                        is_online = uname in clients
-                        directory.append({"user": uname, "online": is_online, "status_text": client_statuses.get(uname, "offline") if is_online else "offline", "is_admin": uname in admins, "is_contact": uname in user_contacts, "is_blocked": user_contacts.get(uname, 0) == 1, "server": server_identity})
+                known = {uname for (uname,) in all_users}
+                for uname in sorted(known | bot_usernames):
+                    directory.append({
+                        "user": uname,
+                        "online": _is_online_user(uname),
+                        "status_text": _status_for_user(uname),
+                        "is_admin": uname in admins,
+                        "is_contact": uname in user_contacts,
+                        "is_blocked": user_contacts.get(uname, 0) == 1,
+                        "server": server_identity
+                    })
                 try: sock.sendall((json.dumps({"action": "user_directory_response", "users": directory}) + "\n").encode())
                 except: pass
 
@@ -459,6 +607,8 @@ def handle_client(cs, addr):
                     reason = f"Message couldn't be sent because {to} has you blocked."
                 elif sender_has_blocked and sender_has_blocked[0] == 1: 
                     reason = "You have blocked this contact."
+                elif _maybe_send_bot_reply(sock, frm, to, msg.get("msg", "")):
+                    reason = None
                 elif not sock_to: 
                     reason = f"{to} is offline."
                 else:
