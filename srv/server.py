@@ -710,9 +710,10 @@ def handle_client(cs, addr):
                 if blocked: continue
 
                 # All checks passed, create transfer and forward offer
-                transfer_id = msg.get("transfer_id", str(uuid.uuid4()))
+                client_transfer_id = msg.get("transfer_id", "")  # echo back so sender can locate its pending files
+                transfer_id = str(uuid.uuid4())  # always server-generated; never trust client-supplied ID
                 with transfer_lock:
-                    pending_transfers[transfer_id] = {"from": user, "to": to, "files": files}
+                    pending_transfers[transfer_id] = {"from": user, "to": to, "files": files, "client_transfer_id": client_transfer_id}
 
                 try:
                     sock_to.sendall((json.dumps({"action": "file_offer", "from": user, "files": files, "transfer_id": transfer_id}) + "\n").encode())
@@ -727,7 +728,7 @@ def handle_client(cs, addr):
                 sender = transfer["from"]
                 with lock: sock_sender = clients.get(sender)
                 if sock_sender:
-                    try: sock_sender.sendall((json.dumps({"action": "file_accepted", "transfer_id": transfer_id, "to": transfer["to"], "files": transfer["files"]}) + "\n").encode())
+                    try: sock_sender.sendall((json.dumps({"action": "file_accepted", "transfer_id": transfer_id, "client_transfer_id": transfer.get("client_transfer_id", ""), "to": transfer["to"], "files": transfer["files"]}) + "\n").encode())
                     except: pass
 
             elif action == "file_decline":
@@ -737,7 +738,7 @@ def handle_client(cs, addr):
                 sender = transfer["from"]
                 with lock: sock_sender = clients.get(sender)
                 if sock_sender:
-                    try: sock_sender.sendall((json.dumps({"action": "file_declined", "transfer_id": transfer_id, "to": transfer["to"], "files": transfer["files"]}) + "\n").encode())
+                    try: sock_sender.sendall((json.dumps({"action": "file_declined", "transfer_id": transfer_id, "client_transfer_id": transfer.get("client_transfer_id", ""), "to": transfer["to"], "files": transfer["files"]}) + "\n").encode())
                     except: pass
 
             elif action == "file_data":

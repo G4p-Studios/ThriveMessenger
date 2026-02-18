@@ -1375,7 +1375,8 @@ class ClientApp(wx.App):
 
     def on_file_accepted(self, msg):
         transfer_id = msg["transfer_id"]; to = msg["to"]; files_info = msg["files"]
-        file_paths = self.pending_file_paths.pop(transfer_id, None)
+        client_tid = msg.get("client_transfer_id") or transfer_id
+        file_paths = self.pending_file_paths.pop(client_tid, None)
         if not file_paths:
             chat = self.frame.get_chat(to)
             if chat: chat.append_error("File transfer error: files no longer available.")
@@ -1409,7 +1410,8 @@ class ClientApp(wx.App):
 
     def on_file_declined(self, msg):
         transfer_id = msg["transfer_id"]; to = msg["to"]; files = msg["files"]
-        self.pending_file_paths.pop(transfer_id, None)
+        client_tid = msg.get("client_transfer_id") or transfer_id
+        self.pending_file_paths.pop(client_tid, None)
         self.play_sound("file_error.wav")
         names = ", ".join(f["filename"] for f in files)
         chat = self.frame.get_chat(to)
@@ -3304,7 +3306,7 @@ class ChatDialog(wx.Dialog):
             return
         self._send_stop_typing()
         ts = datetime.datetime.now().isoformat()
-        msg = {"action":"msg","to":self.contact,"from":self.user,"time":ts,"msg":txt}
+        msg = {"action":"msg","to":self.contact,"from":self.user,"msg":txt,"time":ts}
         self.sock.sendall(json.dumps(msg).encode()+b"\n")
         self.append(txt, self.user, ts)
         wx.GetApp().play_sound("send.wav")
