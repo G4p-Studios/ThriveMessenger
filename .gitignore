@@ -1,0 +1,6 @@
+__pycache__/
+srv/__pycache__/
+build/
+dist/
+dist-macos/
+*.spec

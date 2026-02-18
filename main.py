@@ -7,6 +7,62 @@ except Exception:
 
 VERSION_TAG = "v2026-alpha14"
 URL_REGEX = re.compile(r'(https?://[^\s<>()]+)')
+UPDATE_CONTEXT = {}
+
+def _resource_roots():
+    roots = [os.getcwd()]
+    if getattr(sys, 'frozen', False):
+        exe_dir = os.path.dirname(sys.executable)
+        roots.append(exe_dir)
+        if sys.platform == 'darwin':
+            roots.append(os.path.abspath(os.path.join(exe_dir, '..', 'Resources')))
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            roots.append(meipass)
+    roots.append(os.path.dirname(os.path.abspath(__file__)))
+    deduped = []
+    seen = set()
+    for root in roots:
+        rp = os.path.abspath(root)
+        if rp in seen:
+            continue
+        seen.add(rp)
+        deduped.append(rp)
+    return deduped
+
+def _resolve_existing_file(rel_path):
+    for root in _resource_roots():
+        candidate = os.path.join(root, rel_path)
+        if os.path.isfile(candidate):
+            return candidate
+    return os.path.join(_resource_roots()[-1], rel_path)
+
+def _resolve_existing_dir(rel_path):
+    for root in _resource_roots():
+        candidate = os.path.join(root, rel_path)
+        if os.path.isdir(candidate):
+            return candidate
+    return os.path.join(_resource_roots()[-1], rel_path)
+
+def _coerce_directory_user(entry, default_server="Current Server"):
+    if not isinstance(entry, dict):
+        return None
+    username = str(entry.get("user") or entry.get("username") or "").strip()
+    if not username:
+        return None
+    status_text = str(entry.get("status_text") or entry.get("status") or ("online" if entry.get("online") else "offline"))
+    is_admin = bool(entry.get("is_admin") or ("(Admin)" in status_text))
+    is_contact = bool(entry.get("is_contact", False))
+    is_blocked = bool(entry.get("is_blocked", False))
+    return {
+        "user": username,
+        "online": bool(entry.get("online", False)),
+        "status_text": status_text,
+        "is_admin": is_admin,
+        "is_contact": is_contact,
+        "is_blocked": is_blocked,
+        "server": str(entry.get("server") or default_server),
+    }
 if sys.platform == 'win32':
     from winotify import Notification as _WinNotification
 else:
@@ -73,7 +129,7 @@ if sys.platform == 'win32':
 def load_server_config():
     # Now reading connection details from client.conf instead of srv.conf
     config = configparser.ConfigParser(interpolation=None)
-    config.read('client.conf')
+    config.read(_resolve_existing_file('client.conf'))
     return {
         'host': config.get('server', 'host', fallback='msg.thecubed.cc'),
         'port': config.getint('server', 'port', fallback=2005),
@@ -82,7 +138,7 @@ def load_server_config():
 
 def load_server_entries_from_client_conf():
     config = configparser.ConfigParser(interpolation=None)
-    config.read('client.conf')
+    config.read(_resolve_existing_file('client.conf'))
     entries = []
     if config.has_section('server'):
         entries.append({
@@ -148,6 +204,13 @@ def get_config_dir():
 def get_settings_path():
     return os.path.join(get_config_dir(), 'user_settings.json')
 
+def server_identity_key(server_entry):
+    normalized = normalize_server_entry(server_entry or {})
+    return f"{normalized.get('host', '').lower()}:{normalized.get('port', 0)}"
+
+def _server_keyring_account(server_entry, username):
+    return f"{server_identity_key(server_entry)}|{username}"
+
 def _migrate_settings():
     old_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'user_settings.json')
     new_path = get_settings_path()
@@ -183,7 +246,9 @@ def load_user_config():
         'auto_open_received_files': True,
         'read_messages_aloud': False,
         'typing_indicators': True,
-        'announce_typing': True
+        'announce_typing': True,
+        'multi_server_signin': True,
+        'server_accounts': {}
     }
 
     # 1. Load non-sensitive preferences from JSON
@@ -207,6 +272,8 @@ def load_user_config():
         settings['primary_server_name'] = primary
     if settings.get('last_server_name') not in [e['name'] for e in merged_entries]:
         settings['last_server_name'] = settings.get('primary_server_name') or merged_entries[0]['name']
+    if not isinstance(settings.get('server_accounts'), dict):
+        settings['server_accounts'] = {}
 
     # 3. Load password from Keyring if "Remember me" is active
     if settings.get('username') and settings.get('remember'):
@@ -253,6 +320,40 @@ def save_user_config(settings):
             except Exception as e:
                 # Password might not exist, ignore
                 pass
+
+def remember_server_account(settings, server_entry, username, password, remember_password):
+    if not username:
+        return
+    key = server_identity_key(server_entry)
+    accounts = settings.setdefault('server_accounts', {})
+    accounts[key] = {'username': username, 'remember': bool(remember_password)}
+    account_id = _server_keyring_account(server_entry, username)
+    try:
+        if remember_password and password:
+            keyring.set_password("ThriveMessengerServer", account_id, password)
+        else:
+            existing = keyring.get_password("ThriveMessengerServer", account_id)
+            if existing:
+                keyring.delete_password("ThriveMessengerServer", account_id)
+    except Exception as e:
+        print(f"Keyring error (server account save): {e}")
+
+def lookup_server_account(settings, server_entry):
+    accounts = settings.get('server_accounts', {}) if isinstance(settings.get('server_accounts'), dict) else {}
+    key = server_identity_key(server_entry)
+    row = accounts.get(key)
+    if not isinstance(row, dict):
+        return None, None
+    username = str(row.get('username') or '').strip()
+    if not username:
+        return None, None
+    account_id = _server_keyring_account(server_entry, username)
+    try:
+        password = keyring.get_password("ThriveMessengerServer", account_id)
+    except Exception as e:
+        print(f"Keyring error (server account load): {e}")
+        password = None
+    return username, password
 
 SERVER_CONFIG = load_server_config()
 ADDR = (SERVER_CONFIG['host'], SERVER_CONFIG['port'])
@@ -382,6 +483,21 @@ def parse_github_tag(tag):
     if not m: return None
     return (int(m.group(1)) - 2000, 0, int(m.group(2)), int(m.group(3)) if m.group(3) else 0)
 
+def _load_update_settings():
+    cfg = configparser.ConfigParser(interpolation=None)
+    cfg.read(_resolve_existing_file('client.conf'))
+    update_feed_url = cfg.get('updates', 'feed_url', fallback='').strip()
+    preferred_repo = cfg.get('updates', 'preferred_repo', fallback='Raywonder/ThriveMessenger').strip()
+    fallback_repos = [x.strip() for x in cfg.get('updates', 'fallback_repos', fallback='G4p-Studios/ThriveMessenger').split(',') if x.strip()]
+    repos = []
+    for candidate in [preferred_repo] + fallback_repos:
+        if '/' in candidate and candidate not in repos:
+            repos.append(candidate)
+    return {
+        "feed_url": update_feed_url,
+        "repos": repos or ["Raywonder/ThriveMessenger", "G4p-Studios/ThriveMessenger"],
+    }
+
 def get_program_dir():
     if getattr(sys, 'frozen', False): return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
@@ -393,21 +509,60 @@ def check_for_update(callback):
     def _check():
         import urllib.request
         try:
-            req = urllib.request.Request("https://api.github.com/repos/G4p-Studios/ThriveMessenger/releases/latest",
-                headers={"Accept": "application/vnd.github+json", "User-Agent": "ThriveMessenger/" + VERSION_TAG})
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read().decode())
-            tag = data.get("tag_name", "")
-            remote = parse_github_tag(tag)
-            if remote is None: wx.CallAfter(callback, None, None, f"Unrecognized release tag: {tag}"); return
             local = parse_github_tag(VERSION_TAG)
-            if local is None: wx.CallAfter(callback, None, None, f"Unrecognized local version tag: {VERSION_TAG}"); return
-            if remote != local:
-                wx.CallAfter(callback, tag, ".".join(str(x) for x in remote), None)
-            else:
-                wx.CallAfter(callback, None, None, None)
+            if local is None:
+                wx.CallAfter(callback, None, None, f"Unrecognized local version tag: {VERSION_TAG}", None)
+                return
+            settings = _load_update_settings()
+            UPDATE_CONTEXT.clear()
+
+            # Primary: hosted update feed controlled by this deployment.
+            feed_url = settings.get("feed_url")
+            if feed_url:
+                try:
+                    feed_req = urllib.request.Request(feed_url, headers={"User-Agent": "ThriveMessenger/" + VERSION_TAG, "Accept": "application/json"})
+                    with urllib.request.urlopen(feed_req, timeout=15) as resp:
+                        feed_data = json.loads(resp.read().decode())
+                    tag = str(feed_data.get("tag") or feed_data.get("tag_name") or "").strip()
+                    remote = parse_github_tag(tag)
+                    if remote and remote > local:
+                        UPDATE_CONTEXT.update({
+                            "source": "feed",
+                            "feed_url": feed_url,
+                            "tag": tag,
+                            "zip_url": feed_data.get("win_zip_url") or feed_data.get("zip_url"),
+                            "installer_url": feed_data.get("win_installer_url") or feed_data.get("installer_url"),
+                            "repo": feed_data.get("repo"),
+                        })
+                        wx.CallAfter(callback, tag, ".".join(str(x) for x in remote), None, f"feed:{feed_url}")
+                        return
+                except Exception as feed_err:
+                    print(f"Update feed check failed: {feed_err}")
+
+            # Fallback: GitHub release repos.
+            best = None
+            for repo in settings.get("repos", []):
+                url = f"https://api.github.com/repos/{repo}/releases/latest"
+                req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json", "User-Agent": "ThriveMessenger/" + VERSION_TAG})
+                try:
+                    with urllib.request.urlopen(req, timeout=15) as resp:
+                        data = json.loads(resp.read().decode())
+                except Exception as repo_err:
+                    print(f"Update check failed for {repo}: {repo_err}")
+                    continue
+                tag = data.get("tag_name", "")
+                remote = parse_github_tag(tag)
+                if remote is None:
+                    continue
+                if best is None or remote > best["remote"]:
+                    best = {"repo": repo, "tag": tag, "remote": remote}
+            if best and best["remote"] > local:
+                UPDATE_CONTEXT.update({"source": "repo", "repo": best["repo"], "tag": best["tag"]})
+                wx.CallAfter(callback, best["tag"], ".".join(str(x) for x in best["remote"]), None, best["repo"])
+                return
+            wx.CallAfter(callback, None, None, None, None)
         except Exception as e:
-            wx.CallAfter(callback, None, None, str(e))
+            wx.CallAfter(callback, None, None, str(e), None)
     threading.Thread(target=_check, daemon=True).start()
 
 def download_update(url, dest, progress_dlg, callback):
@@ -491,9 +646,11 @@ class SettingsDialog(wx.Dialog):
             accessibility_box.GetStaticBox().SetBackgroundColour(dark_color)
         
         sound_packs = ['default'];
+        sounds_dir = _resolve_existing_dir('sounds')
         try:
-            if os.path.isdir('sounds'):
-                packs = [d for d in os.listdir('sounds') if os.path.isdir(os.path.join('sounds', d))]; sound_packs = sorted(list(set(sound_packs + packs)))
+            if os.path.isdir(sounds_dir):
+                packs = [d for d in os.listdir(sounds_dir) if os.path.isdir(os.path.join(sounds_dir, d))]
+                sound_packs = sorted(list(set(sound_packs + packs)))
         except Exception as e: print(f"Could not scan for sound packs: {e}")
         self.choice = wx.Choice(sound_box.GetStaticBox(), choices=sound_packs); current_pack = self.config.get('soundpack', 'default')
         if current_pack in sound_packs: self.choice.SetStringSelection(current_pack)
@@ -660,6 +817,8 @@ class ClientApp(wx.App):
                     self.user_config['server_entries'] = dlg.server_entries
                     self.user_config['last_server_name'] = dlg.selected_server.get('name', '')
                     self.user_config['primary_server_name'] = dlg.primary_server_name
+                    self.user_config['multi_server_signin'] = bool(getattr(dlg, 'multi_server_signin', self.user_config.get('multi_server_signin', True)))
+                    remember_server_account(self.user_config, dlg.selected_server, dlg.username, dlg.password, dlg.remember_checked)
                     if dlg.remember_checked:
                         self.user_config['username'] = dlg.username
                         self.user_config['password'] = dlg.password
@@ -684,12 +843,15 @@ class ClientApp(wx.App):
                         'chat_logging': {},
                         'server_entries': dlg.server_entries,
                         'last_server_name': dlg.selected_server.get('name', ''),
-                        'primary_server_name': dlg.primary_server_name
+                        'primary_server_name': dlg.primary_server_name,
+                        'multi_server_signin': bool(getattr(dlg, 'multi_server_signin', True)),
+                        'server_accounts': {}
                     }
+                    remember_server_account(self.user_config, dlg.selected_server, dlg.new_username, dlg.new_password, True)
                     save_user_config(self.user_config); self.start_main_session(dlg.new_username, sock, sf); return True
             else: return False
     
-    def perform_login(self, username, password, server_entry=None):
+    def perform_login(self, username, password, server_entry=None, show_post_login=True):
         try:
             if server_entry:
                 set_active_server_config(server_entry)
@@ -702,7 +864,7 @@ class ClientApp(wx.App):
                 self.active_server_entry = normalize_server_entry(server_entry or SERVER_CONFIG)
                 info = fetch_server_welcome(server_entry or SERVER_CONFIG)
                 post_login = str(info.get('post_login', '') or '').strip()
-                if info.get('enabled') and post_login:
+                if show_post_login and info.get('enabled') and post_login:
                     wx.MessageBox(post_login, "Server Message", wx.OK | wx.ICON_INFORMATION)
                 return True, ssock, sf, "Success"
             else:
@@ -736,56 +898,142 @@ class ClientApp(wx.App):
         except Exception as e:
             print(f"Directory fetch failed for {server_entry}: {e}")
             return []
+
+    def get_directory_credentials_for_server(self, server_entry):
+        username, password = lookup_server_account(self.user_config, server_entry)
+        if username and password:
+            return username, password
+        # fallback to current active account for compatibility
+        if self.username and self.session_password:
+            return self.username, self.session_password
+        return None, None
     
     def start_main_session(self, username, sock, sf):
         self.username = username; self.sock = sock; self.sockfile = sf; self.pending_file_paths = {}
+        self.server_sessions = {}
         self.intentional_disconnect = False
         self.frame = MainFrame(self.username, self.sock); self.frame.Show()
+        primary_name = normalize_server_entry(getattr(self, "active_server_entry", {})).get("name", "Current Server")
+        self.server_sessions[primary_name] = {"entry": normalize_server_entry(getattr(self, "active_server_entry", {})), "sock": self.sock, "sockfile": self.sockfile, "primary": True}
         if self.frame.current_status != "online":
             try: self.sock.sendall((json.dumps({"action": "set_status", "status_text": self.frame.current_status}) + "\n").encode())
             except Exception: pass
-        self.play_sound("login.wav"); threading.Thread(target=self.listen_loop, daemon=True).start()
+        self.play_sound("login.wav")
+        threading.Thread(target=self.listen_loop, args=(primary_name, self.sock, self.sockfile, True), daemon=True).start()
+        if self.user_config.get("multi_server_signin", True):
+            threading.Thread(target=self._connect_additional_sessions, daemon=True).start()
         self.frame.on_check_updates(silent=True)
+
+    def _connect_additional_sessions(self):
+        active = normalize_server_entry(getattr(self, "active_server_entry", {}))
+        active_name = active.get("name", "")
+        for entry in self.user_config.get("server_entries", []):
+            normalized = normalize_server_entry(entry)
+            if not normalized.get("host"):
+                continue
+            if normalized.get("name") == active_name:
+                continue
+            if normalized.get("name") in self.server_sessions:
+                continue
+            username, password = lookup_server_account(self.user_config, normalized)
+            if not username or not password:
+                continue
+            success, ssock, sf, _ = self.perform_login(username, password, normalized, show_post_login=False)
+            if not success:
+                continue
+            self.server_sessions[normalized["name"]] = {"entry": normalized, "sock": ssock, "sockfile": sf, "primary": False}
+            try:
+                ssock.sendall((json.dumps({"action": "user_directory"}) + "\n").encode())
+            except Exception:
+                pass
+            threading.Thread(target=self.listen_loop, args=(normalized["name"], ssock, sf, False), daemon=True).start()
+            wx.CallAfter(show_notification, "Connected", f"Signed in to {normalized['name']}")
+
+    def send_json_to_server(self, server_name, payload):
+        session = self.server_sessions.get(server_name)
+        if not session:
+            return False
+        try:
+            session["sock"].sendall((json.dumps(payload) + "\n").encode())
+            return True
+        except Exception:
+            return False
+
+    def close_all_sessions(self):
+        for _, session in list(getattr(self, "server_sessions", {}).items()):
+            try:
+                session["sock"].sendall(json.dumps({"action":"logout"}).encode()+b"\n")
+            except Exception:
+                pass
+            try:
+                session["sock"].close()
+            except Exception:
+                pass
+        self.server_sessions = {}
 
     def play_sound(self, sound_file):
         pack = self.user_config.get('soundpack', 'default')
-        path = os.path.join('sounds', pack, sound_file)
-        if os.path.exists(path): wx.adv.Sound.PlaySound(path, wx.adv.SOUND_ASYNC)
+        sounds_dir = _resolve_existing_dir('sounds')
+        path = os.path.join(sounds_dir, pack, sound_file)
+        if os.path.exists(path):
+            try:
+                if not wx.adv.Sound.PlaySound(path, wx.adv.SOUND_ASYNC) and sys.platform == 'darwin':
+                    subprocess.Popen(["afplay", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                if sys.platform == 'darwin':
+                    try:
+                        subprocess.Popen(["afplay", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    except Exception:
+                        pass
         else:
-            default_path = os.path.join('sounds', 'default', sound_file)
-            if os.path.exists(default_path): wx.adv.Sound.PlaySound(default_path, wx.adv.SOUND_ASYNC)
+            default_path = os.path.join(sounds_dir, 'default', sound_file)
+            if os.path.exists(default_path):
+                try:
+                    if not wx.adv.Sound.PlaySound(default_path, wx.adv.SOUND_ASYNC) and sys.platform == 'darwin':
+                        subprocess.Popen(["afplay", default_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                except Exception:
+                    if sys.platform == 'darwin':
+                        try:
+                            subprocess.Popen(["afplay", default_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        except Exception:
+                            pass
     
-    def listen_loop(self):
-        sock = self.sock
+    def listen_loop(self, server_name, sock, sockfile, is_primary):
         handled = False
         try:
-            for line in self.sockfile:
+            for line in sockfile:
                 msg = json.loads(line); act = msg.get("action")
-                if act == "contact_list": wx.CallAfter(self.frame.load_contacts, msg["contacts"])
-                elif act == "contact_status": wx.CallAfter(self.frame.update_contact_status, msg["user"], msg["online"], msg.get("status_text"))
+                msg["server"] = server_name
+                if act == "contact_list" and is_primary: wx.CallAfter(self.frame.load_contacts, msg["contacts"])
+                elif act == "contact_status" and is_primary: wx.CallAfter(self.frame.update_contact_status, msg["user"], msg["online"], msg.get("status_text"))
                 elif act == "msg": wx.CallAfter(self.frame.receive_message, msg)
-                elif act == "msg_failed": wx.CallAfter(self.frame.on_message_failed, msg["to"], msg["reason"])
+                elif act == "msg_failed": wx.CallAfter(self.frame.on_message_failed, msg["to"], msg["reason"], server_name)
                 elif act == "add_contact_failed": wx.CallAfter(self.frame.on_add_contact_failed, msg["reason"])
                 elif act == "add_contact_success": wx.CallAfter(self.frame.on_add_contact_success, msg["contact"])
-                elif act == "admin_response": wx.CallAfter(self.frame.on_admin_response, msg["response"])
-                elif act == "server_info_response": wx.CallAfter(self.frame.on_server_info_response, msg)
-                elif act == "user_directory_response": wx.CallAfter(self.frame.on_user_directory_response, msg)
-                elif act == "admin_status_change": wx.CallAfter(self.frame.on_admin_status_change, msg["user"], msg["is_admin"])
-                elif act == "server_alert": wx.CallAfter(self.frame.on_server_alert, msg["message"])
+                elif act == "admin_response" and is_primary: wx.CallAfter(self.frame.on_admin_response, msg["response"])
+                elif act == "server_info_response" and is_primary: wx.CallAfter(self.frame.on_server_info_response, msg)
+                elif act == "user_directory_response" and is_primary: wx.CallAfter(self.frame.on_user_directory_response, msg)
+                elif act == "admin_status_change" and is_primary: wx.CallAfter(self.frame.on_admin_status_change, msg["user"], msg["is_admin"])
+                elif act == "server_alert" and is_primary: wx.CallAfter(self.frame.on_server_alert, msg["message"])
                 elif act == "typing": wx.CallAfter(self.frame.on_typing_event, msg)
-                elif act == "file_offer": wx.CallAfter(self.on_file_offer, msg)
-                elif act == "file_offer_failed": wx.CallAfter(self.on_file_offer_failed, msg)
-                elif act == "file_accepted": wx.CallAfter(self.on_file_accepted, msg)
-                elif act == "file_declined": wx.CallAfter(self.on_file_declined, msg)
-                elif act == "file_data": wx.CallAfter(self.on_file_data, msg)
-                elif act == "banned_kick": wx.CallAfter(self.on_banned); handled = True; break
+                elif act == "file_offer" and is_primary: wx.CallAfter(self.on_file_offer, msg)
+                elif act == "file_offer_failed" and is_primary: wx.CallAfter(self.on_file_offer_failed, msg)
+                elif act == "file_accepted" and is_primary: wx.CallAfter(self.on_file_accepted, msg)
+                elif act == "file_declined" and is_primary: wx.CallAfter(self.on_file_declined, msg)
+                elif act == "file_data" and is_primary: wx.CallAfter(self.on_file_data, msg)
+                elif act == "banned_kick":
+                    if is_primary:
+                        wx.CallAfter(self.on_banned)
+                    handled = True; break
         except (IOError, json.JSONDecodeError, ValueError):
-            print("Disconnected from server.")
-            if self.sock is sock and not self.intentional_disconnect: wx.CallAfter(self.on_server_disconnect); handled = True
+            print(f"Disconnected from server: {server_name}")
+            if is_primary and self.sock is sock and not self.intentional_disconnect: wx.CallAfter(self.on_server_disconnect); handled = True
             else: handled = True
-        if not handled and self.sock is sock and not self.intentional_disconnect:
+        if not handled and is_primary and self.sock is sock and not self.intentional_disconnect:
             print("Server closed connection.")
             wx.CallAfter(self.on_server_disconnect)
+        if not is_primary:
+            self.server_sessions.pop(server_name, None)
     
     def on_banned(self):
         self._return_to_login("You have been banned.", "Banned")
@@ -797,8 +1045,7 @@ class ClientApp(wx.App):
     def _return_to_login(self, message, title):
         if self.intentional_disconnect: return
         self.intentional_disconnect = True
-        try: self.sock.close()
-        except: pass
+        self.close_all_sessions()
         self.SetExitOnFrameDelete(False)
         old_frame = None
         if hasattr(self, 'frame') and self.frame:
@@ -1170,10 +1417,13 @@ class LoginDialog(wx.Dialog):
         server_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "&Server")
         self.server_choice = wx.Choice(server_box.GetStaticBox(), choices=[])
         self.server_choice.Bind(wx.EVT_CHOICE, self.on_server_choice)
+        self.server_choice.SetHelpText("Server selector. Choose which server account to sign in to.")
         manage_servers_btn = wx.Button(server_box.GetStaticBox(), label="Manage Servers...")
         manage_servers_btn.Bind(wx.EVT_BUTTON, self.on_manage_servers)
+        manage_servers_btn.SetHelpText("Open server manager to add, edit, or remove server connections.")
         set_primary_btn = wx.Button(server_box.GetStaticBox(), label="Set as Primary")
         set_primary_btn.Bind(wx.EVT_BUTTON, self.on_set_primary_server)
+        set_primary_btn.SetHelpText("Set the currently selected server as your default at startup.")
         server_row = wx.BoxSizer(wx.HORIZONTAL)
         server_row.Add(self.server_choice, 1, wx.EXPAND | wx.RIGHT, 4)
         server_row.Add(manage_servers_btn, 0, wx.EXPAND | wx.RIGHT, 4)
@@ -1194,6 +1444,11 @@ class LoginDialog(wx.Dialog):
         self.remember_cb = wx.CheckBox(panel, label="&Remember me")
         self.autologin_cb = wx.CheckBox(panel, label="Log in &automatically"); self.remember_cb.SetValue(self.user_config.get('remember', False))
         self.autologin_cb.SetValue(self.user_config.get('autologin', False)); self.remember_cb.Bind(wx.EVT_CHECKBOX, self.on_check_remember)
+        self.multi_server_cb = wx.CheckBox(panel, label="Use saved accounts on other servers after login")
+        self.multi_server_cb.SetValue(bool(self.user_config.get('multi_server_signin', True)))
+        self.remember_cb.SetHelpText("Save these credentials for this server.")
+        self.autologin_cb.SetHelpText("Log into the selected server automatically on app start.")
+        self.multi_server_cb.SetHelpText("After login, include saved accounts from other configured servers in user browsing.")
         
         login_btn = wx.Button(panel, label="&Login"); login_btn.Bind(wx.EVT_BUTTON, self.on_login)
         create_btn = wx.Button(panel, label="&Create Account..."); create_btn.Bind(wx.EVT_BUTTON, self.on_create_account)
@@ -1208,12 +1463,15 @@ class LoginDialog(wx.Dialog):
             for btn in [manage_servers_btn, set_primary_btn, welcome_btn, login_btn, create_btn, forgot_btn]:
                 btn.SetBackgroundColour(dark_color); btn.SetForegroundColour(light_text_color)
             self.remember_cb.SetForegroundColour(light_text_color); self.autologin_cb.SetForegroundColour(light_text_color)
+            self.multi_server_cb.SetForegroundColour(light_text_color)
 
         self.populate_server_choice()
+        self.apply_saved_credentials_for_selected_server()
         self.refresh_welcome_preview()
         s.Add(server_box, 0, wx.EXPAND | wx.ALL, 5)
         s.Add(user_box, 0, wx.EXPAND | wx.ALL, 5); s.Add(pass_box, 0, wx.EXPAND | wx.ALL, 5)
         s.Add(self.remember_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10); s.Add(self.autologin_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        s.Add(self.multi_server_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         btn_sizer = wx.BoxSizer(wx.HORIZONTAL); 
         btn_sizer.Add(login_btn, 1, wx.EXPAND | wx.ALL, 2); btn_sizer.Add(create_btn, 1, wx.EXPAND | wx.ALL, 2)
         s.Add(btn_sizer, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 5)
@@ -1241,7 +1499,17 @@ class LoginDialog(wx.Dialog):
         idx = self.server_choice.GetSelection()
         if 0 <= idx < len(self.server_entries):
             self.selected_server = self.server_entries[idx]
+            self.apply_saved_credentials_for_selected_server()
             self.refresh_welcome_preview()
+
+    def apply_saved_credentials_for_selected_server(self):
+        username, password = lookup_server_account(self.user_config, self.selected_server)
+        if username:
+            self.u.SetValue(username)
+            if password:
+                self.p.SetValue(password)
+                self.remember_cb.SetValue(True)
+            self.on_check_remember(None)
 
     def on_manage_servers(self, _):
         with ServerManagerDialog(self, self.server_entries) as dlg:
@@ -1330,11 +1598,13 @@ class LoginDialog(wx.Dialog):
         self.password = p
         self.remember_checked = self.remember_cb.IsChecked()
         self.autologin_checked = self.autologin_cb.IsChecked()
+        self.multi_server_signin = self.multi_server_cb.IsChecked()
         for entry in self.server_entries:
             entry['primary'] = (entry.get('name') == self.primary_server_name)
         self.user_config['server_entries'] = self.server_entries
         self.user_config['last_server_name'] = self.selected_server.get('name', '')
         self.user_config['primary_server_name'] = self.primary_server_name
+        self.user_config['multi_server_signin'] = self.multi_server_signin
         self.EndModal(wx.ID_OK)
 
     def on_key(self, event):
@@ -1405,6 +1675,16 @@ class UserDirectoryDialog(wx.Dialog):
         search_sizer.Add(search_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
         search_sizer.Add(self.search_box, 1, wx.EXPAND)
         s.Add(search_sizer, 0, wx.EXPAND | wx.ALL, 5)
+        filter_row = wx.BoxSizer(wx.HORIZONTAL)
+        filter_label = wx.StaticText(panel, label="Ser&ver:")
+        self.server_filter_choice = wx.Choice(panel, choices=["All Servers"])
+        self.server_filter_choice.SetSelection(0)
+        self.server_filter_choice.Bind(wx.EVT_CHOICE, self.on_search)
+        self.server_filter_choice.SetToolTip("Choose All Servers or a single connected server.")
+        self.server_filter_choice.SetHelpText("Server filter. Select All Servers to show everyone, or pick one server to narrow the user list.")
+        filter_row.Add(filter_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+        filter_row.Add(self.server_filter_choice, 1, wx.EXPAND)
+        s.Add(filter_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         self.notebook = wx.Notebook(panel)
         self.tabs = {}
         for tab_name in ["Everyone", "Online", "Offline", "Admins"]:
@@ -1438,6 +1718,7 @@ class UserDirectoryDialog(wx.Dialog):
         self.Bind(wx.EVT_MENU, lambda e: self.Close(), id=esc_id)
         self.SetAcceleratorTable(wx.AcceleratorTable([(wx.ACCEL_NORMAL, wx.WXK_ESCAPE, esc_id)]))
         self.Bind(wx.EVT_CLOSE, self.on_close)
+        self._populate_server_filter()
         self._populate_all_tabs(); self.update_button_states()
     def _get_active_list(self):
         page = self.notebook.GetSelection()
@@ -1450,12 +1731,22 @@ class UserDirectoryDialog(wx.Dialog):
             self._selected_user = lv.GetItemText(sel)
             return self._selected_user
         return None
+    def _get_selected_server(self):
+        lv = self._get_active_list()
+        if not lv:
+            return None
+        sel = lv.GetFirstSelected()
+        if sel >= 0:
+            return lv.GetItemText(sel, 2) or None
+        return None
     def _populate_all_tabs(self):
         query = self.search_box.GetValue().strip().lower()
+        selected_server = self.server_filter_choice.GetStringSelection() if hasattr(self, "server_filter_choice") else "All Servers"
         for tab_name, lv in self.tabs.items():
             lv.DeleteAllItems()
             for u in self._all_users:
                 if query and query not in u["user"].lower(): continue
+                if selected_server and selected_server != "All Servers" and u.get("server", "Current") != selected_server: continue
                 if tab_name == "Online" and not u["online"]: continue
                 if tab_name == "Offline" and u["online"]: continue
                 if tab_name == "Admins" and not u["is_admin"]: continue
@@ -1470,12 +1761,28 @@ class UserDirectoryDialog(wx.Dialog):
                 lv.SetItem(idx, 3, ", ".join(info_parts))
                 if u["is_blocked"]: lv.SetItemTextColour(idx, wx.Colour(150, 150, 150))
         self.update_button_states()
+    def _populate_server_filter(self):
+        servers = sorted({str(u.get("server", "Current")) for u in self._all_users})
+        current = self.server_filter_choice.GetStringSelection() if hasattr(self, "server_filter_choice") else "All Servers"
+        self.server_filter_choice.Clear()
+        self.server_filter_choice.Append("All Servers")
+        for server in servers:
+            self.server_filter_choice.Append(server)
+        if current and self.server_filter_choice.FindString(current) != wx.NOT_FOUND:
+            self.server_filter_choice.SetStringSelection(current)
+        else:
+            self.server_filter_choice.SetSelection(0)
     def update_button_states(self):
         user = self._get_selected_user()
         if not user or user == self.my_username:
             self.btn_chat.Disable(); self.btn_file.Disable(); self.btn_block.Disable(); self.btn_add.Disable()
             self.btn_block.SetLabel("&Block"); return
         self.btn_chat.Enable(); self.btn_file.Enable()
+        selected_server = self._get_selected_server()
+        app = wx.GetApp()
+        primary_server = normalize_server_entry(getattr(app, "active_server_entry", {})).get("name", "Current Server")
+        if selected_server and selected_server != primary_server:
+            self.btn_file.Disable()
         is_contact = user in self.contact_states
         self.btn_add.Enable(not is_contact); self.btn_add.SetLabel("&Add to Contacts")
         self.btn_block.Enable(is_contact)
@@ -1501,12 +1808,21 @@ class UserDirectoryDialog(wx.Dialog):
     def on_start_chat(self, _):
         user = self._selected_user
         if not user or user == self.my_username: return
+        server_name = self._get_selected_server() or normalize_server_entry(getattr(wx.GetApp(), "active_server_entry", {})).get("name", "Current Server")
         app = wx.GetApp(); logging_config = app.user_config.get('chat_logging', {}); is_logging_enabled = logging_config.get(user, False)
         is_contact = user in self.contact_states
-        dlg = self.parent_frame.get_chat(user) or ChatDialog(self.parent_frame, user, self.parent_frame.sock, self.parent_frame.user, is_logging_enabled, is_contact=is_contact)
+        sock = app.server_sessions.get(server_name, {}).get("sock", self.parent_frame.sock)
+        dlg = self.parent_frame.get_chat(user, server_name) or ChatDialog(self.parent_frame, user, sock, self.parent_frame.user, is_logging_enabled, is_contact=is_contact, server_name=server_name, send_json_fn=self.parent_frame._send_chat_payload)
         dlg.Show(); dlg.input_ctrl.SetFocus()
     def on_send_file(self, _):
-        if self._selected_user: wx.GetApp().send_file_to(self._selected_user)
+        if not self._selected_user:
+            return
+        selected_server = self._get_selected_server()
+        primary_server = normalize_server_entry(getattr(wx.GetApp(), "active_server_entry", {})).get("name", "Current Server")
+        if selected_server and selected_server != primary_server:
+            wx.MessageBox("File transfer is currently available only on your primary server session.", "File Transfer", wx.OK | wx.ICON_INFORMATION)
+            return
+        wx.GetApp().send_file_to(self._selected_user)
     def on_block_toggle(self, _):
         user = self._selected_user
         if not user or user not in self.contact_states: return
@@ -1552,6 +1868,7 @@ class UserDirectoryDialog(wx.Dialog):
             if key not in merged:
                 merged[key] = u
         self._all_users = list(merged.values())
+        self._populate_server_filter()
         self._populate_all_tabs()
 
 class MainFrame(wx.Frame):
@@ -1653,13 +1970,42 @@ class MainFrame(wx.Frame):
     def on_user_directory_response(self, msg):
         app = wx.GetApp()
         current_server_name = getattr(app, "active_server_entry", {}).get("name", "Current Server")
-        users = msg.get("users", [])
+        raw_users = msg.get("users", [])
+        users = []
+        if isinstance(raw_users, list):
+            for entry in raw_users:
+                coerced = _coerce_directory_user(entry, current_server_name)
+                if coerced:
+                    users.append(coerced)
+        if not users:
+            # Fallback so directory never appears as empty tabs only.
+            for c in self._all_contacts:
+                status_text = c.get("status", "offline")
+                users.append({
+                    "user": c.get("user", ""),
+                    "online": status_text != "offline" and not status_text.startswith("offline"),
+                    "status_text": status_text,
+                    "is_admin": "(Admin)" in status_text,
+                    "is_contact": True,
+                    "is_blocked": c.get("blocked", 0) == 1,
+                    "server": current_server_name,
+                })
+            if not any(u.get("user") == self.user for u in users):
+                users.insert(0, {
+                    "user": self.user,
+                    "online": True,
+                    "status_text": self.current_status,
+                    "is_admin": False,
+                    "is_contact": False,
+                    "is_blocked": False,
+                    "server": current_server_name,
+                })
         for u in users:
             u["server"] = u.get("server", current_server_name)
         dlg = UserDirectoryDialog(self, users, self.user, self.contact_states)
         self._directory_dlg = dlg
         dlg.Show()
-        if app.user_config.get("server_entries") and app.session_password:
+        if app.user_config.get("multi_server_signin", True) and app.user_config.get("server_entries"):
             def merge_later():
                 extras = []
                 active = normalize_server_entry(getattr(app, "active_server_entry", {}))
@@ -1667,7 +2013,10 @@ class MainFrame(wx.Frame):
                     normalized = normalize_server_entry(entry)
                     if normalized["host"].lower() == active.get("host", "").lower() and normalized["port"] == active.get("port", 0):
                         continue
-                    extras.extend(app.fetch_directory_for_server(normalized, self.user, app.session_password))
+                    u, p = app.get_directory_credentials_for_server(normalized)
+                    if not u or not p:
+                        continue
+                    extras.extend(app.fetch_directory_for_server(normalized, u, p))
                 if extras and self._directory_dlg:
                     wx.CallAfter(self._directory_dlg.merge_external_users, extras)
             threading.Thread(target=merge_later, daemon=True).start()
@@ -1702,11 +2051,14 @@ class MainFrame(wx.Frame):
                 except Exception as e: print(f"Error setting status: {e}")
     def on_check_updates(self, event=None, silent=False):
         self.btn_update.Disable()
-        def _callback(tag, version_str, error):
+        def _callback(tag, version_str, error, source):
             self.btn_update.Enable()
             if tag:
+                if silent:
+                    show_notification("Update available", f"{tag} is available from {source or 'configured source'}. Press Alt+P to update.")
+                    return
                 result = wx.MessageBox(
-                    f"A new version is available: {tag}\nYou are currently running {VERSION_TAG}.\n\nWould you like to download and install it?",
+                    f"A new version is available: {tag}\nSource: {source or 'default'}\nYou are currently running {VERSION_TAG}.\n\nWould you like to download and install it?",
                     "Update Available", wx.YES_NO | wx.ICON_INFORMATION, self)
                 if result == wx.YES:
                     self._start_update_download(tag)
@@ -1717,20 +2069,24 @@ class MainFrame(wx.Frame):
         check_for_update(_callback)
     def _start_update_download(self, tag):
         import urllib.request
-        api_url = f"https://api.github.com/repos/G4p-Studios/ThriveMessenger/releases/tags/{tag}"
-        try:
-            req = urllib.request.Request(api_url, headers={"Accept": "application/vnd.github+json", "User-Agent": "ThriveMessenger/" + VERSION_TAG})
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read().decode())
-        except Exception as e:
-            wx.MessageBox(f"Failed to fetch release info:\n{e}", "Update Error", wx.ICON_ERROR); return
-        assets = data.get("assets", [])
         use_installer = is_installer_install()
         target_name = "thrive_messenger_installer.exe" if use_installer else "thrive_messenger.zip"
         asset_url = None
-        for a in assets:
-            if a["name"] == target_name:
-                asset_url = a["browser_download_url"]; break
+        if UPDATE_CONTEXT.get("source") == "feed":
+            asset_url = UPDATE_CONTEXT.get("installer_url") if use_installer else UPDATE_CONTEXT.get("zip_url")
+        if not asset_url:
+            repo = UPDATE_CONTEXT.get("repo") if UPDATE_CONTEXT.get("repo") else "Raywonder/ThriveMessenger"
+            api_url = f"https://api.github.com/repos/{repo}/releases/tags/{tag}"
+            try:
+                req = urllib.request.Request(api_url, headers={"Accept": "application/vnd.github+json", "User-Agent": "ThriveMessenger/" + VERSION_TAG})
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    data = json.loads(resp.read().decode())
+            except Exception as e:
+                wx.MessageBox(f"Failed to fetch release info:\n{e}", "Update Error", wx.ICON_ERROR); return
+            assets = data.get("assets", [])
+            for a in assets:
+                if a["name"] == target_name:
+                    asset_url = a["browser_download_url"]; break
         if not asset_url:
             wx.MessageBox(f"Could not find {target_name} in release assets.", "Update Error", wx.ICON_ERROR); return
         ext = ".exe" if use_installer else ".zip"
@@ -1740,19 +2096,18 @@ class MainFrame(wx.Frame):
         def _done(success, error):
             progress.Destroy()
             if success:
+                show_notification("Update downloaded", "Install will begin now.")
                 if use_installer:
                     apply_installer_update(dest)
                 else:
                     apply_zip_update(dest)
                 app = wx.GetApp(); app.intentional_disconnect = True
-                try: self.sock.sendall(json.dumps({"action":"logout"}).encode()+b"\n")
-                except: pass
-                try: self.sock.close()
-                except: pass
+                app.close_all_sessions()
                 if self.task_bar_icon: self.task_bar_icon.Destroy()
                 self.is_exiting = True; self.Destroy()
                 app.ExitMainLoop()
             else:
+                show_notification("Update download failed", str(error))
                 wx.MessageBox(f"Download failed:\n{error}", "Update Error", wx.ICON_ERROR)
         download_update(asset_url, dest, progress, _done)
     def on_add_contact_failed(self, reason): wx.MessageBox(reason, "Add Contact Failed", wx.ICON_ERROR)
@@ -1822,20 +2177,14 @@ class MainFrame(wx.Frame):
     def on_exit(self, _):
         print("Exiting application...");
         app = wx.GetApp(); app.intentional_disconnect = True
-        try: self.sock.sendall(json.dumps({"action":"logout"}).encode()+b"\n")
-        except: pass
-        try: self.sock.close()
-        except: pass
+        app.close_all_sessions()
         if self._directory_dlg: self._directory_dlg.Destroy(); self._directory_dlg = None
         if self.task_bar_icon: self.task_bar_icon.Destroy()
         self.is_exiting = True; self.Destroy()
         app.ExitMainLoop()
     def on_logout(self, _):
         self.is_exiting = True; app = wx.GetApp(); app.intentional_disconnect = True
-        try: self.sock.sendall(json.dumps({"action":"logout"}).encode()+b"\n")
-        except: pass
-        try: self.sock.close()
-        except: pass
+        app.close_all_sessions()
         if self._directory_dlg: self._directory_dlg.Destroy(); self._directory_dlg = None
         app.play_sound("logout.wav"); self.Destroy()
         app.show_login_dialog()
@@ -1863,7 +2212,8 @@ class MainFrame(wx.Frame):
         if sel < 0: return
         c = self.lv.GetItemText(sel);
         app = wx.GetApp(); logging_config = app.user_config.get('chat_logging', {}); is_logging_enabled = logging_config.get(c, False)
-        dlg = self.get_chat(c) or ChatDialog(self, c, self.sock, self.user, is_logging_enabled)
+        server_name = normalize_server_entry(getattr(app, "active_server_entry", {})).get("name", "Current Server")
+        dlg = self.get_chat(c, server_name) or ChatDialog(self, c, self.sock, self.user, is_logging_enabled, server_name=server_name, send_json_fn=self._send_chat_payload)
         dlg.Show(); dlg.input_ctrl.SetFocus()
     def on_send_file(self, _):
         sel = self.lv.GetFirstSelected()
@@ -1884,21 +2234,34 @@ class MainFrame(wx.Frame):
     def receive_message(self, msg):
         wx.GetApp().play_sound("receive.wav");
         app = wx.GetApp(); logging_config = app.user_config.get('chat_logging', {}); is_logging_enabled = logging_config.get(msg["from"], False)
-        dlg = self.get_chat(msg["from"])
+        server_name = msg.get("server", normalize_server_entry(getattr(app, "active_server_entry", {})).get("name", "Current Server"))
+        dlg = self.get_chat(msg["from"], server_name)
         if not dlg:
             is_contact = msg["from"] in self.contact_states
-            dlg = ChatDialog(self, msg["from"], self.sock, self.user, is_logging_enabled, is_contact=is_contact)
+            sock = app.server_sessions.get(server_name, {}).get("sock", self.sock)
+            dlg = ChatDialog(self, msg["from"], sock, self.user, is_logging_enabled, is_contact=is_contact, server_name=server_name, send_json_fn=self._send_chat_payload)
         dlg.Show(); dlg.append(msg["msg"], msg["from"], msg["time"]); dlg.input_ctrl.SetFocus(); self.RequestUserAttention()
     def on_typing_event(self, msg):
         from_user = msg.get("from")
         is_typing = bool(msg.get("typing", False))
-        chat = self.get_chat(from_user)
+        chat = self.get_chat(from_user, msg.get("server"))
         if chat:
             chat.set_typing_state(from_user, is_typing)
-    def on_message_failed(self, to, reason): chat_dlg = self.get_chat(to); (chat_dlg.append_error(reason) if chat_dlg else wx.MessageBox(reason, "Message Failed", wx.OK | wx.ICON_ERROR))
-    def get_chat(self, contact):
+    def on_message_failed(self, to, reason, server_name=None): chat_dlg = self.get_chat(to, server_name); (chat_dlg.append_error(reason) if chat_dlg else wx.MessageBox(reason, "Message Failed", wx.OK | wx.ICON_ERROR))
+    def _send_chat_payload(self, server_name, payload):
+        app = wx.GetApp()
+        if server_name and server_name in getattr(app, "server_sessions", {}):
+            return app.send_json_to_server(server_name, payload)
+        try:
+            self.sock.sendall((json.dumps(payload) + "\n").encode())
+            return True
+        except Exception:
+            return False
+    def get_chat(self, contact, server_name=None):
         for child in self.GetChildren():
-            if isinstance(child, ChatDialog) and child.contact == contact: return child
+            if isinstance(child, ChatDialog) and child.contact == contact:
+                if server_name is None or getattr(child, "server_name", None) == server_name:
+                    return child
         return None
 
 def get_day_with_suffix(d): return str(d) + "th" if 11 <= d <= 13 else str(d) + {1: "st", 2: "nd", 3: "rd"}.get(d % 10, "th")
@@ -1919,7 +2282,9 @@ class AdminDialog(wx.Dialog):
             
         self.hist = wx.ListCtrl(self, style=wx.LC_REPORT)
         self.hist.InsertColumn(0, "Server Response", width=200); self.hist.InsertColumn(1, "Time", width=220)
+
         box_msg = wx.StaticBoxSizer(wx.VERTICAL, self, "&Enter command (e.g., /create user pass)"); self.input_ctrl = wx.TextCtrl(box_msg.GetStaticBox(), style=wx.TE_PROCESS_ENTER)
+        self.btn_actions = wx.Button(self, label="Admin &Actions...")
         btn = wx.Button(self, label="&Send Command")
         
         if dark_mode_on:
@@ -1927,10 +2292,34 @@ class AdminDialog(wx.Dialog):
             box_msg.GetStaticBox().SetForegroundColour(light_text_color)
             box_msg.GetStaticBox().SetBackgroundColour(dark_color)
             self.input_ctrl.SetBackgroundColour(dark_color); self.input_ctrl.SetForegroundColour(light_text_color)
+            self.btn_actions.SetBackgroundColour(dark_color); self.btn_actions.SetForegroundColour(light_text_color)
             btn.SetBackgroundColour(dark_color); btn.SetForegroundColour(light_text_color)
-            
-        s.Add(self.hist, 1, wx.EXPAND|wx.ALL, 5); self.input_ctrl.Bind(wx.EVT_TEXT_ENTER, self.on_send); box_msg.Add(self.input_ctrl, 0, wx.EXPAND|wx.ALL, 5)
-        s.Add(box_msg, 0, wx.EXPAND|wx.ALL, 5); btn.Bind(wx.EVT_BUTTON, self.on_send); s.Add(btn, 0, wx.CENTER|wx.ALL, 5); self.SetSizer(s)
+
+        self._action_handlers = {
+            "alert": self.on_quick_alert,
+            "create": self.on_quick_create,
+            "ban": self.on_quick_ban,
+            "unban": self.on_quick_unban,
+            "delete": self.on_quick_delete,
+            "admin": self.on_quick_admin,
+            "unadmin": self.on_quick_unadmin,
+            "banfile": self.on_quick_banfile,
+            "restart": self.on_quick_restart,
+            "shutdown": self.on_quick_shutdown,
+        }
+        self.btn_actions.Bind(wx.EVT_BUTTON, self.on_open_action_menu)
+        self.hist.Bind(wx.EVT_CONTEXT_MENU, self.on_open_action_menu)
+        self.input_ctrl.Bind(wx.EVT_CONTEXT_MENU, self.on_open_action_menu)
+
+        s.Add(self.hist, 1, wx.EXPAND|wx.ALL, 5)
+        self.input_ctrl.Bind(wx.EVT_TEXT_ENTER, self.on_send); box_msg.Add(self.input_ctrl, 0, wx.EXPAND|wx.ALL, 5)
+        s.Add(box_msg, 0, wx.EXPAND|wx.ALL, 5)
+        btn_row = wx.BoxSizer(wx.HORIZONTAL)
+        btn_row.Add(self.btn_actions, 1, wx.EXPAND | wx.RIGHT, 5)
+        btn_row.Add(btn, 1, wx.EXPAND)
+        btn.Bind(wx.EVT_BUTTON, self.on_send)
+        s.Add(btn_row, 0, wx.EXPAND|wx.LEFT|wx.RIGHT|wx.BOTTOM, 5)
+        self.SetSizer(s)
     def on_key(self, event):
         if event.GetKeyCode() == wx.WXK_F1:
             open_help_docs_for_context("admin", self)
@@ -1940,15 +2329,109 @@ class AdminDialog(wx.Dialog):
         cmd = self.input_ctrl.GetValue().strip()
         if not cmd: return
         if not cmd.startswith('/'): self.append_response("Error: Commands must start with /"); return
-        msg = {"action":"admin_cmd", "cmd": cmd[1:]}; self.sock.sendall(json.dumps(msg).encode()+b"\n"); self.input_ctrl.Clear(); self.input_ctrl.SetFocus()
+        self._send_admin_command(cmd[1:])
+        self.input_ctrl.Clear()
+        self.input_ctrl.SetFocus()
+    def _send_admin_command(self, cmd_text):
+        msg = {"action":"admin_cmd", "cmd": cmd_text}
+        self.sock.sendall(json.dumps(msg).encode()+b"\n")
+    def on_open_action_menu(self, event):
+        menu = wx.Menu()
+        items = [
+            ("Broadcast Alert...", "alert"),
+            ("Create User...", "create"),
+            ("Ban User...", "ban"),
+            ("Unban User...", "unban"),
+            ("Delete User...", "delete"),
+            ("Make Admin...", "admin"),
+            ("Remove Admin...", "unadmin"),
+            ("Ban File Type...", "banfile"),
+            ("Restart Server...", "restart"),
+            ("Shutdown Server...", "shutdown"),
+        ]
+        for label, key in items:
+            item = menu.Append(wx.ID_ANY, label)
+            menu.Bind(wx.EVT_MENU, lambda _evt, k=key: self._action_handlers[k](_evt), item)
+        self.PopupMenu(menu)
+        menu.Destroy()
+    def _ask(self, title, prompt):
+        with wx.TextEntryDialog(self, prompt, title) as dlg:
+            if dlg.ShowModal() != wx.ID_OK:
+                return None
+            val = dlg.GetValue().strip()
+            return val or None
+    def on_quick_alert(self, _):
+        text = self._ask("Alert", "Enter alert message to broadcast:")
+        if text:
+            self._send_admin_command(f"alert {text}")
+    def on_quick_create(self, _):
+        user = self._ask("Create User", "Username:")
+        if not user:
+            return
+        password = self._ask("Create User", "Password:")
+        if password:
+            self._send_admin_command(f"create {user} {password}")
+    def on_quick_ban(self, _):
+        user = self._ask("Ban User", "Username:")
+        if not user:
+            return
+        until = self._ask("Ban User", "Until date (MM/DD/YYYY):")
+        if not until:
+            return
+        reason = self._ask("Ban User", "Reason:")
+        if not reason:
+            return
+        self._send_admin_command(f"ban {user} {until} {reason}")
+    def on_quick_unban(self, _):
+        user = self._ask("Unban User", "Username:")
+        if user:
+            self._send_admin_command(f"unban {user}")
+    def on_quick_delete(self, _):
+        user = self._ask("Delete User", "Username:")
+        if not user:
+            return
+        if wx.MessageBox(f"Delete user '{user}'?", "Confirm Delete", wx.YES_NO | wx.ICON_WARNING) == wx.YES:
+            self._send_admin_command(f"del {user}")
+    def on_quick_admin(self, _):
+        user = self._ask("Make Admin", "Username:")
+        if user:
+            self._send_admin_command(f"admin {user}")
+    def on_quick_unadmin(self, _):
+        user = self._ask("Remove Admin", "Username:")
+        if user:
+            self._send_admin_command(f"unadmin {user}")
+    def on_quick_banfile(self, _):
+        user = self._ask("Ban File Type", "Username:")
+        if not user:
+            return
+        file_type = self._ask("Ban File Type", "Extension (without dot, or * for all):")
+        if not file_type:
+            return
+        until = self._ask("Ban File Type", "Until date (MM/DD/YYYY). Leave blank for permanent:")
+        reason = self._ask("Ban File Type", "Reason:")
+        if not reason:
+            reason = "No reason given"
+        if until:
+            self._send_admin_command(f"banfile {user} {file_type} {until} {reason}")
+        else:
+            self._send_admin_command(f"banfile {user} {file_type} {reason}")
+    def on_quick_restart(self, _):
+        if wx.MessageBox("Restart the server now?", "Confirm Restart", wx.YES_NO | wx.ICON_WARNING) == wx.YES:
+            self._send_admin_command("restart")
+    def on_quick_shutdown(self, _):
+        if wx.MessageBox("Shut down the server now?", "Confirm Shutdown", wx.YES_NO | wx.ICON_WARNING) == wx.YES:
+            self._send_admin_command("exit")
     def append_response(self, text):
         ts = datetime.datetime.now().isoformat(); idx = self.hist.GetItemCount(); self.hist.InsertItem(idx, text); self.hist.SetItem(idx, 1, format_timestamp(ts))
         if text.lower().startswith('error'): self.hist.SetItemTextColour(idx, wx.RED)
 
 class ChatDialog(wx.Dialog):
-    def __init__(self, parent, contact, sock, user, logging_enabled=False, is_contact=True):
-        super().__init__(parent, title=f"Chat with {contact}", size=(450, 450))
+    def __init__(self, parent, contact, sock, user, logging_enabled=False, is_contact=True, server_name=None, send_json_fn=None):
+        title_server = f" ({server_name})" if server_name else ""
+        super().__init__(parent, title=f"Chat with {contact}{title_server}", size=(450, 450))
         self.contact, self.sock, self.user = contact, sock, user
+        self.server_name = server_name
+        self._send_json_fn = send_json_fn
         self.Bind(wx.EVT_CHAR_HOOK, self.on_key)
         self.Bind(wx.EVT_CLOSE, self.on_close)
         self._sent_typing = False
@@ -2010,7 +2493,8 @@ class ChatDialog(wx.Dialog):
     def _save_message_to_log(self, formatted_log_line):
         try:
             docs_path = os.path.join(os.path.expanduser('~'), 'Documents')
-            log_dir = os.path.join(docs_path, 'ThriveMessenger', 'chats', self.contact)
+            server_folder = self.server_name if self.server_name else "default"
+            log_dir = os.path.join(docs_path, 'ThriveMessenger', 'chats', server_folder, self.contact)
             os.makedirs(log_dir, exist_ok=True)
             log_file = f"{datetime.date.today().isoformat()}.txt"
             log_path = os.path.join(log_dir, log_file)
@@ -2028,7 +2512,7 @@ class ChatDialog(wx.Dialog):
             txt = self.input_ctrl.GetValue().strip()
             if txt and not self._sent_typing:
                 try:
-                    self.sock.sendall((json.dumps({"action": "typing", "to": self.contact, "typing": True}) + "\n").encode())
+                    self._send_json({"action": "typing", "to": self.contact, "typing": True})
                     self._sent_typing = True
                 except Exception:
                     pass
@@ -2041,7 +2525,7 @@ class ChatDialog(wx.Dialog):
         if not self._sent_typing:
             return
         try:
-            self.sock.sendall((json.dumps({"action": "typing", "to": self.contact, "typing": False}) + "\n").encode())
+            self._send_json({"action": "typing", "to": self.contact, "typing": False})
         except Exception:
             pass
         self._sent_typing = False
@@ -2059,14 +2543,18 @@ class ChatDialog(wx.Dialog):
         self._send_stop_typing()
         ts = datetime.datetime.now().isoformat()
         msg = {"action":"msg","to":self.contact,"from":self.user,"time":ts,"msg":txt}
-        self.sock.sendall(json.dumps(msg).encode()+b"\n")
+        if not self._send_json(msg):
+            self.append_error("Failed to send message: disconnected from selected server.")
+            return
         self.append(txt, self.user, ts)
         wx.GetApp().play_sound("send.wav")
         self.input_ctrl.Clear(); self.input_ctrl.SetFocus()
     def on_send_file(self, _):
         wx.GetApp().send_file_to(self.contact)
     def on_add_contact(self, _):
-        self.sock.sendall(json.dumps({"action": "add_contact", "to": self.contact}).encode() + b"\n")
+        if not self._send_json({"action": "add_contact", "to": self.contact}):
+            self.append_error("Could not add contact on this server.")
+            return
         self.btn_add_contact.Disable(); self.btn_add_contact.SetLabel("Adding...")
     def hide_add_button(self):
         self.btn_add_contact.Hide(); self.GetSizer().Layout()
@@ -2116,6 +2604,14 @@ class ChatDialog(wx.Dialog):
     def on_close(self, event):
         self._send_stop_typing()
         event.Skip()
+    def _send_json(self, payload):
+        if self._send_json_fn is not None:
+            return bool(self._send_json_fn(self.server_name, payload))
+        try:
+            self.sock.sendall((json.dumps(payload) + "\n").encode())
+            return True
+        except Exception:
+            return False
 
 def main():
     app = ClientApp(False); app.MainLoop()
