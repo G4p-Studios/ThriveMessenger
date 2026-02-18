@@ -433,8 +433,10 @@ def handle_client(cs, addr):
                         response = "Alert sent to all online users."
                     elif command == "create" and len(cmd_parts) in (3, 4):
                         email = cmd_parts[3] if len(cmd_parts) == 4 else ""
-                        handle_create(cmd_parts[1], cmd_parts[2], email)
-                        response = f"User '{cmd_parts[1]}' created."
+                        if handle_create(cmd_parts[1], cmd_parts[2], email):
+                            response = f"User '{cmd_parts[1]}' created."
+                        else:
+                            response = f"Error: Username '{cmd_parts[1]}' is already taken."
                     elif command == "ban" and len(cmd_parts) >= 4: 
                         handle_ban(cmd_parts[1], cmd_parts[2], " ".join(cmd_parts[3:]))
                         response = f"User '{cmd_parts[1]}' banned."
@@ -711,11 +713,12 @@ def handle_create(user, password, email=""):
     existing = con.execute("SELECT 1 FROM users WHERE LOWER(username)=LOWER(?)", (user,)).fetchone()
     if not existing:
         con.execute("INSERT INTO users(username,password,email,is_verified) VALUES(?,?,?,1)", (user, password, email))
-        con.commit()
+        con.commit(); con.close()
         print(f"User '{user}' created.")
-    else:
-        print(f"User '{user}' already exists (case-insensitive match).")
+        return True
     con.close()
+    print(f"User '{user}' already exists (case-insensitive match).")
+    return False
 
 def handle_ban(user, date_str, reason):
     try: 
