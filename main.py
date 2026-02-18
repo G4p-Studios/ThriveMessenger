@@ -1837,16 +1837,18 @@ class LoginDialog(wx.Dialog):
                     
                     if resp.get("action") == "verify_pending":
                         wx.MessageBox("A verification code has been sent to your email.", "Verification Required", wx.ICON_INFORMATION)
-                        with VerificationDialog(self, u) as vdlg:
-                            if vdlg.ShowModal() == wx.ID_OK:
+                        while True:
+                            with VerificationDialog(self, u) as vdlg:
+                                if vdlg.ShowModal() != wx.ID_OK: break
                                 code = vdlg.code_txt.GetValue().strip()
-                                sock2 = create_secure_socket()
-                                sock2.sendall(json.dumps({"action":"verify_account", "user":u, "code":code}).encode()+b"\n")
-                                vresp = json.loads(sock2.makefile().readline() or "{}"); sock2.close()
-                                if vresp.get("status") == "ok":
-                                    wx.MessageBox("Account verified!", "Success")
-                                    if auto: self.new_username = u; self.new_password = p; self.EndModal(wx.ID_ABORT)
-                                else: wx.MessageBox("Verification failed: " + vresp.get("reason"), "Error", wx.ICON_ERROR)
+                            sock2 = create_secure_socket()
+                            sock2.sendall(json.dumps({"action":"verify_account", "user":u, "code":code}).encode()+b"\n")
+                            vresp = json.loads(sock2.makefile().readline() or "{}"); sock2.close()
+                            if vresp.get("status") == "ok":
+                                wx.MessageBox("Account verified!", "Success")
+                                if auto: self.new_username = u; self.new_password = p; self.EndModal(wx.ID_ABORT)
+                                break
+                            wx.MessageBox("Verification failed: " + vresp.get("reason", "Unknown error"), "Error", wx.ICON_ERROR)
                     elif resp.get("action") == "create_account_success":
                         wx.MessageBox("Account created successfully!", "Success", wx.OK | wx.ICON_INFORMATION)
                         if auto: self.new_username = u; self.new_password = p; self.EndModal(wx.ID_ABORT)
