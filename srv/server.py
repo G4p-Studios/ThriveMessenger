@@ -1,6 +1,9 @@
 import sqlite3, threading, socket, json, datetime, sys, configparser, ssl, os, uuid, base64, time
 import smtplib, secrets
 from email.mime.text import MIMEText
+from argon2 import PasswordHasher
+from argon2.exceptions import VerifyMismatchError, VerificationError, InvalidHashError
+_ph = PasswordHasher()
 
 DB = 'thrive.db'
 ADMIN_FILE = 'admins.txt'
@@ -215,6 +218,7 @@ def handle_client(cs, addr):
                 sock.sendall((json.dumps({"action": "create_account_failed", "reason": "Username is already taken."}) + "\n").encode())
                 con.close(); return
 
+            new_pass = _ph.hash(new_pass)
             verified = 1 if not smtp_config['enabled'] else 0
             code = None; expires = None
 
@@ -312,7 +316,7 @@ def handle_client(cs, addr):
                     con.close(); _record_code_fail(t_user)
                     sock.sendall(json.dumps({"status": "error", "reason": "Code has expired."}).encode() + b"\n")
                 else:
-                    con.execute("UPDATE users SET password=?, reset_code=NULL, code_expires=NULL WHERE username=?", (new_p, t_user))
+                    con.execute("UPDATE users SET password=?, reset_code=NULL, code_expires=NULL WHERE username=?", (_ph.hash(new_p), t_user))
                     con.commit(); con.close(); _clear_code_fails(t_user)
                     sock.sendall(json.dumps({"status": "ok"}).encode() + b"\n")
             else:
@@ -329,10 +333,23 @@ def handle_client(cs, addr):
         cur.execute("SELECT password,banned_until,ban_reason,is_verified FROM users WHERE username=?", (req["user"],))
         row = cur.fetchone()
         
-        if not row or row[0] != req["pass"]: 
+        stored, incoming = (row[0] if row else None), req["pass"]
+        password_ok = False; needs_rehash = False
+        if stored:
+            if stored.startswith("$argon2"):
+                try:
+                    _ph.verify(stored, incoming); password_ok = True
+                    if _ph.check_needs_rehash(stored): needs_rehash = True
+                except (VerifyMismatchError, VerificationError, InvalidHashError):
+                    pass
+            else:  # legacy plain-text — accept and rehash transparently
+                if stored == incoming: password_ok = True; needs_rehash = True
+        if not password_ok:
             sock.sendall(b'{"status":"error","reason":"Invalid credentials"}\n')
-            db.close()
-            return
+            db.close(); return
+        if needs_rehash:
+            db.execute("UPDATE users SET password=? WHERE username=?", (_ph.hash(incoming), req["user"]))
+            db.commit()
             
         bi, br, verified = row[1], row[2], row[3]
         
@@ -712,7 +729,7 @@ def handle_create(user, password, email=""):
     con = sqlite3.connect(DB)
     existing = con.execute("SELECT 1 FROM users WHERE LOWER(username)=LOWER(?)", (user,)).fetchone()
     if not existing:
-        con.execute("INSERT INTO users(username,password,email,is_verified) VALUES(?,?,?,1)", (user, password, email))
+        con.execute("INSERT INTO users(username,password,email,is_verified) VALUES(?,?,?,1)", (user, _ph.hash(password), email))
         con.commit(); con.close()
         print(f"User '{user}' created.")
         return True
