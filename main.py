@@ -8,6 +8,7 @@ except Exception:
 VERSION_TAG = "v2026-alpha14"
 URL_REGEX = re.compile(r'(https?://[^\s<>()]+)')
 UPDATE_CONTEXT = {}
+ACCESSKIT_COMPAT_ENABLED = (sys.platform == 'darwin')
 
 def _resource_roots():
     roots = [os.getcwd()]
@@ -63,6 +64,61 @@ def _coerce_directory_user(entry, default_server="Current Server"):
         "is_blocked": is_blocked,
         "server": str(entry.get("server") or default_server),
     }
+
+def _derive_accessible_name(ctrl):
+    label = ""
+    try:
+        if hasattr(ctrl, "GetLabel"):
+            label = (ctrl.GetLabel() or "").strip()
+    except Exception:
+        label = ""
+    if label:
+        return label.replace("&", "")
+    try:
+        if isinstance(ctrl, wx.TextCtrl):
+            return "Text input"
+        if isinstance(ctrl, wx.ListCtrl):
+            return "List view"
+        if isinstance(ctrl, wx.Choice):
+            return "Selection list"
+        if isinstance(ctrl, wx.Notebook):
+            return "Tabbed panel"
+    except Exception:
+        pass
+    return ctrl.__class__.__name__
+
+def apply_accesskit_compat(root, context=""):
+    # wxWidgets does not expose native AccessKit directly; this compatibility
+    # pass improves macOS accessibility metadata in a centralized way.
+    if not ACCESSKIT_COMPAT_ENABLED:
+        return
+    try:
+        queue = [root]
+        seen = set()
+        while queue:
+            node = queue.pop(0)
+            if id(node) in seen:
+                continue
+            seen.add(id(node))
+            try:
+                name = _derive_accessible_name(node)
+                if hasattr(node, "GetName") and hasattr(node, "SetName"):
+                    current_name = (node.GetName() or "").strip()
+                    if not current_name and name:
+                        node.SetName(name)
+                if hasattr(node, "GetHelpText") and hasattr(node, "SetHelpText"):
+                    current_help = (node.GetHelpText() or "").strip()
+                    if not current_help:
+                        hint = f"{name}. {context}" if context else name
+                        node.SetHelpText(hint.strip())
+            except Exception:
+                pass
+            try:
+                queue.extend(node.GetChildren())
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"Accessibility compatibility pass failed: {e}")
 if sys.platform == 'win32':
     from winotify import Notification as _WinNotification
 else:
@@ -682,6 +738,7 @@ class SettingsDialog(wx.Dialog):
             cancel_btn.SetBackgroundColour(dark_color); cancel_btn.SetForegroundColour(light_text_color)
             
         btn_sizer.AddButton(ok_btn); btn_sizer.AddButton(cancel_btn); btn_sizer.Realize(); main_sizer.Add(btn_sizer, 0, wx.ALIGN_CENTER | wx.ALL, 10); panel.SetSizer(main_sizer)
+        apply_accesskit_compat(self, "Settings dialog")
     def on_key(self, event):
         if event.GetKeyCode() == wx.WXK_F1:
             open_help_docs_for_context("settings", self)
@@ -722,6 +779,7 @@ class StatusDialog(wx.Dialog):
             cancel_btn.SetBackgroundColour(self.dark_color); cancel_btn.SetForegroundColour(self.light_text_color)
         btn_sizer.AddButton(ok_btn); btn_sizer.AddButton(cancel_btn); btn_sizer.Realize()
         s.Add(btn_sizer, 0, wx.ALIGN_CENTER | wx.ALL, 10); panel.SetSizer(s)
+        apply_accesskit_compat(self, "Status dialog")
         if not is_custom: self.sizer.Hide(self.custom_box)
         self.panel.Layout()
         self.SetSize((350, 220 if is_custom else 150))
@@ -1220,6 +1278,7 @@ class VerificationDialog(wx.Dialog):
             ok_btn.SetBackgroundColour(dark_color); ok_btn.SetForegroundColour(light_text_color); cancel_btn.SetBackgroundColour(dark_color); cancel_btn.SetForegroundColour(light_text_color)
             
         btn_sizer.AddButton(ok_btn); btn_sizer.AddButton(cancel_btn); btn_sizer.Realize(); s.Add(btn_sizer, 0, wx.ALIGN_CENTER | wx.ALL, 10); panel.SetSizer(s)
+        apply_accesskit_compat(self, "Verification dialog")
 
 class ForgotPasswordDialog(wx.Dialog):
     def __init__(self, parent):
@@ -1252,6 +1311,7 @@ class ForgotPasswordDialog(wx.Dialog):
                 if isinstance(c, (wx.TextCtrl, wx.Button)): c.SetBackgroundColour(self.dark_color)
 
         panel.SetSizer(self.sizer)
+        apply_accesskit_compat(self, "Forgot password dialog")
 
     def on_request(self, e):
         ident = self.email_txt.GetValue().strip()
@@ -1307,6 +1367,7 @@ class CreateAccountDialog(wx.Dialog):
         s.Add(user_box, 0, wx.EXPAND | wx.ALL, 5); s.Add(email_box, 0, wx.EXPAND | wx.ALL, 5); s.Add(pass_box, 0, wx.EXPAND | wx.ALL, 5); s.Add(confirm_box, 0, wx.EXPAND | wx.ALL, 5)
         s.Add(self.autologin_cb, 0, wx.ALL, 10)
         btn_sizer.AddButton(ok_btn); btn_sizer.AddButton(cancel_btn); btn_sizer.Realize(); s.Add(btn_sizer, 0, wx.ALIGN_CENTER | wx.ALL, 5); panel.SetSizer(s)
+        apply_accesskit_compat(self, "Create account dialog")
     
     def on_create(self, event):
         u = self.u_text.GetValue().strip(); p1 = self.p1_text.GetValue(); p2 = self.p2_text.GetValue()
@@ -1360,6 +1421,7 @@ class ServerManagerDialog(wx.Dialog):
         s.Add(btn_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
 
         panel.SetSizer(s)
+        apply_accesskit_compat(self, "Server manager dialog")
 
     def _refresh_list(self):
         self.list.DeleteAllItems()
@@ -1495,6 +1557,7 @@ class LoginDialog(wx.Dialog):
         s.Add(btn_sizer, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 5)
         s.Add(forgot_btn, 0, wx.ALIGN_CENTER | wx.ALL, 5)
         self.p.Bind(wx.EVT_TEXT_ENTER, self.on_login); panel.SetSizer(s); self.on_check_remember(None)
+        apply_accesskit_compat(self, "Login dialog")
 
     def populate_server_choice(self):
         self.server_choice.Clear()
@@ -1665,6 +1728,7 @@ class ServerInfoDialog(wx.Dialog):
         if dark_mode_on:
             btn.SetBackgroundColour(dark_color); btn.SetForegroundColour(light_text_color)
         s.Add(self.lv, 1, wx.EXPAND | wx.ALL, 5); s.Add(btn, 0, wx.ALIGN_CENTER | wx.ALL, 5); self.SetSizer(s)
+        apply_accesskit_compat(self, "Server information dialog")
         self.Bind(wx.EVT_CHAR_HOOK, self.on_key)
     def on_key(self, event):
         if event.GetKeyCode() == wx.WXK_F1:
@@ -1738,6 +1802,7 @@ class UserDirectoryDialog(wx.Dialog):
         self.Bind(wx.EVT_CLOSE, self.on_close)
         self._populate_server_filter()
         self._populate_all_tabs(); self.update_button_states()
+        apply_accesskit_compat(self, "User directory dialog")
     def _get_active_list(self):
         page = self.notebook.GetSelection()
         return self.notebook.GetPage(page) if page != wx.NOT_FOUND else None
@@ -1960,6 +2025,7 @@ class MainFrame(wx.Frame):
         gs_util = wx.GridSizer(1, 8, 5, 5); gs_util.Add(self.btn_info, 0, wx.EXPAND); gs_util.Add(self.btn_status, 0, wx.EXPAND); gs_util.Add(self.btn_directory, 0, wx.EXPAND); gs_util.Add(self.btn_admin, 0, wx.EXPAND); gs_util.Add(self.btn_settings, 0, wx.EXPAND); gs_util.Add(self.btn_update, 0, wx.EXPAND); gs_util.Add(self.btn_logout, 0, wx.EXPAND); gs_util.Add(self.btn_exit, 0, wx.EXPAND)
         s = wx.BoxSizer(wx.VERTICAL); s.Add(box_contacts, 1, wx.EXPAND|wx.ALL, 5); s.Add(gs_main, 0, wx.CENTER|wx.ALL, 5); s.Add(gs_util, 0, wx.CENTER|wx.ALL, 5); panel.SetSizer(s)
         self.update_button_states()
+        apply_accesskit_compat(self, "Main application window")
     def on_settings(self, event):
         app = wx.GetApp()
         with SettingsDialog(self, app.user_config) as dlg:
@@ -2330,6 +2396,7 @@ class AdminDialog(wx.Dialog):
         btn.Bind(wx.EVT_BUTTON, self.on_send)
         s.Add(btn_row, 0, wx.EXPAND|wx.LEFT|wx.RIGHT|wx.BOTTOM, 5)
         self.SetSizer(s)
+        apply_accesskit_compat(self, "Admin commands dialog")
     def on_key(self, event):
         if event.GetKeyCode() == wx.WXK_F1:
             open_help_docs_for_context("admin", self)
@@ -2495,6 +2562,7 @@ class ChatDialog(wx.Dialog):
         btn_sizer.Add(btn_file, 1, wx.EXPAND | wx.ALL, 5)
         s.Add(btn_sizer, 0, wx.EXPAND|wx.ALL, 5)
         self.SetSizer(s)
+        apply_accesskit_compat(self, "Chat dialog")
     def on_toggle_save(self, event):
         app = wx.GetApp(); is_enabled = self.save_hist_cb.IsChecked()
         if 'chat_logging' not in app.user_config: app.user_config['chat_logging'] = {}
