@@ -642,6 +642,30 @@ def handle_client(cs, addr):
                 with lock: client_statuses[user] = status_text
                 broadcast_contact_status(user, True)
 
+            elif action == "change_password":
+                cur_pass = msg.get("current_pass", "")
+                new_pass = msg.get("new_pass", "")
+                if not cur_pass or not new_pass:
+                    sock.sendall((json.dumps({"action": "change_password_result", "ok": False, "reason": "Missing fields."}) + "\n").encode())
+                else:
+                    con = sqlite3.connect(DB)
+                    row = con.execute("SELECT password FROM users WHERE username=?", (user,)).fetchone()
+                    stored = row[0] if row else None
+                    ok = False
+                    if stored:
+                        if stored.startswith("$argon2"):
+                            try: _ph.verify(stored, cur_pass); ok = True
+                            except (VerifyMismatchError, VerificationError, InvalidHashError): pass
+                        else:
+                            ok = (stored == cur_pass)
+                    if ok:
+                        con.execute("UPDATE users SET password=? WHERE username=?", (_ph.hash(new_pass), user))
+                        con.commit(); con.close()
+                        sock.sendall((json.dumps({"action": "change_password_result", "ok": True}) + "\n").encode())
+                    else:
+                        con.close()
+                        sock.sendall((json.dumps({"action": "change_password_result", "ok": False, "reason": "Current password is incorrect."}) + "\n").encode())
+
             elif action == "logout": break
     except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
         pass
