@@ -1,7 +1,20 @@
-import wx, socket, json, threading, datetime, wx.adv, configparser, ssl, sys, os, base64, uuid, subprocess, tempfile, re
+import wx, socket, json, threading, datetime, wx.adv, configparser, ssl, sys, os, base64, uuid, subprocess, tempfile, re, time
 import keyring
 
-VERSION_TAG = "v2026-alpha14"
+try:
+    from accessible_output2.outputs.auto import Auto as _AO2Auto
+    _ao2 = _AO2Auto()
+    _ao2_available = True
+except Exception:
+    _ao2 = None
+    _ao2_available = False
+
+def speak(text):
+    if _ao2_available and _ao2:
+        try: _ao2.speak(text, interrupt=True)
+        except Exception: pass
+
+VERSION_TAG = "v2026-alpha15"
 
 # Constants
 MAX_CACHED_MESSAGES_PER_CONTACT = 100
@@ -11,8 +24,29 @@ if sys.platform == 'win32':
 else:
     from plyer import notification as _plyer_notification
 
-def show_notification(title, message, timeout=5):
+# Initialize accessible_output2 for speech feedback
+try:
+    from accessible_output2.outputs.auto import Auto as _SpeechOutput
+    _speech = _SpeechOutput()
+except Exception as e:
+    print(f"Could not initialize speech output: {e}")
+    _speech = None
+
+def speak_message(message):
+    """Speak a message using accessible_output2 if speech feedback is enabled."""
     try:
+        if _speech and wx.GetApp() and wx.GetApp().user_config.get('speech_feedback', False):
+            _speech.speak(message, interrupt=False)
+    except Exception as e:
+        print(f"Error speaking message: {e}")
+
+def show_notification(title, message, timeout=5):
+    """Show OS notification if enabled in user preferences."""
+    try:
+        # Check if notifications are enabled in user config
+        if wx.GetApp() and not wx.GetApp().user_config.get('show_notifications', True):
+            return
+        
         if sys.platform == 'win32':
             toast = _WinNotification(app_id="Thrive Messenger", title=title, msg=message, duration="short")
             toast.show()
@@ -77,6 +111,8 @@ def load_server_config():
         'host': config.get('server', 'host', fallback='msg.thecubed.cc'),
         'port': config.getint('server', 'port', fallback=2005),
         'cafile': config.get('server', 'cafile', fallback=None),
+        'max_retries': config.getint('server', 'max_retries', fallback=5),
+        'retry_timeout': config.getint('server', 'retry_timeout', fallback=15),
     }
 
 def get_config_dir():
@@ -116,7 +152,10 @@ def load_user_config():
         'username': '',
         'password': '',
         'soundpack': 'default',
+        'speech_feedback': False,
+        'show_notifications': True,
         'chat_logging': {},
+        'tts_enabled': False,
         'message_cache': {},
         'use_local_time': True
     }
@@ -176,6 +215,47 @@ def save_user_config(settings):
             except Exception as e:
                 # Password might not exist, ignore
                 pass
+
+def get_conversations_path(username):
+    return os.path.join(get_config_dir(), f'conversations_{username}.json')
+
+def load_noncontact_senders(username):
+    path = get_conversations_path(username)
+    try:
+        with open(path, 'r') as f:
+            return set(json.load(f))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return set()
+
+def save_noncontact_senders(username, senders):
+    try:
+        with open(get_conversations_path(username), 'w') as f:
+            json.dump(sorted(senders), f)
+    except OSError as e:
+        print(f"Could not save conversations: {e}")
+
+def get_noncontact_chat_path(my_username, contact):
+    path = os.path.join(get_config_dir(), 'noncontact_messages', my_username)
+    os.makedirs(path, exist_ok=True)
+    return os.path.join(path, f'{contact}.json')
+
+def load_noncontact_messages(my_username, contact):
+    try:
+        with open(get_noncontact_chat_path(my_username, contact), 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return []
+
+def save_noncontact_messages(my_username, contact, messages):
+    try:
+        with open(get_noncontact_chat_path(my_username, contact), 'w', encoding='utf-8') as f:
+            json.dump(messages, f)
+    except OSError as e:
+        print(f"Could not save messages: {e}")
+
+def delete_noncontact_messages(my_username, contact):
+    try: os.remove(get_noncontact_chat_path(my_username, contact))
+    except OSError: pass
 
 SERVER_CONFIG = load_server_config()
 ADDR = (SERVER_CONFIG['host'], SERVER_CONFIG['port'])
@@ -280,7 +360,7 @@ class ThriveTaskBarIcon(wx.adv.TaskBarIcon):
 
 class SettingsDialog(wx.Dialog):
     def __init__(self, parent, current_config):
-        super().__init__(parent, title="Settings", size=(300, 200)); self.config = current_config
+        super().__init__(parent, title="Settings", size=(300, 350)); self.config = current_config
         panel = wx.Panel(self); main_sizer = wx.BoxSizer(wx.VERTICAL); sound_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "&Sound Pack")
         
         dark_mode_on = is_windows_dark_mode()
@@ -301,22 +381,160 @@ class SettingsDialog(wx.Dialog):
         
         sound_box.Add(self.choice, 0, wx.EXPAND | wx.ALL, 5); main_sizer.Add(sound_box, 0, wx.EXPAND | wx.ALL, 5)
         
-        # Add timezone checkbox
+        # Add wx.ListCtrl with checkboxes for notification options from PR #2
+        notification_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "&Notification Options")
+        if dark_mode_on:
+            notification_box.GetStaticBox().SetForegroundColour(light_text_color)
+            notification_box.GetStaticBox().SetBackgroundColour(dark_color)
+        
+        # Create ListCtrl with checkboxes
+        self.notification_list = wx.ListCtrl(panel, style=wx.LC_REPORT | wx.LC_NO_HEADER | wx.LC_SINGLE_SEL)
+        self.notification_list.EnableCheckBoxes(True)
+        
+        # Add a single column to the list
+        self.notification_list.InsertColumn(0, "Option")
+        
+        # Add notification options as list items
+        self.notification_list.InsertItem(0, "Speech feedback for online/offline status")
+        self.notification_list.InsertItem(1, "Show OS notifications")
+        
+        # Set initial checked states from config
+        self.notification_list.CheckItem(0, self.config.get('speech_feedback', False))
+        self.notification_list.CheckItem(1, self.config.get('show_notifications', True))
+        
+        # Auto-size the column to fit content
+        self.notification_list.SetColumnWidth(0, wx.LIST_AUTOSIZE)
+        
+        # Apply dark mode styling to ListCtrl
+        if dark_mode_on:
+            self.notification_list.SetBackgroundColour(dark_color)
+            self.notification_list.SetForegroundColour(light_text_color)
+        
+        # Add ListCtrl to the notification box
+        notification_box.Add(self.notification_list, 1, wx.EXPAND | wx.ALL, 5)
+        main_sizer.Add(notification_box, 1, wx.EXPAND | wx.ALL, 5)
+        
+        # Add TTS checkbox from PR #2
+        self.tts_cb = wx.CheckBox(panel, label="&Read new messages aloud")
+        self.tts_cb.SetValue(self.config.get('tts_enabled', False))
+        if not _ao2_available:
+            self.tts_cb.Enable(False)
+            self.tts_cb.SetToolTip("accessible_output2 is not installed")
+        
+        if dark_mode_on:
+            self.tts_cb.SetBackgroundColour(dark_color)
+            self.tts_cb.SetForegroundColour(light_text_color)
+        
+        main_sizer.Add(self.tts_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        
+        # Add timezone checkbox from my branch
         self.use_local_time_cb = wx.CheckBox(panel, label="Use &local computer time for messages")
         self.use_local_time_cb.SetValue(self.config.get('use_local_time', True))
         if dark_mode_on:
             self.use_local_time_cb.SetForegroundColour(light_text_color); self.use_local_time_cb.SetBackgroundColour(dark_color)
         main_sizer.Add(self.use_local_time_cb, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         
+        # Add Change Password button from PR #2
+        self.btn_chpass = wx.Button(panel, label="C&hange Password...")
+        self.btn_chpass.Bind(wx.EVT_BUTTON, self.on_change_password)
+        
+        if dark_mode_on:
+            self.btn_chpass.SetBackgroundColour(dark_color)
+            self.btn_chpass.SetForegroundColour(light_text_color)
+        
+        main_sizer.Add(self.btn_chpass, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        
         btn_sizer = wx.StdDialogButtonSizer()
         ok_btn = wx.Button(panel, wx.ID_OK, label="&Apply"); ok_btn.SetDefault(); cancel_btn = wx.Button(panel, wx.ID_CANCEL)
         
         if dark_mode_on:
             self.choice.SetBackgroundColour(dark_color); self.choice.SetForegroundColour(light_text_color)
+            self.tts_cb.SetForegroundColour(light_text_color); self.tts_cb.SetBackgroundColour(dark_color)
+            self.btn_chpass.SetBackgroundColour(dark_color); self.btn_chpass.SetForegroundColour(light_text_color)
             ok_btn.SetBackgroundColour(dark_color); ok_btn.SetForegroundColour(light_text_color)
             cancel_btn.SetBackgroundColour(dark_color); cancel_btn.SetForegroundColour(light_text_color)
             
         btn_sizer.AddButton(ok_btn); btn_sizer.AddButton(cancel_btn); btn_sizer.Realize(); main_sizer.Add(btn_sizer, 0, wx.ALIGN_CENTER | wx.ALL, 10); panel.SetSizer(main_sizer)
+
+    def on_change_password(self, _):
+        with ChangePasswordDialog(self) as dlg:
+            if dlg.ShowModal() == wx.ID_OK:
+                cur = dlg.cur_ctrl.GetValue(); new = dlg.new_ctrl.GetValue()
+                frame = self.GetParent()
+                try: frame.sock.sendall((json.dumps({"action": "change_password", "current_pass": cur, "new_pass": new}) + "\n").encode())
+                except Exception as e: wx.MessageBox(f"Failed to send request: {e}", "Error", wx.ICON_ERROR)
+
+class ReconnectDialog(wx.Dialog):
+    def __init__(self):
+        super().__init__(None, title="Connection Lost", style=wx.DEFAULT_DIALOG_STYLE | wx.STAY_ON_TOP)
+        self.cancelled = False
+        panel = wx.Panel(self); sizer = wx.BoxSizer(wx.VERTICAL)
+
+        dark_mode_on = is_windows_dark_mode()
+        if dark_mode_on:
+            dark_color = wx.Colour(40, 40, 40); light_text_color = wx.WHITE
+            WxMswDarkMode().enable(self); self.SetBackgroundColour(dark_color); panel.SetBackgroundColour(dark_color)
+
+        self.status_label = wx.StaticText(panel, label="Connection to the server was lost.")
+        give_up_btn = wx.Button(panel, label="Give Up")
+        give_up_btn.Bind(wx.EVT_BUTTON, self.on_give_up)
+
+        if dark_mode_on:
+            self.status_label.SetForegroundColour(light_text_color); self.status_label.SetBackgroundColour(dark_color)
+            give_up_btn.SetBackgroundColour(dark_color); give_up_btn.SetForegroundColour(light_text_color)
+
+        sizer.Add(self.status_label, 0, wx.ALL, 15)
+        sizer.Add(give_up_btn, 0, wx.ALIGN_CENTER | wx.BOTTOM, 10)
+        panel.SetSizer(sizer); self.Fit(); self.Centre()
+
+    def set_status(self, text):
+        self.status_label.SetLabel(text); self.Layout(); self.Fit()
+
+    def on_give_up(self, _):
+        self.cancelled = True; self.EndModal(wx.ID_CANCEL)
+
+class ChangePasswordDialog(wx.Dialog):
+    def __init__(self, parent):
+        super().__init__(parent, title="Change Password", size=(300, 220))
+        panel = wx.Panel(self); sizer = wx.BoxSizer(wx.VERTICAL)
+        dark_mode_on = is_windows_dark_mode()
+        if dark_mode_on:
+            dark_color = wx.Colour(40, 40, 40); light_text_color = wx.WHITE
+            WxMswDarkMode().enable(self); self.SetBackgroundColour(dark_color); panel.SetBackgroundColour(dark_color)
+        cur_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "&Current Password")
+        self.cur_ctrl = wx.TextCtrl(cur_box.GetStaticBox(), style=wx.TE_PASSWORD)
+        new_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "&New Password")
+        self.new_ctrl = wx.TextCtrl(new_box.GetStaticBox(), style=wx.TE_PASSWORD)
+        conf_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "Con&firm New Password")
+        self.conf_ctrl = wx.TextCtrl(conf_box.GetStaticBox(), style=wx.TE_PASSWORD)
+        btn_sizer = wx.StdDialogButtonSizer()
+        ok_btn = wx.Button(panel, wx.ID_OK, label="&Change"); ok_btn.SetDefault()
+        cancel_btn = wx.Button(panel, wx.ID_CANCEL)
+        ok_btn.Bind(wx.EVT_BUTTON, self.on_ok)
+        if dark_mode_on:
+            for box in [cur_box, new_box, conf_box]:
+                box.GetStaticBox().SetForegroundColour(light_text_color); box.GetStaticBox().SetBackgroundColour(dark_color)
+            for ctrl in [self.cur_ctrl, self.new_ctrl, self.conf_ctrl]:
+                ctrl.SetBackgroundColour(dark_color); ctrl.SetForegroundColour(light_text_color)
+            ok_btn.SetBackgroundColour(dark_color); ok_btn.SetForegroundColour(light_text_color)
+            cancel_btn.SetBackgroundColour(dark_color); cancel_btn.SetForegroundColour(light_text_color)
+        cur_box.Add(self.cur_ctrl, 0, wx.EXPAND | wx.ALL, 5)
+        new_box.Add(self.new_ctrl, 0, wx.EXPAND | wx.ALL, 5)
+        conf_box.Add(self.conf_ctrl, 0, wx.EXPAND | wx.ALL, 5)
+        sizer.Add(cur_box, 0, wx.EXPAND | wx.ALL, 5)
+        sizer.Add(new_box, 0, wx.EXPAND | wx.ALL, 5)
+        sizer.Add(conf_box, 0, wx.EXPAND | wx.ALL, 5)
+        btn_sizer.AddButton(ok_btn); btn_sizer.AddButton(cancel_btn); btn_sizer.Realize()
+        sizer.Add(btn_sizer, 0, wx.ALIGN_CENTER | wx.ALL, 5)
+        panel.SetSizer(sizer)
+    def on_ok(self, _):
+        if not self.cur_ctrl.GetValue():
+            wx.MessageBox("Please enter your current password.", "Error", wx.ICON_ERROR); return
+        if not self.new_ctrl.GetValue():
+            wx.MessageBox("Please enter a new password.", "Error", wx.ICON_ERROR); return
+        if self.new_ctrl.GetValue() != self.conf_ctrl.GetValue():
+            wx.MessageBox("New passwords do not match.", "Error", wx.ICON_ERROR); return
+        self.EndModal(wx.ID_OK)
 
 STATUS_PRESETS = ["online", "offline", "busy", "away", "on the phone", "doing homework", "in the shower", "watching TV", "hiding from the parents", "fixing my PC", "battery about to die"]
 
@@ -1107,6 +1325,12 @@ class MainFrame(wx.Frame):
         with SettingsDialog(self, app.user_config) as dlg:
             if dlg.ShowModal() == wx.ID_OK:
                 selected_pack = dlg.choice.GetStringSelection(); app.user_config['soundpack'] = selected_pack
+                # Get checked states from ListCtrl (PR #2 features)
+                app.user_config['speech_feedback'] = dlg.notification_list.IsItemChecked(0)
+                app.user_config['show_notifications'] = dlg.notification_list.IsItemChecked(1)
+                # Get TTS setting from PR #2
+                app.user_config['tts_enabled'] = dlg.tts_cb.IsChecked()
+                # Get timezone setting from my branch
                 app.user_config['use_local_time'] = dlg.use_local_time_cb.IsChecked()
                 save_user_config(app.user_config)
                 wx.MessageBox("Settings have been applied.", "Settings Saved", wx.OK | wx.ICON_INFORMATION)

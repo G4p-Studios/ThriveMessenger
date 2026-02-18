@@ -1,6 +1,9 @@
 import sqlite3, threading, socket, json, datetime, sys, configparser, ssl, os, uuid, base64, time
-import smtplib, random, string
+import smtplib, secrets
 from email.mime.text import MIMEText
+from argon2 import PasswordHasher
+from argon2.exceptions import VerifyMismatchError, VerificationError, InvalidHashError
+_ph = PasswordHasher()
 
 DB = 'thrive.db'
 ADMIN_FILE = 'admins.txt'
@@ -36,8 +39,39 @@ class EmailManager:
             return False
 
     @staticmethod
-    def generate_code(length=6):
-        return ''.join(random.choices(string.digits, k=length))
+    def generate_code():
+        return secrets.token_hex(16)  # 32-char hex, 128-bit entropy
+
+# In-memory rate limiting (resets on server restart)
+_email_send_times = {}   # email -> [unix_timestamp, ...]
+_code_fail_times  = {}   # username -> [unix_timestamp, ...]
+_MAIL_LIMIT       = 3    # max outbound emails per address per hour
+_MAIL_WINDOW      = 3600
+_CODE_FAIL_LIMIT  = 10   # max wrong code attempts per username per hour
+_CODE_FAIL_WINDOW = 3600
+
+def _email_allowed(email):
+    """Return True if another email may be sent to this address, else False."""
+    now = time.time()
+    times = [t for t in _email_send_times.get(email, []) if now - t < _MAIL_WINDOW]
+    if len(times) >= _MAIL_LIMIT:
+        _email_send_times[email] = times; return False
+    times.append(now); _email_send_times[email] = times; return True
+
+def _code_attempts_ok(username):
+    """Return True if the user has not exceeded the failed-attempt limit."""
+    now = time.time()
+    fails = [t for t in _code_fail_times.get(username, []) if now - t < _CODE_FAIL_WINDOW]
+    _code_fail_times[username] = fails
+    return len(fails) < _CODE_FAIL_LIMIT
+
+def _record_code_fail(username):
+    now = time.time()
+    fails = [t for t in _code_fail_times.get(username, []) if now - t < _CODE_FAIL_WINDOW]
+    fails.append(now); _code_fail_times[username] = fails
+
+def _clear_code_fails(username):
+    _code_fail_times.pop(username, None)
 
 def get_admins():
     try:
@@ -117,9 +151,11 @@ def init_db():
     if 'verification_code' not in existing_cols: cur.execute("ALTER TABLE users ADD COLUMN verification_code TEXT")
     if 'is_verified' not in existing_cols: cur.execute("ALTER TABLE users ADD COLUMN is_verified INTEGER DEFAULT 1") # Default 1 for old users
     if 'reset_code' not in existing_cols: cur.execute("ALTER TABLE users ADD COLUMN reset_code TEXT")
+    if 'code_expires' not in existing_cols: cur.execute("ALTER TABLE users ADD COLUMN code_expires TEXT")
 
     cur.execute('''CREATE TABLE IF NOT EXISTS contacts (owner TEXT, contact TEXT, blocked INTEGER DEFAULT 0, PRIMARY KEY(owner, contact))''')
     cur.execute('''CREATE TABLE IF NOT EXISTS file_bans (username TEXT, file_type TEXT, until_date TEXT, reason TEXT, PRIMARY KEY(username, file_type))''')
+    cur.execute('''CREATE TABLE IF NOT EXISTS offline_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, recipient TEXT NOT NULL, sender TEXT NOT NULL, message TEXT NOT NULL, timestamp TEXT NOT NULL)''')
     # Add file_type column if table was created with an older schema
     fb_cols = [row[1] for row in cur.execute("PRAGMA table_info(file_bans)")]
     if 'file_type' not in fb_cols: cur.execute("ALTER TABLE file_bans ADD COLUMN file_type TEXT")
@@ -170,34 +206,48 @@ def handle_client(cs, addr):
             new_user = req.get("user")
             new_pass = req.get("pass")
             email = req.get("email", "")
-            if not new_user or not new_pass: 
+            if not new_user or not new_pass:
                 sock.sendall((json.dumps({"action": "create_account_failed", "reason": "Missing fields."}) + "\n").encode())
                 return
-            
+
             con = sqlite3.connect(DB)
-            row = con.execute("SELECT is_verified FROM users WHERE username=?", (new_user,)).fetchone()
-            
-            # Allow overwriting unverified users
+            row = con.execute("SELECT is_verified FROM users WHERE LOWER(username)=LOWER(?)", (new_user,)).fetchone()
+
+            # Allow overwriting unverified users only
             if row and (row[0] == 1 or not smtp_config['enabled']):
                 sock.sendall((json.dumps({"action": "create_account_failed", "reason": "Username is already taken."}) + "\n").encode())
                 con.close(); return
-            
-            # Logic: If SMTP is on, set verified=0, gen code, send email. Else verified=1.
+
+            new_pass = _ph.hash(new_pass)
             verified = 1 if not smtp_config['enabled'] else 0
-            code = EmailManager.generate_code() if not verified else None
-            
-            if row: # Overwriting unverified
-                con.execute("UPDATE users SET password=?, email=?, verification_code=?, is_verified=? WHERE username=?", (new_pass, email, code, verified, new_user))
+            code = None; expires = None
+
+            if not verified:
+                # Block registration with an email already owned by a verified account
+                if email:
+                    taken = con.execute("SELECT 1 FROM users WHERE LOWER(email)=LOWER(?) AND is_verified=1", (email,)).fetchone()
+                    if taken:
+                        sock.sendall((json.dumps({"action": "create_account_failed", "reason": "Email is already in use."}) + "\n").encode())
+                        con.close(); return
+                # Rate-limit outbound verification emails per address
+                if not _email_allowed(email or new_user):
+                    sock.sendall((json.dumps({"action": "create_account_failed", "reason": "Too many verification attempts. Try again later."}) + "\n").encode())
+                    con.close(); return
+                code = EmailManager.generate_code()
+                expires = (datetime.datetime.utcnow() + datetime.timedelta(hours=1)).isoformat()
+
+            if row:  # Overwriting unverified
+                con.execute("UPDATE users SET password=?, email=?, verification_code=?, is_verified=?, code_expires=? WHERE username=?",
+                            (new_pass, email, code, verified, expires, new_user))
             else:
-                con.execute("INSERT INTO users(username, password, email, verification_code, is_verified) VALUES(?,?,?,?,?)", (new_user, new_pass, email, code, verified))
-            con.commit()
-            con.close()
+                con.execute("INSERT INTO users(username, password, email, verification_code, is_verified, code_expires) VALUES(?,?,?,?,?,?)",
+                            (new_user, new_pass, email, code, verified, expires))
+            con.commit(); con.close()
 
             if not verified:
                 if EmailManager.send_email(email, "Thrive Messenger - Verify Account", f"Your verification code is: {code}"):
                     sock.sendall((json.dumps({"action": "verify_pending"}) + "\n").encode())
                 else:
-                    # Fallback if email fails? For now just say success but maybe log it.
                     print("Failed to send verification email.")
                     sock.sendall((json.dumps({"action": "create_account_failed", "reason": "Could not send verification email."}) + "\n").encode())
             else:
@@ -208,36 +258,45 @@ def handle_client(cs, addr):
         if action == "verify_account":
             u_ver = req.get("user")
             code_ver = req.get("code")
+            if not _code_attempts_ok(u_ver):
+                sock.sendall(json.dumps({"status": "error", "reason": "Too many failed attempts. Try again later."}).encode() + b"\n")
+                return
             con = sqlite3.connect(DB)
-            row = con.execute("SELECT verification_code FROM users WHERE username=?", (u_ver,)).fetchone()
-            if row and row[0] == code_ver:
-                con.execute("UPDATE users SET is_verified=1, verification_code=NULL WHERE username=?", (u_ver,))
-                con.commit(); con.close()
-                sock.sendall(json.dumps({"status": "ok"}).encode() + b"\n")
+            row = con.execute("SELECT verification_code, code_expires FROM users WHERE username=?", (u_ver,)).fetchone()
+            if row and row[0] and row[0] == code_ver:
+                if row[1] and datetime.datetime.utcnow().isoformat() > row[1]:
+                    con.close(); _record_code_fail(u_ver)
+                    sock.sendall(json.dumps({"status": "error", "reason": "Code has expired. Please register again."}).encode() + b"\n")
+                else:
+                    con.execute("UPDATE users SET is_verified=1, verification_code=NULL, code_expires=NULL WHERE username=?", (u_ver,))
+                    con.commit(); con.close(); _clear_code_fails(u_ver)
+                    sock.sendall(json.dumps({"status": "ok"}).encode() + b"\n")
             else:
-                con.close()
-                sock.sendall(json.dumps({"status": "error", "reason": "Invalid code"}).encode() + b"\n")
+                con.close(); _record_code_fail(u_ver)
+                sock.sendall(json.dumps({"status": "error", "reason": "Invalid code."}).encode() + b"\n")
             return
 
         # --- Request Password Reset ---
         if action == "request_reset":
             ident = req.get("identifier")
             con = sqlite3.connect(DB)
-            # Find user by email or username
             row = con.execute("SELECT username, email FROM users WHERE username=? OR email=?", (ident, ident)).fetchone()
             if row:
                 t_user, t_email = row
                 if t_email:
+                    if not _email_allowed(t_email):
+                        con.close()
+                        sock.sendall(json.dumps({"status": "error", "reason": "Too many reset attempts. Try again later."}).encode() + b"\n")
+                        return
                     code = EmailManager.generate_code()
-                    con.execute("UPDATE users SET reset_code=? WHERE username=?", (code, t_user))
+                    expires = (datetime.datetime.utcnow() + datetime.timedelta(hours=1)).isoformat()
+                    con.execute("UPDATE users SET reset_code=?, code_expires=? WHERE username=?", (code, expires, t_user))
                     con.commit()
                     EmailManager.send_email(t_email, "Thrive Messenger - Password Reset", f"Your password reset code is: {code}")
-                    # Return OK even if email fails to prevent enumeration, mostly.
                     sock.sendall(json.dumps({"status": "ok", "user": t_user}).encode() + b"\n")
                 else:
                     sock.sendall(json.dumps({"status": "error", "reason": "No email on file."}).encode() + b"\n")
             else:
-                # Security: Don't reveal user existence? For this app, we'll just say ok to pretend.
                 sock.sendall(json.dumps({"status": "ok"}).encode() + b"\n")
             con.close()
             return
@@ -247,15 +306,22 @@ def handle_client(cs, addr):
             t_user = req.get("user")
             t_code = req.get("code")
             new_p = req.get("new_pass")
+            if not _code_attempts_ok(t_user):
+                sock.sendall(json.dumps({"status": "error", "reason": "Too many failed attempts. Try again later."}).encode() + b"\n")
+                return
             con = sqlite3.connect(DB)
-            row = con.execute("SELECT reset_code FROM users WHERE username=?", (t_user,)).fetchone()
-            if row and row[0] == t_code and t_code:
-                con.execute("UPDATE users SET password=?, reset_code=NULL WHERE username=?", (new_p, t_user))
-                con.commit(); con.close()
-                sock.sendall(json.dumps({"status": "ok"}).encode() + b"\n")
+            row = con.execute("SELECT reset_code, code_expires FROM users WHERE username=?", (t_user,)).fetchone()
+            if row and row[0] and row[0] == t_code:
+                if row[1] and datetime.datetime.utcnow().isoformat() > row[1]:
+                    con.close(); _record_code_fail(t_user)
+                    sock.sendall(json.dumps({"status": "error", "reason": "Code has expired."}).encode() + b"\n")
+                else:
+                    con.execute("UPDATE users SET password=?, reset_code=NULL, code_expires=NULL WHERE username=?", (_ph.hash(new_p), t_user))
+                    con.commit(); con.close(); _clear_code_fails(t_user)
+                    sock.sendall(json.dumps({"status": "ok"}).encode() + b"\n")
             else:
-                con.close()
-                sock.sendall(json.dumps({"status": "error", "reason": "Invalid code"}).encode() + b"\n")
+                con.close(); _record_code_fail(t_user)
+                sock.sendall(json.dumps({"status": "error", "reason": "Invalid code."}).encode() + b"\n")
             return
 
         if action != "login": 
@@ -267,10 +333,23 @@ def handle_client(cs, addr):
         cur.execute("SELECT password,banned_until,ban_reason,is_verified FROM users WHERE username=?", (req["user"],))
         row = cur.fetchone()
         
-        if not row or row[0] != req["pass"]: 
+        stored, incoming = (row[0] if row else None), req["pass"]
+        password_ok = False; needs_rehash = False
+        if stored:
+            if stored.startswith("$argon2"):
+                try:
+                    _ph.verify(stored, incoming); password_ok = True
+                    if _ph.check_needs_rehash(stored): needs_rehash = True
+                except (VerifyMismatchError, VerificationError, InvalidHashError):
+                    pass
+            else:  # legacy plain-text — accept and rehash transparently
+                if stored == incoming: password_ok = True; needs_rehash = True
+        if not password_ok:
             sock.sendall(b'{"status":"error","reason":"Invalid credentials"}\n')
-            db.close()
-            return
+            db.close(); return
+        if needs_rehash:
+            db.execute("UPDATE users SET password=? WHERE username=?", (_ph.hash(incoming), req["user"]))
+            db.commit()
             
         bi, br, verified = row[1], row[2], row[3]
         
@@ -297,6 +376,12 @@ def handle_client(cs, addr):
         with lock:
             contacts = [{"user":c, "blocked":b, "online": (c in clients), "is_admin": (c in admins), "status_text": client_statuses.get(c, "offline") if c in clients else "offline"} for c,b in rows]
         sock.sendall((json.dumps({"action":"contact_list","contacts":contacts})+"\n").encode())
+        offline = db.execute("SELECT sender, message, timestamp FROM offline_messages WHERE recipient=? ORDER BY id ASC", (user,)).fetchall()
+        if offline:
+            msgs = [{"from": s, "msg": m, "time": t} for s, m, t in offline]
+            sock.sendall((json.dumps({"action": "offline_messages", "messages": msgs}) + "\n").encode())
+            db.execute("DELETE FROM offline_messages WHERE recipient=?", (user,))
+            db.commit()
         db.close()
         
         broadcast_contact_status(user, True)
@@ -363,9 +448,12 @@ def handle_client(cs, addr):
                         alert_message = " ".join(cmd_parts[1:])
                         broadcast_alert(alert_message)
                         response = "Alert sent to all online users."
-                    elif command == "create" and len(cmd_parts) == 3: 
-                        handle_create(cmd_parts[1], cmd_parts[2])
-                        response = f"User '{cmd_parts[1]}' created."
+                    elif command == "create" and len(cmd_parts) in (3, 4):
+                        email = cmd_parts[3] if len(cmd_parts) == 4 else ""
+                        if handle_create(cmd_parts[1], cmd_parts[2], email):
+                            response = f"User '{cmd_parts[1]}' created."
+                        else:
+                            response = f"Error: Username '{cmd_parts[1]}' is already taken."
                     elif command == "ban" and len(cmd_parts) >= 4: 
                         handle_ban(cmd_parts[1], cmd_parts[2], " ".join(cmd_parts[3:]))
                         response = f"User '{cmd_parts[1]}' banned."
@@ -430,30 +518,41 @@ def handle_client(cs, addr):
                 except: pass
 
             elif action == "msg":
-                to, frm = msg["to"], msg["from"]
+                to = msg["to"]
+                frm = user  # always use the authenticated identity; never trust client-supplied "from"
                 con = sqlite3.connect(DB)
                 recipient_has_blocked = con.execute("SELECT blocked FROM contacts WHERE owner=? AND contact=?", (to, frm)).fetchone()
                 sender_has_blocked = con.execute("SELECT blocked FROM contacts WHERE owner=? AND contact=?", (frm, to)).fetchone()
                 con.close()
-                
+
                 with lock: sock_to = clients.get(to)
-                if recipient_has_blocked and recipient_has_blocked[0] == 1: 
+                reason = None
+                if recipient_has_blocked and recipient_has_blocked[0] == 1:
                     reason = f"Message couldn't be sent because {to} has you blocked."
-                elif sender_has_blocked and sender_has_blocked[0] == 1: 
+                elif sender_has_blocked and sender_has_blocked[0] == 1:
                     reason = "You have blocked this contact."
-                elif not sock_to: 
-                    reason = f"{to} is offline."
+                elif not sock_to:
+                    con2 = sqlite3.connect(DB)
+                    con2.execute("INSERT INTO offline_messages (recipient, sender, message, timestamp) VALUES (?, ?, ?, ?)", (to, frm, msg["msg"], msg["time"]))
+                    con2.commit(); con2.close()
+                    reason = None
                 else:
-                    try: 
-                        sock_to.sendall((json.dumps(msg)+"\n").encode())
+                    try:
+                        outgoing = {"action": "msg", "from": frm, "to": to, "msg": msg["msg"], "time": msg["time"]}
+                        sock_to.sendall((json.dumps(outgoing) + "\n").encode())
                         reason = None
                     except: pass
-                if reason: 
+                if reason:
                     sock.sendall(json.dumps({"action": "msg_failed", "to": to, "reason": reason}).encode() + b"\n")
                     
             elif action == "file_offer":
                 to = msg["to"]
                 files = msg.get("files", [])
+                # Reject any filename containing a path separator (OS-independent check)
+                bad = next((f["filename"] for f in files if '/' in f["filename"] or '\\' in f["filename"]), None)
+                if bad:
+                    sock.sendall((json.dumps({"action": "file_offer_failed", "to": to, "reason": f"Invalid filename: '{bad}'"}) + "\n").encode())
+                    continue
 
                 # Check if recipient is online
                 with lock: sock_to = clients.get(to)
@@ -492,9 +591,10 @@ def handle_client(cs, addr):
                 if blocked: continue
 
                 # All checks passed, create transfer and forward offer
-                transfer_id = msg.get("transfer_id", str(uuid.uuid4()))
+                client_transfer_id = msg.get("transfer_id", "")  # echo back so sender can locate its pending files
+                transfer_id = str(uuid.uuid4())  # always server-generated; never trust client-supplied ID
                 with transfer_lock:
-                    pending_transfers[transfer_id] = {"from": user, "to": to, "files": files}
+                    pending_transfers[transfer_id] = {"from": user, "to": to, "files": files, "client_transfer_id": client_transfer_id}
 
                 try:
                     sock_to.sendall((json.dumps({"action": "file_offer", "from": user, "files": files, "transfer_id": transfer_id}) + "\n").encode())
@@ -509,7 +609,7 @@ def handle_client(cs, addr):
                 sender = transfer["from"]
                 with lock: sock_sender = clients.get(sender)
                 if sock_sender:
-                    try: sock_sender.sendall((json.dumps({"action": "file_accepted", "transfer_id": transfer_id, "to": transfer["to"], "files": transfer["files"]}) + "\n").encode())
+                    try: sock_sender.sendall((json.dumps({"action": "file_accepted", "transfer_id": transfer_id, "client_transfer_id": transfer.get("client_transfer_id", ""), "to": transfer["to"], "files": transfer["files"]}) + "\n").encode())
                     except: pass
 
             elif action == "file_decline":
@@ -519,23 +619,53 @@ def handle_client(cs, addr):
                 sender = transfer["from"]
                 with lock: sock_sender = clients.get(sender)
                 if sock_sender:
-                    try: sock_sender.sendall((json.dumps({"action": "file_declined", "transfer_id": transfer_id, "to": transfer["to"], "files": transfer["files"]}) + "\n").encode())
+                    try: sock_sender.sendall((json.dumps({"action": "file_declined", "transfer_id": transfer_id, "client_transfer_id": transfer.get("client_transfer_id", ""), "to": transfer["to"], "files": transfer["files"]}) + "\n").encode())
                     except: pass
 
             elif action == "file_data":
                 transfer_id = msg["transfer_id"]
-                with transfer_lock: transfer = pending_transfers.pop(transfer_id, None)
+                with transfer_lock: transfer = pending_transfers.get(transfer_id)
                 if not transfer: continue
+                if transfer["from"] != user: continue  # only the original sender may deliver data
+                with transfer_lock: pending_transfers.pop(transfer_id, None)
                 recipient = transfer["to"]
                 with lock: sock_to = clients.get(recipient)
                 if sock_to:
-                    try: sock_to.sendall((json.dumps({"action": "file_data", "from": transfer["from"], "files": msg["files"]}) + "\n").encode())
+                    # Use the filenames stored at offer time (already validated); ignore client-supplied names in data packet
+                    name_map = {f["filename"]: f["filename"] for f in transfer["files"]}
+                    safe_files = [dict(fd, filename=name_map.get(fd["filename"], fd["filename"])) for fd in msg["files"]
+                                  if '/' not in fd["filename"] and '\\' not in fd["filename"]]
+                    try: sock_to.sendall((json.dumps({"action": "file_data", "from": transfer["from"], "files": safe_files}) + "\n").encode())
                     except: pass
 
             elif action == "set_status":
                 status_text = msg.get("status_text", "online")[:max_status_length]
                 with lock: client_statuses[user] = status_text
                 broadcast_contact_status(user, True)
+
+            elif action == "change_password":
+                cur_pass = msg.get("current_pass", "")
+                new_pass = msg.get("new_pass", "")
+                if not cur_pass or not new_pass:
+                    sock.sendall((json.dumps({"action": "change_password_result", "ok": False, "reason": "Missing fields."}) + "\n").encode())
+                else:
+                    con = sqlite3.connect(DB)
+                    row = con.execute("SELECT password FROM users WHERE username=?", (user,)).fetchone()
+                    stored = row[0] if row else None
+                    ok = False
+                    if stored:
+                        if stored.startswith("$argon2"):
+                            try: _ph.verify(stored, cur_pass); ok = True
+                            except (VerifyMismatchError, VerificationError, InvalidHashError): pass
+                        else:
+                            ok = (stored == cur_pass)
+                    if ok:
+                        con.execute("UPDATE users SET password=? WHERE username=?", (_ph.hash(new_pass), user))
+                        con.commit(); con.close()
+                        sock.sendall((json.dumps({"action": "change_password_result", "ok": True}) + "\n").encode())
+                    else:
+                        con.close()
+                        sock.sendall((json.dumps({"action": "change_password_result", "ok": False, "reason": "Current password is incorrect."}) + "\n").encode())
 
             elif action == "logout": break
     except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
@@ -627,13 +757,17 @@ def serve_loop(config):
             import time
             time.sleep(1)
 
-def handle_create(user, password):
+def handle_create(user, password, email=""):
     con = sqlite3.connect(DB)
-    # Admin console creation defaults to verified
-    con.execute("INSERT OR IGNORE INTO users(username,password,is_verified) VALUES(?,?,1)",(user, password))
-    con.commit()
+    existing = con.execute("SELECT 1 FROM users WHERE LOWER(username)=LOWER(?)", (user,)).fetchone()
+    if not existing:
+        con.execute("INSERT INTO users(username,password,email,is_verified) VALUES(?,?,?,1)", (user, _ph.hash(password), email))
+        con.commit(); con.close()
+        print(f"User '{user}' created.")
+        return True
     con.close()
-    print(f"User '{user}' created or already exists.")
+    print(f"User '{user}' already exists (case-insensitive match).")
+    return False
 
 def handle_ban(user, date_str, reason):
     try: 
