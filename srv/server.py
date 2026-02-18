@@ -54,11 +54,19 @@ def _maybe_send_bot_reply(sender_sock, sender_user, to_user, text):
         return False
     lower = (text or "").strip().lower()
     if not lower:
-        reply = "I'm online and ready. Ask me anything."
-    elif lower in ("hi", "hello", "hey"):
-        reply = f"Hi {sender_user}, I'm {to_user}. I'm online."
+        reply = "I'm online and ready. Ask me for help, commands, or server status."
+    elif any(w in lower for w in ("hi", "hello", "hey")):
+        reply = f"Hi {sender_user}. I'm {to_user}. How can I help?"
+    elif "help" in lower:
+        reply = "You can ask me about status, contacts, file transfers, or admin features."
+    elif "status" in lower:
+        reply = "I can report server presence and room/user status where available."
+    elif "file" in lower:
+        reply = "File transfers are available from chat and user menus. Check File Transfers for history."
+    elif "admin" in lower:
+        reply = "Admin actions are available from Server Side Commands and admin menus, based on your role."
     else:
-        reply = f"{to_user}: I got your message: {text}"
+        reply = "Message received. Ask 'help' to see what I can do."
     payload = {
         "action": "msg",
         "from": to_user,

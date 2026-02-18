@@ -1,4 +1,6 @@
 import wx, socket, json, threading, datetime, wx.adv, configparser, ssl, sys, os, base64, uuid, subprocess, tempfile, re, random, shutil
+import urllib.request, urllib.parse
+import traceback, platform
 import keyring
 try:
     import wx.html2 as wxhtml2
@@ -8,7 +10,11 @@ except Exception:
 VERSION_TAG = "v2026-alpha14"
 URL_REGEX = re.compile(r'(https?://[^\s<>()]+)')
 KEYRING_SERVICE = "ThriveMessenger"
+DEFAULT_SOUNDPACK_BASE_URL = "https://im.tappedin.fm/thrive/sounds"
+DEFAULT_LOG_SUBMIT_URL = "https://im.tappedin.fm/thrive/logs"
 _KEYRING_WRITE_CACHE = {}
+_SOUND_DOWNLOAD_NOTICE_CACHE = set()
+_SOUND_DOWNLOAD_FAILURE_CACHE = set()
 if sys.platform == 'win32':
     from winotify import Notification as _WinNotification
 else:
@@ -225,6 +231,8 @@ def load_user_config():
         'password': '',
         'soundpack': 'default',
         'default_soundpack': 'default',
+        'soundpack_base_url': DEFAULT_SOUNDPACK_BASE_URL,
+        'log_submit_url': DEFAULT_LOG_SUBMIT_URL,
         'sound_volume': 80,
         'call_input_volume': 80,
         'call_output_volume': 80,
@@ -321,6 +329,103 @@ def save_user_config(settings):
 SERVER_CONFIG = load_server_config()
 ADDR = (SERVER_CONFIG['host'], SERVER_CONFIG['port'])
 _IPC_PORT = 48951
+_LOG_FILE_NAME = "thrive_client.log"
+
+def get_logs_dir():
+    p = os.path.join(os.path.dirname(get_settings_path()), "logs")
+    os.makedirs(p, exist_ok=True)
+    return p
+
+def get_log_path():
+    return os.path.join(get_logs_dir(), _LOG_FILE_NAME)
+
+def _trim_log_file(path, max_bytes=2 * 1024 * 1024):
+    try:
+        if os.path.getsize(path) <= max_bytes:
+            return
+        with open(path, "rb") as f:
+            f.seek(-max_bytes, os.SEEK_END)
+            tail = f.read()
+        with open(path, "wb") as f:
+            f.write(tail)
+    except Exception:
+        pass
+
+def log_event(level, message, extra=None):
+    try:
+        payload = {
+            "ts": datetime.datetime.utcnow().isoformat() + "Z",
+            "level": str(level).lower(),
+            "message": str(message),
+        }
+        if extra is not None:
+            payload["extra"] = extra
+        with open(get_log_path(), "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=True) + "\n")
+        _trim_log_file(get_log_path())
+    except Exception:
+        pass
+
+def _read_log_tail(path, max_bytes=256 * 1024):
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            if size > max_bytes:
+                f.seek(-max_bytes, os.SEEK_END)
+            data = f.read()
+        return data.decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+def submit_logs_payload(config_dict, reason="manual"):
+    base_url = str(config_dict.get("log_submit_url", DEFAULT_LOG_SUBMIT_URL) or "").strip().rstrip("/")
+    if not base_url:
+        return False, "Log submit URL is not configured."
+    payload = {
+        "app": "Thrive Messenger",
+        "version": VERSION_TAG,
+        "reason": reason,
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "username": str(config_dict.get("username", "") or ""),
+        "server": normalize_server_entry(config_dict.get("server_entries", [{}])[0] if config_dict.get("server_entries") else SERVER_CONFIG).get("name", "unknown"),
+        "platform": platform.platform(),
+        "log_tail": _read_log_tail(get_log_path()),
+    }
+    body = json.dumps(payload).encode("utf-8")
+    file_name = f"log-{datetime.datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}.json"
+    url = f"{base_url}/{urllib.parse.quote(file_name)}"
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="PUT",
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": f"ThriveMessenger/{VERSION_TAG}",
+            "X-Thrive-Client": "desktop",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            code = int(getattr(resp, "status", 200))
+        if 200 <= code < 300:
+            return True, None
+        return False, f"Server returned status {code}"
+    except Exception as e:
+        return False, str(e)
+
+def prompt_submit_logs(parent, config_dict, reason, intro="A diagnostic report can be submitted to help troubleshoot this issue. Submit now?"):
+    res = wx.MessageBox(intro, "Submit Diagnostics", wx.YES_NO | wx.ICON_QUESTION, parent)
+    if res != wx.YES:
+        return False
+    ok, err = submit_logs_payload(config_dict, reason=reason)
+    if ok:
+        show_notification("Diagnostics", "Logs submitted successfully.", timeout=4)
+        wx.MessageBox("Diagnostic logs submitted successfully.", "Logs Submitted", wx.OK | wx.ICON_INFORMATION, parent)
+        log_event("info", "logs_submitted_prompted", {"reason": reason})
+        return True
+    wx.MessageBox(f"Could not submit logs:\n{err}", "Log Submit Failed", wx.OK | wx.ICON_ERROR, parent)
+    log_event("error", "logs_submit_failed", {"reason": reason, "error": str(err)})
+    return False
 
 def set_active_server_config(server_entry):
     global SERVER_CONFIG, ADDR
@@ -514,14 +619,149 @@ def get_program_dir():
     if getattr(sys, 'frozen', False): return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
 
+def get_bundle_resources_dir():
+    if not getattr(sys, 'frozen', False):
+        return None
+    exe_dir = os.path.dirname(sys.executable)
+    if sys.platform == 'darwin':
+        # PyInstaller macOS app bundle: Contents/MacOS/<binary> and Contents/Resources/<assets>.
+        resources = os.path.abspath(os.path.join(exe_dir, '..', 'Resources'))
+        if os.path.isdir(resources):
+            return resources
+    # Windows one-folder build typically places assets next to the executable.
+    return exe_dir
+
 def is_installer_install():
     return os.path.exists(os.path.join(get_program_dir(), 'unins000.exe'))
 
 def get_sounds_dir():
-    bundle_sounds = os.path.join(get_program_dir(), 'sounds')
-    if os.path.isdir(bundle_sounds):
-        return bundle_sounds
+    resources_dir = get_bundle_resources_dir()
+    if resources_dir:
+        bundled = os.path.join(resources_dir, 'sounds')
+        if os.path.isdir(bundled):
+            return bundled
+    local_sounds = os.path.join(get_program_dir(), 'sounds')
+    if os.path.isdir(local_sounds):
+        return local_sounds
     return os.path.join(os.getcwd(), 'sounds')
+
+def get_downloaded_sounds_dir():
+    sounds_dir = os.path.join(os.path.dirname(get_settings_path()), 'sounds')
+    os.makedirs(sounds_dir, exist_ok=True)
+    return sounds_dir
+
+def get_soundpack_base_url(config_dict):
+    base = str(config_dict.get('soundpack_base_url', DEFAULT_SOUNDPACK_BASE_URL) or DEFAULT_SOUNDPACK_BASE_URL).strip()
+    return base.rstrip('/')
+
+def get_sound_fetch_headers():
+    return {
+        "User-Agent": f"ThriveMessenger/{VERSION_TAG}",
+        "X-Thrive-Client": "desktop",
+        "Accept": "application/json, audio/wav, application/octet-stream, */*",
+    }
+
+def _safe_sound_name(name):
+    return bool(re.match(r'^[A-Za-z0-9._ -]+$', str(name or '')))
+
+def get_remote_sound_manifest(config_dict):
+    base = get_soundpack_base_url(config_dict)
+    url = f"{base}/index.json"
+    req = urllib.request.Request(url, headers=get_sound_fetch_headers())
+    try:
+        with urllib.request.urlopen(req, timeout=4) as resp:
+            data = json.loads(resp.read().decode('utf-8', errors='replace'))
+        packs = data.get('packs', {})
+        return packs if isinstance(packs, dict) else {}
+    except Exception:
+        # Fallback to autoindex parsing so newly added packs/files appear without manifest updates.
+        result = {}
+        try:
+            root_req = urllib.request.Request(f"{base}/", headers=get_sound_fetch_headers())
+            with urllib.request.urlopen(root_req, timeout=5) as resp:
+                listing = resp.read().decode('utf-8', errors='replace')
+            pack_names = []
+            for href in re.findall(r'href="([^"]+)"', listing):
+                if href in ('../', '/'):
+                    continue
+                name = href.strip('/').strip()
+                if name and _safe_sound_name(name):
+                    pack_names.append(name)
+            for pack in sorted(set(pack_names)):
+                try:
+                    pack_req = urllib.request.Request(f"{base}/{urllib.parse.quote(pack)}/", headers=get_sound_fetch_headers())
+                    with urllib.request.urlopen(pack_req, timeout=5) as presp:
+                        p_listing = presp.read().decode('utf-8', errors='replace')
+                    wavs = []
+                    for href in re.findall(r'href="([^"]+)"', p_listing):
+                        candidate = href.split('?', 1)[0].strip()
+                        if candidate.lower().endswith('.wav'):
+                            fname = os.path.basename(candidate)
+                            if _safe_sound_name(fname):
+                                wavs.append(fname)
+                    if wavs:
+                        result[pack] = sorted(set(wavs))
+                except Exception:
+                    continue
+        except Exception:
+            return {}
+        return result
+
+def list_available_sound_packs(config_dict):
+    packs = {'none', 'default'}
+    for root in (get_sounds_dir(), get_downloaded_sounds_dir()):
+        if not os.path.isdir(root):
+            continue
+        try:
+            for d in os.listdir(root):
+                if os.path.isdir(os.path.join(root, d)):
+                    packs.add(d)
+        except Exception:
+            pass
+    for pack_name in get_remote_sound_manifest(config_dict).keys():
+        if _safe_sound_name(pack_name):
+            packs.add(pack_name)
+    return sorted(packs)
+
+def find_local_sound_path(pack, sound_file):
+    for root in (get_sounds_dir(), get_downloaded_sounds_dir()):
+        p = os.path.join(root, pack, sound_file)
+        if os.path.exists(p):
+            return p
+    return None
+
+def download_sound_file_if_missing(config_dict, pack, sound_file):
+    if not (_safe_sound_name(pack) and _safe_sound_name(sound_file)):
+        return None
+    existing = find_local_sound_path(pack, sound_file)
+    if existing:
+        return existing
+    base = get_soundpack_base_url(config_dict)
+    url = f"{base}/{urllib.parse.quote(pack)}/{urllib.parse.quote(sound_file)}"
+    req = urllib.request.Request(url, headers=get_sound_fetch_headers())
+    key = f"{pack}/{sound_file}"
+    if key not in _SOUND_DOWNLOAD_NOTICE_CACHE:
+        _SOUND_DOWNLOAD_NOTICE_CACHE.add(key)
+        show_notification("Sound pack", f"Downloading sound: {pack}/{sound_file}", timeout=3)
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            blob = resp.read()
+        if not blob:
+            return None
+        out_dir = os.path.join(get_downloaded_sounds_dir(), pack)
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, sound_file)
+        tmp_path = out_path + ".part"
+        with open(tmp_path, 'wb') as f:
+            f.write(blob)
+        os.replace(tmp_path, out_path)
+        show_notification("Sound pack", f"Downloaded sound: {pack}/{sound_file}", timeout=3)
+        return out_path
+    except Exception:
+        if key not in _SOUND_DOWNLOAD_FAILURE_CACHE:
+            _SOUND_DOWNLOAD_FAILURE_CACHE.add(key)
+            show_notification("Sound pack", f"Could not download sound: {pack}/{sound_file}", timeout=4)
+        return None
 
 def check_for_update(callback):
     def _check():
@@ -627,13 +867,7 @@ class SettingsDialog(wx.Dialog):
             accessibility_box.GetStaticBox().SetForegroundColour(light_text_color)
             accessibility_box.GetStaticBox().SetBackgroundColour(dark_color)
         
-        sound_packs = ['none', 'default'];
-        try:
-            sounds_root = get_sounds_dir()
-            if os.path.isdir(sounds_root):
-                packs = [d for d in os.listdir(sounds_root) if os.path.isdir(os.path.join(sounds_root, d))]
-                sound_packs = sorted(list(set(sound_packs + packs)))
-        except Exception as e: print(f"Could not scan for sound packs: {e}")
+        sound_packs = list_available_sound_packs(self.config)
         self.choice = wx.Choice(sound_box.GetStaticBox(), choices=sound_packs)
         current_pack = self.config.get('soundpack', 'default')
         if not current_pack:
@@ -797,17 +1031,40 @@ def create_secure_socket(server_entry=None):
         sock.close(); return socket.create_connection(addr)
 
 class ClientApp(wx.App):
+    def _signal_existing_instance(self):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(1.0)
+            s.connect(('127.0.0.1', _IPC_PORT))
+            s.sendall(b'restore')
+            s.close()
+            return True
+        except Exception:
+            return False
+
+    def _activate_existing_app(self):
+        if sys.platform != 'darwin':
+            return False
+        try:
+            p = subprocess.run(
+                ["osascript", "-e", 'tell application "Thrive Messenger" to activate'],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            return p.returncode == 0
+        except Exception:
+            return False
+
     def OnInit(self):
+        log_event("info", "app_start")
         self.instance_checker = wx.SingleInstanceChecker("ThriveMessenger-%s" % wx.GetUserId())
         if self.instance_checker.IsAnotherRunning():
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.connect(('127.0.0.1', _IPC_PORT))
-                s.sendall(b'restore')
-                s.close()
-            except Exception:
-                pass
-            return False
+            if self._signal_existing_instance() or self._activate_existing_app():
+                return False
+            # Stale lock or crashed/background state: continue startup to recover.
+            print("Detected stale single-instance state; launching a fresh visible window.")
+            log_event("warn", "stale_single_instance_lock_recovered")
         try:
             self._ipc_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self._ipc_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -815,17 +1072,13 @@ class ClientApp(wx.App):
             self._ipc_sock.listen(1)
             threading.Thread(target=self._ipc_listener, daemon=True).start()
         except Exception:
-            # If port is already bound, another instance is already active.
-            # Restore existing window and exit this launch to prevent duplicate sessions/sounds.
+            # If IPC binding fails, first try to restore an existing instance.
+            # If restore fails, continue startup without IPC to avoid being stuck unable to open.
             self._ipc_sock = None
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.connect(('127.0.0.1', _IPC_PORT))
-                s.sendall(b'restore')
-                s.close()
-            except Exception:
-                pass
-            return False
+            if self._signal_existing_instance() or self._activate_existing_app():
+                return False
+            print("IPC port unavailable and no active instance responded; continuing without IPC listener.")
+            log_event("warn", "ipc_bind_unavailable_continuing")
         self.user_config = load_user_config()
         self.session_password = ""
         self.active_server_entry = resolve_default_server_entry(self.user_config)
@@ -838,6 +1091,7 @@ class ClientApp(wx.App):
             if success: self.start_main_session(self.user_config['username'], sock, sf); return True
             else:
                 wx.MessageBox(f"Auto-login failed: {reason}", "Login Failed", wx.ICON_ERROR)
+                log_event("error", "auto_login_failed", {"reason": str(reason)})
                 # Keep autologin enabled for transient network/server issues.
                 if "invalid credentials" in str(reason).lower():
                     self.user_config['autologin'] = False
@@ -933,8 +1187,15 @@ class ClientApp(wx.App):
                     show_notification("Server Message", post_login, timeout=8)
                 return True, ssock, sf, "Success"
             else:
-                reason = resp.get("reason", "Unknown error"); wx.MessageBox("Login failed: " + reason, "Login Failed", wx.ICON_ERROR); ssock.close(); return False, None, None, reason
-        except Exception as e: wx.MessageBox(f"A connection error occurred: {e}", "Connection Error", wx.ICON_ERROR); return False, None, None, str(e)
+                reason = resp.get("reason", "Unknown error"); log_event("error", "login_failed", {"reason": reason}); wx.MessageBox("Login failed: " + reason, "Login Failed", wx.ICON_ERROR); ssock.close(); return False, None, None, reason
+        except Exception as e:
+            log_event("error", "login_connection_error", {"error": str(e)})
+            wx.MessageBox(f"A connection error occurred: {e}", "Connection Error", wx.ICON_ERROR)
+            try:
+                prompt_submit_logs(None, self.user_config, reason="login_connection_error")
+            except Exception:
+                pass
+            return False, None, None, str(e)
 
     def fetch_directory_for_server(self, server_entry, username, password):
         try:
@@ -1003,13 +1264,12 @@ class ClientApp(wx.App):
         pack = self._resolved_sound_pack()
         if pack == 'none':
             return
-        sounds_root = get_sounds_dir()
-        path = os.path.join(sounds_root, pack, sound_file)
-        if os.path.exists(path):
+        path = find_local_sound_path(pack, sound_file) or download_sound_file_if_missing(self.user_config, pack, sound_file)
+        if path and os.path.exists(path):
             self._play_path_with_volume(path)
             return
-        default_path = os.path.join(sounds_root, 'default', sound_file)
-        if os.path.exists(default_path):
+        default_path = find_local_sound_path('default', sound_file) or download_sound_file_if_missing(self.user_config, 'default', sound_file)
+        if default_path and os.path.exists(default_path):
             self._play_path_with_volume(default_path)
 
     def play_startup_sound(self):
@@ -1945,8 +2205,29 @@ class UserDirectoryDialog(wx.Dialog):
         if not user: return
         self.parent_frame.sock.sendall(json.dumps({"action": "add_contact", "to": user}).encode() + b"\n")
         self.btn_add.Disable(); self.btn_add.SetLabel("Adding...")
-    def on_list_context_menu(self, _):
+    def _select_user_from_context_event(self, event):
+        lv = self._get_active_list()
+        if not lv:
+            return
+        try:
+            pos = event.GetPosition()
+        except Exception:
+            pos = wx.DefaultPosition
+        try:
+            if isinstance(pos, wx.Point) and pos.x >= 0 and pos.y >= 0:
+                idx = lv.HitTest(lv.ScreenToClient(pos))
+                if idx != wx.NOT_FOUND:
+                    lv.SetSelection(idx)
+        except Exception:
+            pass
+        if lv.GetSelection() == wx.NOT_FOUND and lv.GetCount() > 0:
+            lv.SetSelection(0)
+    def on_list_context_menu(self, event):
+        self._select_user_from_context_event(event)
         self._selected_user = self._get_selected_user()
+        selected = bool(self._selected_user and self._selected_user != self.my_username)
+        external = self._is_selected_external_server()
+        is_contact = bool(self._selected_user and self._selected_user in self.contact_states)
         menu = wx.Menu()
         mi_chat = menu.Append(wx.ID_ANY, "Start Chat")
         mi_add = menu.Append(wx.ID_ANY, "Add to Contacts")
@@ -1954,11 +2235,15 @@ class UserDirectoryDialog(wx.Dialog):
         mi_file = menu.Append(wx.ID_ANY, "Send File")
         menu.AppendSeparator()
         mi_refresh = menu.Append(wx.ID_ANY, "Refresh Directory")
-        self.Bind(wx.EVT_MENU, self.on_start_chat, mi_chat)
-        self.Bind(wx.EVT_MENU, self.on_add_to_contacts, mi_add)
-        self.Bind(wx.EVT_MENU, self.on_block_toggle, mi_block)
-        self.Bind(wx.EVT_MENU, self.on_send_file, mi_file)
-        self.Bind(wx.EVT_MENU, lambda e: self.parent_frame.on_user_directory(None), mi_refresh)
+        mi_chat.Enable(selected and not external)
+        mi_add.Enable(selected and (not is_contact) and not external)
+        mi_block.Enable(selected and is_contact and not external)
+        mi_file.Enable(selected and not external)
+        self.Bind(wx.EVT_MENU, self.on_start_chat, id=mi_chat.GetId())
+        self.Bind(wx.EVT_MENU, self.on_add_to_contacts, id=mi_add.GetId())
+        self.Bind(wx.EVT_MENU, self.on_block_toggle, id=mi_block.GetId())
+        self.Bind(wx.EVT_MENU, self.on_send_file, id=mi_file.GetId())
+        self.Bind(wx.EVT_MENU, lambda e: self.parent_frame.on_user_directory(None), id=mi_refresh.GetId())
         self.PopupMenu(menu)
         menu.Destroy()
     def on_list_key(self, event):
@@ -2170,6 +2455,7 @@ class MainFrame(wx.Frame):
 
         help_menu = wx.Menu()
         self.mi_help = help_menu.Append(wx.ID_ANY, "Help\tF1")
+        self.mi_submit_logs = help_menu.Append(wx.ID_ANY, "Submit Diagnostic Logs")
 
         menubar.Append(file_menu, "&File")
         menubar.Append(contacts_menu, "&Contacts")
@@ -2202,6 +2488,7 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, lambda e: self._set_sort_mode("name_desc"), self.mi_sort_name_desc)
         self.Bind(wx.EVT_MENU, lambda e: self._set_sort_mode("status"), self.mi_sort_status)
         self.Bind(wx.EVT_MENU, lambda e: open_help_docs_for_context("main", self), self.mi_help)
+        self.Bind(wx.EVT_MENU, self.on_submit_logs, self.mi_submit_logs)
 
     def _apply_voiceover_hints(self, search_label):
         search_label.SetToolTip("Type a username to filter your contact list.")
@@ -2239,6 +2526,16 @@ class MainFrame(wx.Frame):
         if sel == wx.NOT_FOUND or sel >= len(self._contact_display_map):
             return None
         return self._contact_display_map[sel]
+    def on_submit_logs(self, _):
+        app = wx.GetApp()
+        ok, err = submit_logs_payload(app.user_config, reason="manual_submit")
+        if ok:
+            show_notification("Diagnostics", "Logs submitted successfully.", timeout=4)
+            wx.MessageBox("Diagnostic logs submitted successfully.", "Logs Submitted", wx.OK | wx.ICON_INFORMATION)
+            log_event("info", "logs_submitted_manual")
+        else:
+            wx.MessageBox(f"Could not submit logs:\n{err}", "Log Submit Failed", wx.OK | wx.ICON_ERROR)
+            log_event("error", "logs_submit_failed", {"error": str(err)})
     def on_settings(self, event):
         app = wx.GetApp()
         with SettingsDialog(self, app.user_config) as dlg:
@@ -2606,7 +2903,25 @@ class MainFrame(wx.Frame):
         elif first_real_idx >= 0:
             self.lv.SetSelection(first_real_idx)
         self.update_button_states()
-    def on_contact_context_menu(self, _):
+    def _select_contact_from_context_event(self, event):
+        try:
+            pos = event.GetPosition()
+        except Exception:
+            pos = wx.DefaultPosition
+        try:
+            if isinstance(pos, wx.Point) and pos.x >= 0 and pos.y >= 0:
+                idx = self.lv.HitTest(self.lv.ScreenToClient(pos))
+                if idx != wx.NOT_FOUND:
+                    self.lv.SetSelection(idx)
+        except Exception:
+            pass
+        if self.lv.GetSelection() == wx.NOT_FOUND and self.lv.GetCount() > 0:
+            self.lv.SetSelection(0)
+        self.update_button_states()
+    def on_contact_context_menu(self, event):
+        self._select_contact_from_context_event(event)
+        selected = self._selected_contact_name()
+        has_contact = bool(selected and selected in self.contact_states)
         menu = wx.Menu()
         mi_chat = menu.Append(wx.ID_ANY, "Start Chat")
         mi_add = menu.Append(wx.ID_ANY, "Add Contact")
@@ -2616,13 +2931,19 @@ class MainFrame(wx.Frame):
         mi_delete = menu.Append(wx.ID_ANY, "Delete Contact")
         menu.AppendSeparator()
         mi_dir = menu.Append(wx.ID_ANY, "Open User Directory")
-        self.Bind(wx.EVT_MENU, self.on_send, mi_chat)
-        self.Bind(wx.EVT_MENU, self.on_add, mi_add)
-        self.Bind(wx.EVT_MENU, self.on_send_file, mi_file)
-        self.Bind(wx.EVT_MENU, self.on_toggle_selected_chat_logging, mi_log)
-        self.Bind(wx.EVT_MENU, self.on_block_toggle, mi_block)
-        self.Bind(wx.EVT_MENU, self.on_delete, mi_delete)
-        self.Bind(wx.EVT_MENU, self.on_user_directory, mi_dir)
+        mi_chat.Enable(bool(selected))
+        mi_add.Enable(True)
+        mi_file.Enable(bool(selected))
+        mi_log.Enable(bool(selected))
+        mi_block.Enable(has_contact)
+        mi_delete.Enable(has_contact)
+        self.Bind(wx.EVT_MENU, self.on_send, id=mi_chat.GetId())
+        self.Bind(wx.EVT_MENU, self.on_add, id=mi_add.GetId())
+        self.Bind(wx.EVT_MENU, self.on_send_file, id=mi_file.GetId())
+        self.Bind(wx.EVT_MENU, self.on_toggle_selected_chat_logging, id=mi_log.GetId())
+        self.Bind(wx.EVT_MENU, self.on_block_toggle, id=mi_block.GetId())
+        self.Bind(wx.EVT_MENU, self.on_delete, id=mi_delete.GetId())
+        self.Bind(wx.EVT_MENU, self.on_user_directory, id=mi_dir.GetId())
         self.PopupMenu(menu)
         menu.Destroy()
     def on_toggle_selected_chat_logging(self, _):
@@ -2939,6 +3260,27 @@ class ChatDialog(wx.Dialog):
     def on_key(self, event):
         if event.GetKeyCode() == wx.WXK_F1:
             open_help_docs_for_context("chat", self)
+        elif event.GetKeyCode() in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
+            focused = wx.Window.FindFocus()
+            is_in_input = False
+            w = focused
+            while w:
+                if w is self.input_ctrl:
+                    is_in_input = True
+                    break
+                w = w.GetParent()
+            if is_in_input:
+                if event.ControlDown():
+                    self.on_send_file(None)
+                elif event.CmdDown():
+                    self.input_ctrl.WriteText('\n')
+                else:
+                    enter_action = wx.GetApp().user_config.get('enter_key_action', 'send')
+                    if enter_action == 'newline':
+                        self.input_ctrl.WriteText('\n')
+                    else:
+                        self.on_send(None)
+                return
         elif event.CmdDown() and event.GetKeyCode() == ord(','):
             parent = self.GetParent()
             if parent and hasattr(parent, "on_settings"):
