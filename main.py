@@ -1547,7 +1547,6 @@ class MainFrame(wx.Frame):
         dlg.append(msg["msg"], msg["from"], msg["time"])
         if app.user_config.get('tts_enabled', True):
             speak(f"{msg['from']}: {msg['msg']}")
-        self.RequestUserAttention()
     def on_message_failed(self, to, reason): chat_dlg = self.get_chat(to); (chat_dlg.append_error(reason) if chat_dlg else wx.MessageBox(reason, "Message Failed", wx.OK | wx.ICON_ERROR))
     def on_offline_messages(self, messages):
         if not messages: return
