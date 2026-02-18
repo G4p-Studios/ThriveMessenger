@@ -203,7 +203,7 @@ Someone sends you a message and they aren't in your contacts. You get to chattin
 
 ### Running the server
 
-The Thrive Messenger server is also written in Python, but it is standard library, meaning it does not require any external dependencies to run.
+The Thrive Messenger server is also written in Python. It is almost standard library, meaning it does not require any external dependencies to run, save for the argon2-cffi library used for hashing passwords.
 Note: the server will technically run on both Windows and Linux, but the following instructions are optimised for Linux, so you will need a Linux machine either in the cloud or on your local network.
 
 1. If for some reason git is not installed on your machine, install it with these commands, substituting apt for your distro's package manager.
@@ -225,26 +225,33 @@ Note: the server will technically run on both Windows and Linux, but the followi
     cd ThriveMessenger/srv
     ```
 
-4. Make a screen session so you're not constantly tied to the terminal when running the server.
+4. Install the argon2-cffi library.
+
+    ```
+    pip3 install --break-system-packages argon2-cffi
+    ```
+
+Note: we aren't actually breaking any packages here, we're just using that argument to stop pip whining about virtual environments.
+
+5. Make a screen session so you're not constantly tied to the terminal when running the server.
 
     ```
     screen -S thrive
     ```
 
-5. Ensure the server's port is allowed through the firewall.
+6. Ensure the server's port is allowed through the firewall.
 
     ```
     sudo ufw allow 2005
     ```
 
-
-6. Finally, runn the server.
+7. Finally, runn the server.
 
     ```
     python3 server.py
     ```
 
-6. Detach yourself from the screen session by pressing Control + A, then press D.
+8. Detach yourself from the screen session by pressing Control + A, then press D.
 
 Please note: the server will run in unencrypted mode by default, meaning data sent from the client will be sent in plain text. This should only be used for testing servers. In a production environment, you must use valid SSL certificates from a trusted certificate authority such as Let's Encrypt.
 
