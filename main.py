@@ -3077,7 +3077,10 @@ class MainFrame(wx.Frame):
         if not dlg:
             is_contact = msg["from"] in self.contact_states
             dlg = ChatDialog(self, msg["from"], self.sock, self.user, is_logging_enabled, is_contact=is_contact)
-        dlg.Show(); dlg.append(msg["msg"], msg["from"], msg["time"]); wx.CallAfter(dlg.input_ctrl.SetFocus); self.RequestUserAttention()
+        dlg.Show()
+        dlg.append(msg["msg"], msg["from"], msg["time"])
+        if app.user_config.get('tts_enabled', True):
+            speak_text(f"{msg['from']}: {msg['msg']}")
     def on_typing_event(self, msg):
         from_user = msg.get("from")
         is_typing = bool(msg.get("typing", False))
