@@ -779,11 +779,11 @@ class ClientApp(wx.App):
             chat = self.frame.get_chat(sender)
             if chat:
                 names = ", ".join(f["filename"] for f in files)
-                chat.append(f"Accepting {len(files)} file(s): {names}...", "System", datetime.datetime.now().isoformat())
+                chat.append(f"Accepting {len(files)} file(s): {names}...", "System", get_utc_timestamp())
         else:
             self.sock.sendall((json.dumps({"action": "file_decline", "transfer_id": transfer_id}) + "\n").encode())
             chat = self.frame.get_chat(sender)
-            if chat: chat.append(f"Declined {len(files)} file(s) from {sender}", "System", datetime.datetime.now().isoformat())
+            if chat: chat.append(f"Declined {len(files)} file(s) from {sender}", "System", get_utc_timestamp())
 
     def on_file_offer_failed(self, msg):
         self.play_sound("file_error.wav")
@@ -816,7 +816,7 @@ class ClientApp(wx.App):
         chat = self.frame.get_chat(to)
         if chat:
             names = ", ".join(filenames)
-            chat.append(f"{len(filenames)} file(s) sent: {names}", "System", datetime.datetime.now().isoformat())
+            chat.append(f"{len(filenames)} file(s) sent: {names}", "System", get_utc_timestamp())
 
     def _on_file_send_error(self, to, error):
         self.play_sound("file_error.wav")
@@ -829,7 +829,7 @@ class ClientApp(wx.App):
         self.play_sound("file_error.wav")
         names = ", ".join(f["filename"] for f in files)
         chat = self.frame.get_chat(to)
-        if chat: chat.append(f"{to} declined your file(s): {names}", "System", datetime.datetime.now().isoformat())
+        if chat: chat.append(f"{to} declined your file(s): {names}", "System", get_utc_timestamp())
         else: wx.MessageBox(f"{to} declined your file(s): {names}", "File Declined", wx.ICON_INFORMATION)
 
     def on_file_data(self, msg):
@@ -858,7 +858,7 @@ class ClientApp(wx.App):
             self.play_sound("file_receive.wav")
             chat = self.frame.get_chat(sender)
             names = ", ".join(saved)
-            if chat: chat.append(f"{len(saved)} file(s) received and saved: {names}", "System", datetime.datetime.now().isoformat())
+            if chat: chat.append(f"{len(saved)} file(s) received and saved: {names}", "System", get_utc_timestamp())
             else:
                 show_notification("Files Received", f"{sender} sent you {len(saved)} file(s)")
 
@@ -882,7 +882,7 @@ class ClientApp(wx.App):
         chat = self.frame.get_chat(contact)
         if chat:
             names = ", ".join(f["filename"] for f in files)
-            chat.append(f"Sending file offer ({len(files)} file(s)): {names}...", "System", datetime.datetime.now().isoformat())
+            chat.append(f"Sending file offer ({len(files)} file(s)): {names}...", "System", get_utc_timestamp())
 
 class VerificationDialog(wx.Dialog):
     def __init__(self, parent, username):
@@ -1561,6 +1561,10 @@ class MainFrame(wx.Frame):
             if isinstance(child, ChatDialog) and child.contact == contact: return child
         return None
 
+def get_utc_timestamp():
+    """Get current time in UTC as ISO format string (naive, for compatibility)."""
+    return datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat()
+
 def get_day_with_suffix(d): return str(d) + "th" if 11 <= d <= 13 else str(d) + {1: "st", 2: "nd", 3: "rd"}.get(d % 10, "th")
 def format_timestamp(iso_ts, use_local_time=True):
     """
@@ -1617,7 +1621,7 @@ class AdminDialog(wx.Dialog):
         if not cmd.startswith('/'): self.append_response("Error: Commands must start with /"); return
         msg = {"action":"admin_cmd", "cmd": cmd[1:]}; self.sock.sendall(json.dumps(msg).encode()+b"\n"); self.input_ctrl.Clear(); self.input_ctrl.SetFocus()
     def append_response(self, text):
-        ts = datetime.datetime.now().isoformat(); idx = self.hist.GetItemCount(); self.hist.InsertItem(idx, text)
+        ts = get_utc_timestamp(); idx = self.hist.GetItemCount(); self.hist.InsertItem(idx, text)
         app = wx.GetApp()
         use_local_time = app.user_config.get('use_local_time', True)
         self.hist.SetItem(idx, 1, format_timestamp(ts, use_local_time))
@@ -1764,7 +1768,7 @@ class ChatDialog(wx.Dialog):
     def on_send(self, _):
         txt = self.input_ctrl.GetValue().strip()
         if not txt: return
-        ts = datetime.datetime.now().isoformat()
+        ts = get_utc_timestamp()
         msg = {"action":"msg","to":self.contact,"from":self.user,"time":ts,"msg":txt}
         self.sock.sendall(json.dumps(msg).encode()+b"\n")
         self.append(txt, self.user, ts)
@@ -1791,7 +1795,7 @@ class ChatDialog(wx.Dialog):
             log_line = f"[{formatted_time}] {sender}: {text}\n"
             self._save_message_to_log(log_line)
     def append_error(self, reason):
-        ts = datetime.datetime.now().isoformat()
+        ts = get_utc_timestamp()
         self.append(reason, "System", ts, is_error=True)
         self.input_ctrl.SetFocus()
 
