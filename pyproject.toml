@@ -13,4 +13,5 @@ dependencies = [
     "pyinstaller>=6.18.0",
     "pyinstaller-versionfile>=3.0.1",
     "wxpython>=4.2.5",
+    "accessible-output2==0.16",
 ]
