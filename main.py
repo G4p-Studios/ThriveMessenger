@@ -1,4 +1,4 @@
-import wx, socket, json, threading, datetime, wx.adv, configparser, ssl, sys, os, base64, uuid, subprocess, tempfile, re
+import wx, socket, json, threading, datetime, wx.adv, configparser, ssl, sys, os, base64, uuid, subprocess, tempfile, re, time
 import keyring
 
 try:
@@ -86,6 +86,8 @@ def load_server_config():
         'host': config.get('server', 'host', fallback='msg.thecubed.cc'),
         'port': config.getint('server', 'port', fallback=2005),
         'cafile': config.get('server', 'cafile', fallback=None),
+        'max_retries': config.getint('server', 'max_retries', fallback=5),
+        'retry_timeout': config.getint('server', 'retry_timeout', fallback=15),
     }
 
 def get_config_dir():
@@ -126,7 +128,7 @@ def load_user_config():
         'password': '',
         'soundpack': 'default',
         'chat_logging': {},
-        'tts_enabled': True
+        'tts_enabled': False
     }
 
     # 1. Load non-sensitive preferences from JSON
@@ -367,6 +369,35 @@ class SettingsDialog(wx.Dialog):
 
         btn_sizer.AddButton(ok_btn); btn_sizer.AddButton(cancel_btn); btn_sizer.Realize(); main_sizer.Add(btn_sizer, 0, wx.ALIGN_CENTER | wx.ALL, 10); panel.SetSizer(main_sizer)
 
+class ReconnectDialog(wx.Dialog):
+    def __init__(self):
+        super().__init__(None, title="Connection Lost", style=wx.DEFAULT_DIALOG_STYLE | wx.STAY_ON_TOP)
+        self.cancelled = False
+        panel = wx.Panel(self); sizer = wx.BoxSizer(wx.VERTICAL)
+
+        dark_mode_on = is_windows_dark_mode()
+        if dark_mode_on:
+            dark_color = wx.Colour(40, 40, 40); light_text_color = wx.WHITE
+            WxMswDarkMode().enable(self); self.SetBackgroundColour(dark_color); panel.SetBackgroundColour(dark_color)
+
+        self.status_label = wx.StaticText(panel, label="Connection to the server was lost.")
+        give_up_btn = wx.Button(panel, label="Give Up")
+        give_up_btn.Bind(wx.EVT_BUTTON, self.on_give_up)
+
+        if dark_mode_on:
+            self.status_label.SetForegroundColour(light_text_color); self.status_label.SetBackgroundColour(dark_color)
+            give_up_btn.SetBackgroundColour(dark_color); give_up_btn.SetForegroundColour(light_text_color)
+
+        sizer.Add(self.status_label, 0, wx.ALL, 15)
+        sizer.Add(give_up_btn, 0, wx.ALIGN_CENTER | wx.BOTTOM, 10)
+        panel.SetSizer(sizer); self.Fit(); self.Centre()
+
+    def set_status(self, text):
+        self.status_label.SetLabel(text); self.Layout(); self.Fit()
+
+    def on_give_up(self, _):
+        self.cancelled = True; self.EndModal(wx.ID_CANCEL)
+
 STATUS_PRESETS = ["online", "offline", "busy", "away", "on the phone", "doing homework", "in the shower", "watching TV", "hiding from the parents", "fixing my PC", "battery about to die"]
 
 class StatusDialog(wx.Dialog):
@@ -413,18 +444,18 @@ class StatusDialog(wx.Dialog):
             self.status_text.SetValue(sel); self.sizer.Hide(self.custom_box); self.panel.Layout()
             self.SetSize((350, 150))
 
-def create_secure_socket():
-    sock = socket.create_connection(ADDR)
+def create_secure_socket(timeout=None):
+    sock = socket.create_connection(ADDR, timeout=timeout)
     if SERVER_CONFIG['cafile'] and os.path.exists(SERVER_CONFIG['cafile']):
         context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=SERVER_CONFIG['cafile'])
     else: context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
     try: return context.wrap_socket(sock, server_hostname=SERVER_CONFIG['host'])
     except ssl.SSLCertVerificationError:
-        sock.close(); sock = socket.create_connection(ADDR)
+        sock.close(); sock = socket.create_connection(ADDR, timeout=timeout)
         context = ssl.create_default_context(); context.check_hostname = False; context.verify_mode = ssl.CERT_NONE
         return context.wrap_socket(sock, server_hostname=SERVER_CONFIG['host'])
     except (ssl.SSLError, OSError):
-        sock.close(); return socket.create_connection(ADDR)
+        sock.close(); return socket.create_connection(ADDR, timeout=timeout)
 
 class ClientApp(wx.App):
     def OnInit(self):
@@ -503,16 +534,21 @@ class ClientApp(wx.App):
                     save_user_config(self.user_config); self.start_main_session(dlg.new_username, sock, sf); return True
             else: return False
     
-    def perform_login(self, username, password):
+    def perform_login(self, username, password, silent=False, connect_timeout=None):
         try:
-            ssock = create_secure_socket()
+            ssock = create_secure_socket(timeout=connect_timeout)
+            ssock.settimeout(None)  # switch to blocking after connect
             ssock.sendall(json.dumps({"action":"login","user":username,"pass":password}).encode()+b"\n")
             sf = ssock.makefile()
             resp = json.loads(sf.readline() or "{}")
             if resp.get("status") == "ok": return True, ssock, sf, "Success"
             else:
-                reason = resp.get("reason", "Unknown error"); wx.MessageBox("Login failed: " + reason, "Login Failed", wx.ICON_ERROR); ssock.close(); return False, None, None, reason
-        except Exception as e: wx.MessageBox(f"A connection error occurred: {e}", "Connection Error", wx.ICON_ERROR); return False, None, None, str(e)
+                reason = resp.get("reason", "Unknown error")
+                if not silent: wx.MessageBox("Login failed: " + reason, "Login Failed", wx.ICON_ERROR)
+                ssock.close(); return False, None, None, reason
+        except Exception as e:
+            if not silent: wx.MessageBox(f"A connection error occurred: {e}", "Connection Error", wx.ICON_ERROR)
+            return False, None, None, str(e)
     
     def start_main_session(self, username, sock, sf):
         self.username = username; self.sock = sock; self.sockfile = sf; self.pending_file_paths = {}
@@ -569,7 +605,49 @@ class ClientApp(wx.App):
 
     def on_server_disconnect(self):
         if self.intentional_disconnect: return
-        self._return_to_login("Connection to the server was lost.", "Connection Lost")
+        self.intentional_disconnect = True
+        try: self.sock.close()
+        except: pass
+        username = getattr(self, 'username', '')
+        password = self.user_config.get('password', '')
+        if not username or not password:
+            self.intentional_disconnect = False
+            self._return_to_login("Connection to the server was lost.", "Connection Lost")
+            return
+        dlg = ReconnectDialog()
+        threading.Thread(target=self._reconnect_loop, args=(dlg, username, password,
+            SERVER_CONFIG['max_retries'], SERVER_CONFIG['retry_timeout']), daemon=True).start()
+        result = dlg.ShowModal(); dlg.Destroy()
+        if result != wx.ID_OK:
+            self.intentional_disconnect = False
+            self._return_to_login("Could not reconnect to the server.", "Connection Lost")
+
+    def _reconnect_loop(self, dlg, username, password, max_retries=5, wait_secs=15):
+        for attempt in range(1, max_retries + 1):
+            if dlg.cancelled: return
+            wx.CallAfter(dlg.set_status, f"Reconnecting... (attempt {attempt} of {max_retries})")
+            success, sock, sf, _ = self.perform_login(username, password, silent=True, connect_timeout=10)
+            if success:
+                wx.CallAfter(self._finish_reconnect, dlg, sock, sf); return
+            if dlg.cancelled: return
+            for remaining in range(wait_secs, 0, -1):
+                if dlg.cancelled: return
+                wx.CallAfter(dlg.set_status, f"Attempt {attempt} of {max_retries} failed. Retrying in {remaining}s...")
+                time.sleep(1)
+        wx.CallAfter(dlg.EndModal, wx.ID_CANCEL)
+
+    def _finish_reconnect(self, dlg, sock, sf):
+        self.sock = sock; self.sockfile = sf; self.pending_file_paths = {}
+        self.intentional_disconnect = False
+        self.frame.sock = sock
+        for child in self.frame.GetChildren():
+            if isinstance(child, (ChatDialog, AdminDialog)): child.sock = sock
+        threading.Thread(target=self.listen_loop, daemon=True).start()
+        if self.frame.current_status != "online":
+            try: sock.sendall((json.dumps({"action": "set_status", "status_text": self.frame.current_status}) + "\n").encode())
+            except: pass
+        self.play_sound("login.wav")
+        dlg.EndModal(wx.ID_OK)
 
     def _return_to_login(self, message, title):
         if self.intentional_disconnect: return
@@ -1451,7 +1529,7 @@ class AdminDialog(wx.Dialog):
             
         self.hist = wx.ListCtrl(self, style=wx.LC_REPORT)
         self.hist.InsertColumn(0, "Server Response", width=200); self.hist.InsertColumn(1, "Time", width=220)
-        box_msg = wx.StaticBoxSizer(wx.VERTICAL, self, "&Enter command (e.g., /create user pass)"); self.input_ctrl = wx.TextCtrl(box_msg.GetStaticBox(), style=wx.TE_PROCESS_ENTER)
+        box_msg = wx.StaticBoxSizer(wx.VERTICAL, self, "&Enter command (e.g., /create user pass [email])"); self.input_ctrl = wx.TextCtrl(box_msg.GetStaticBox(), style=wx.TE_PROCESS_ENTER)
         btn = wx.Button(self, label="&Send Command")
         
         if dark_mode_on:
@@ -1474,6 +1552,7 @@ class AdminDialog(wx.Dialog):
     def append_response(self, text):
         ts = datetime.datetime.now().isoformat(); idx = self.hist.GetItemCount(); self.hist.InsertItem(idx, text); self.hist.SetItem(idx, 1, format_timestamp(ts))
         if text.lower().startswith('error'): self.hist.SetItemTextColour(idx, wx.RED)
+        if wx.GetApp().user_config.get('tts_enabled', False): speak(text)
 
 class ChatDialog(wx.Dialog):
     def __init__(self, parent, contact, sock, user, logging_enabled=False, is_contact=True):
@@ -1564,8 +1643,20 @@ class ChatDialog(wx.Dialog):
             if frame._conversations_dlg:
                 frame._conversations_dlg.Raise(); frame._conversations_dlg.SetFocus()
     def on_key(self, event):
-        if event.GetKeyCode() == wx.WXK_ESCAPE: self.Close()
-        else: event.Skip()
+        if event.GetKeyCode() == wx.WXK_ESCAPE:
+            self.Close()
+        elif event.GetKeyCode() == ord('C') and event.ControlDown():
+            if wx.Window.FindFocus() is not self.input_ctrl:
+                sel = self.hist.GetFirstSelected()
+                if sel >= 0:
+                    text = self.hist.GetItemText(sel, 1)
+                    if wx.TheClipboard.Open():
+                        wx.TheClipboard.SetData(wx.TextDataObject(text))
+                        wx.TheClipboard.Close()
+            else:
+                event.Skip()
+        else:
+            event.Skip()
     def on_send(self, _):
         txt = self.input_ctrl.GetValue().strip()
         if not txt: return
