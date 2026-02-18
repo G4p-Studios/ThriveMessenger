@@ -1,5 +1,5 @@
 import sqlite3, threading, socket, json, datetime, sys, configparser, ssl, os, uuid, base64, time
-import smtplib, random, string
+import smtplib, secrets
 import urllib.request, urllib.parse
 from email.mime.text import MIMEText
 
@@ -101,7 +101,10 @@ class EmailManager:
 
     @staticmethod
     def generate_code(length=6):
-        return ''.join(random.choices(string.digits, k=length))
+        if length <= 6:
+            # Preserve a short user-facing code option while using CSPRNG.
+            return ''.join(secrets.choice('0123456789') for _ in range(length))
+        return secrets.token_hex(max(1, length // 2))
 
 class FlexPBXManager:
     @staticmethod
