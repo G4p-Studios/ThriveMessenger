@@ -546,8 +546,12 @@ def handle_client(cs, addr):
                     
             elif action == "file_offer":
                 to = msg["to"]
-                # Strip any path components from filenames before processing or forwarding
-                files = [dict(f, filename=os.path.basename(f["filename"])) for f in msg.get("files", [])]
+                files = msg.get("files", [])
+                # Reject any filename containing a path separator (OS-independent check)
+                bad = next((f["filename"] for f in files if '/' in f["filename"] or '\\' in f["filename"]), None)
+                if bad:
+                    sock.sendall((json.dumps({"action": "file_offer_failed", "to": to, "reason": f"Invalid filename: '{bad}'"}) + "\n").encode())
+                    continue
 
                 # Check if recipient is online
                 with lock: sock_to = clients.get(to)
@@ -625,8 +629,10 @@ def handle_client(cs, addr):
                 recipient = transfer["to"]
                 with lock: sock_to = clients.get(recipient)
                 if sock_to:
-                    # Re-use the sanitized filenames from the accepted offer; ignore client-supplied names in data packet
-                    safe_files = [dict(fd, filename=os.path.basename(fd["filename"])) for fd in msg["files"]]
+                    # Use the filenames stored at offer time (already validated); ignore client-supplied names in data packet
+                    name_map = {f["filename"]: f["filename"] for f in transfer["files"]}
+                    safe_files = [dict(fd, filename=name_map.get(fd["filename"], fd["filename"])) for fd in msg["files"]
+                                  if '/' not in fd["filename"] and '\\' not in fd["filename"]]
                     try: sock_to.sendall((json.dumps({"action": "file_data", "from": transfer["from"], "files": safe_files}) + "\n").encode())
                     except: pass
 
