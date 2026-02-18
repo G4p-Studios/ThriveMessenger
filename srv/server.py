@@ -639,7 +639,8 @@ def handle_client(cs, addr):
                 con.close()
                 
                 with lock: sock_to = clients.get(to)
-                if recipient_has_blocked and recipient_has_blocked[0] == 1: 
+                reason = None
+                if recipient_has_blocked and recipient_has_blocked[0] == 1:
                     reason = f"Message couldn't be sent because {to} has you blocked."
                 elif sender_has_blocked and sender_has_blocked[0] == 1: 
                     reason = "You have blocked this contact."
