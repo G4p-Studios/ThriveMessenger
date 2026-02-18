@@ -14,7 +14,7 @@ def speak(text):
         try: _ao2.speak(text, interrupt=True)
         except Exception: pass
 
-VERSION_TAG = "v2026-alpha15"
+VERSION_TAG = "v2026-alpha15.1"
 if sys.platform == 'win32':
     from winotify import Notification as _WinNotification
 else:
