@@ -1,6 +1,19 @@
 import wx, socket, json, threading, datetime, wx.adv, configparser, ssl, sys, os, base64, uuid, subprocess, tempfile, re
 import keyring
 
+try:
+    from accessible_output2.outputs.auto import Auto as _AO2Auto
+    _ao2 = _AO2Auto()
+    _ao2_available = True
+except Exception:
+    _ao2 = None
+    _ao2_available = False
+
+def speak(text):
+    if _ao2_available and _ao2:
+        try: _ao2.speak(text, interrupt=True)
+        except Exception: pass
+
 VERSION_TAG = "v2026-alpha14"
 if sys.platform == 'win32':
     from winotify import Notification as _WinNotification
@@ -112,7 +125,8 @@ def load_user_config():
         'username': '',
         'password': '',
         'soundpack': 'default',
-        'chat_logging': {}
+        'chat_logging': {},
+        'tts_enabled': True
     }
 
     # 1. Load non-sensitive preferences from JSON
@@ -170,6 +184,47 @@ def save_user_config(settings):
             except Exception as e:
                 # Password might not exist, ignore
                 pass
+
+def get_conversations_path(username):
+    return os.path.join(get_config_dir(), f'conversations_{username}.json')
+
+def load_noncontact_senders(username):
+    path = get_conversations_path(username)
+    try:
+        with open(path, 'r') as f:
+            return set(json.load(f))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return set()
+
+def save_noncontact_senders(username, senders):
+    try:
+        with open(get_conversations_path(username), 'w') as f:
+            json.dump(sorted(senders), f)
+    except OSError as e:
+        print(f"Could not save conversations: {e}")
+
+def get_noncontact_chat_path(my_username, contact):
+    path = os.path.join(get_config_dir(), 'noncontact_messages', my_username)
+    os.makedirs(path, exist_ok=True)
+    return os.path.join(path, f'{contact}.json')
+
+def load_noncontact_messages(my_username, contact):
+    try:
+        with open(get_noncontact_chat_path(my_username, contact), 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return []
+
+def save_noncontact_messages(my_username, contact, messages):
+    try:
+        with open(get_noncontact_chat_path(my_username, contact), 'w', encoding='utf-8') as f:
+            json.dump(messages, f)
+    except OSError as e:
+        print(f"Could not save messages: {e}")
+
+def delete_noncontact_messages(my_username, contact):
+    try: os.remove(get_noncontact_chat_path(my_username, contact))
+    except OSError: pass
 
 SERVER_CONFIG = load_server_config()
 ADDR = (SERVER_CONFIG['host'], SERVER_CONFIG['port'])
@@ -274,16 +329,16 @@ class ThriveTaskBarIcon(wx.adv.TaskBarIcon):
 
 class SettingsDialog(wx.Dialog):
     def __init__(self, parent, current_config):
-        super().__init__(parent, title="Settings", size=(300, 150)); self.config = current_config
+        super().__init__(parent, title="Settings", size=(300, 210)); self.config = current_config
         panel = wx.Panel(self); main_sizer = wx.BoxSizer(wx.VERTICAL); sound_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "&Sound Pack")
-        
+
         dark_mode_on = is_windows_dark_mode()
         if dark_mode_on:
             dark_color = wx.Colour(40, 40, 40); light_text_color = wx.WHITE
             WxMswDarkMode().enable(self); self.SetBackgroundColour(dark_color); panel.SetBackgroundColour(dark_color)
             sound_box.GetStaticBox().SetForegroundColour(light_text_color)
             sound_box.GetStaticBox().SetBackgroundColour(dark_color)
-        
+
         sound_packs = ['default'];
         try:
             if os.path.isdir('sounds'):
@@ -292,15 +347,24 @@ class SettingsDialog(wx.Dialog):
         self.choice = wx.Choice(sound_box.GetStaticBox(), choices=sound_packs); current_pack = self.config.get('soundpack', 'default')
         if current_pack in sound_packs: self.choice.SetStringSelection(current_pack)
         else: self.choice.SetSelection(0)
-        
-        sound_box.Add(self.choice, 0, wx.EXPAND | wx.ALL, 5); main_sizer.Add(sound_box, 0, wx.EXPAND | wx.ALL, 5); btn_sizer = wx.StdDialogButtonSizer()
+
+        self.tts_cb = wx.CheckBox(panel, label="&Read new messages aloud")
+        self.tts_cb.SetValue(self.config.get('tts_enabled', True))
+        if not _ao2_available:
+            self.tts_cb.Enable(False)
+            self.tts_cb.SetToolTip("accessible_output2 is not installed")
+
+        sound_box.Add(self.choice, 0, wx.EXPAND | wx.ALL, 5); main_sizer.Add(sound_box, 0, wx.EXPAND | wx.ALL, 5)
+        main_sizer.Add(self.tts_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        btn_sizer = wx.StdDialogButtonSizer()
         ok_btn = wx.Button(panel, wx.ID_OK, label="&Apply"); ok_btn.SetDefault(); cancel_btn = wx.Button(panel, wx.ID_CANCEL)
-        
+
         if dark_mode_on:
             self.choice.SetBackgroundColour(dark_color); self.choice.SetForegroundColour(light_text_color)
+            self.tts_cb.SetForegroundColour(light_text_color); self.tts_cb.SetBackgroundColour(dark_color)
             ok_btn.SetBackgroundColour(dark_color); ok_btn.SetForegroundColour(light_text_color)
             cancel_btn.SetBackgroundColour(dark_color); cancel_btn.SetForegroundColour(light_text_color)
-            
+
         btn_sizer.AddButton(ok_btn); btn_sizer.AddButton(cancel_btn); btn_sizer.Realize(); main_sizer.Add(btn_sizer, 0, wx.ALIGN_CENTER | wx.ALL, 10); panel.SetSizer(main_sizer)
 
 STATUS_PRESETS = ["online", "offline", "busy", "away", "on the phone", "doing homework", "in the shower", "watching TV", "hiding from the parents", "fixing my PC", "battery about to die"]
@@ -490,6 +554,7 @@ class ClientApp(wx.App):
                 elif act == "file_accepted": wx.CallAfter(self.on_file_accepted, msg)
                 elif act == "file_declined": wx.CallAfter(self.on_file_declined, msg)
                 elif act == "file_data": wx.CallAfter(self.on_file_data, msg)
+                elif act == "offline_messages": wx.CallAfter(self.frame.on_offline_messages, msg["messages"])
                 elif act == "banned_kick": wx.CallAfter(self.on_banned); handled = True; break
         except (IOError, json.JSONDecodeError, ValueError):
             print("Disconnected from server.")
@@ -1029,7 +1094,7 @@ class MainFrame(wx.Frame):
             show_notification("Contact offline", f"{user} has gone offline.")
 
     def __init__(self, user, sock):
-        super().__init__(None, title=f"Thrive Messenger – {user}", size=(400,380)); self.user, self.sock = user, sock; self.task_bar_icon = None; self.is_exiting = False; self._directory_dlg = None
+        super().__init__(None, title=f"Thrive Messenger – {user}", size=(400,380)); self.user, self.sock = user, sock; self.task_bar_icon = None; self.is_exiting = False; self._directory_dlg = None; self._conversations_dlg = None; self._noncontact_senders = load_noncontact_senders(user)
         self.current_status = wx.GetApp().user_config.get('status', 'online')
         self.notifications = []; self.Bind(wx.EVT_CLOSE, self.on_close_window); panel = wx.Panel(self)
 
@@ -1065,10 +1130,11 @@ class MainFrame(wx.Frame):
         self.btn_directory = wx.Button(panel, label="User Director&y")
         self.btn_admin = wx.Button(panel, label="Use Ser&ver Side Commands"); self.btn_settings = wx.Button(panel, label="Se&ttings...")
         self.btn_update = wx.Button(panel, label="Check for U&pdates")
+        self.btn_conv = wx.Button(panel, label="&Conversations...")
         self.btn_logout = wx.Button(panel, label="L&ogout"); self.btn_exit = wx.Button(panel, label="E&xit")
 
         if dark_mode_on:
-            buttons = [self.btn_block, self.btn_add, self.btn_send, self.btn_delete, self.btn_send_file, self.btn_info, self.btn_status, self.btn_directory, self.btn_admin, self.btn_settings, self.btn_update, self.btn_logout, self.btn_exit]
+            buttons = [self.btn_block, self.btn_add, self.btn_send, self.btn_delete, self.btn_send_file, self.btn_info, self.btn_status, self.btn_directory, self.btn_conv, self.btn_admin, self.btn_settings, self.btn_update, self.btn_logout, self.btn_exit]
             for btn in buttons:
                 btn.SetBackgroundColour(dark_color)
                 btn.SetForegroundColour(light_text_color)
@@ -1080,19 +1146,25 @@ class MainFrame(wx.Frame):
         self.btn_directory.Bind(wx.EVT_BUTTON, self.on_user_directory)
         self.btn_admin.Bind(wx.EVT_BUTTON, self.on_admin); self.btn_settings.Bind(wx.EVT_BUTTON, self.on_settings)
         self.btn_update.Bind(wx.EVT_BUTTON, self.on_check_updates)
+        self.btn_conv.Bind(wx.EVT_BUTTON, self.on_conversations)
         self.btn_logout.Bind(wx.EVT_BUTTON, self.on_logout); self.btn_exit.Bind(wx.EVT_BUTTON, self.on_exit)
-        accel_entries = [(wx.ACCEL_ALT, ord('B'), self.btn_block.GetId()), (wx.ACCEL_ALT, ord('A'), self.btn_add.GetId()), (wx.ACCEL_ALT, ord('S'), self.btn_send.GetId()), (wx.ACCEL_ALT, ord('D'), self.btn_delete.GetId()), (wx.ACCEL_ALT, ord('F'), self.btn_send_file.GetId()), (wx.ACCEL_ALT, ord('I'), self.btn_info.GetId()), (wx.ACCEL_ALT, ord('U'), self.btn_status.GetId()), (wx.ACCEL_ALT, ord('Y'), self.btn_directory.GetId()), (wx.ACCEL_ALT, ord('V'), self.btn_admin.GetId()), (wx.ACCEL_ALT, ord('T'), self.btn_settings.GetId()), (wx.ACCEL_ALT, ord('P'), self.btn_update.GetId()), (wx.ACCEL_ALT, ord('O'), self.btn_logout.GetId()), (wx.ACCEL_ALT, ord('X'), self.btn_exit.GetId()),]
+        accel_entries = [(wx.ACCEL_ALT, ord('B'), self.btn_block.GetId()), (wx.ACCEL_ALT, ord('A'), self.btn_add.GetId()), (wx.ACCEL_ALT, ord('S'), self.btn_send.GetId()), (wx.ACCEL_ALT, ord('D'), self.btn_delete.GetId()), (wx.ACCEL_ALT, ord('F'), self.btn_send_file.GetId()), (wx.ACCEL_ALT, ord('I'), self.btn_info.GetId()), (wx.ACCEL_ALT, ord('U'), self.btn_status.GetId()), (wx.ACCEL_ALT, ord('Y'), self.btn_directory.GetId()), (wx.ACCEL_ALT, ord('C'), self.btn_conv.GetId()), (wx.ACCEL_ALT, ord('V'), self.btn_admin.GetId()), (wx.ACCEL_ALT, ord('T'), self.btn_settings.GetId()), (wx.ACCEL_ALT, ord('P'), self.btn_update.GetId()), (wx.ACCEL_ALT, ord('O'), self.btn_logout.GetId()), (wx.ACCEL_ALT, ord('X'), self.btn_exit.GetId()),]
         accel_tbl = wx.AcceleratorTable(accel_entries); self.SetAcceleratorTable(accel_tbl)
         gs_main = wx.GridSizer(1, 5, 5, 5); gs_main.Add(self.btn_block, 0, wx.EXPAND); gs_main.Add(self.btn_add, 0, wx.EXPAND); gs_main.Add(self.btn_send, 0, wx.EXPAND); gs_main.Add(self.btn_send_file, 0, wx.EXPAND); gs_main.Add(self.btn_delete, 0, wx.EXPAND)
-        gs_util = wx.GridSizer(1, 8, 5, 5); gs_util.Add(self.btn_info, 0, wx.EXPAND); gs_util.Add(self.btn_status, 0, wx.EXPAND); gs_util.Add(self.btn_directory, 0, wx.EXPAND); gs_util.Add(self.btn_admin, 0, wx.EXPAND); gs_util.Add(self.btn_settings, 0, wx.EXPAND); gs_util.Add(self.btn_update, 0, wx.EXPAND); gs_util.Add(self.btn_logout, 0, wx.EXPAND); gs_util.Add(self.btn_exit, 0, wx.EXPAND)
+        gs_util = wx.GridSizer(1, 9, 5, 5); gs_util.Add(self.btn_info, 0, wx.EXPAND); gs_util.Add(self.btn_status, 0, wx.EXPAND); gs_util.Add(self.btn_directory, 0, wx.EXPAND); gs_util.Add(self.btn_conv, 0, wx.EXPAND); gs_util.Add(self.btn_admin, 0, wx.EXPAND); gs_util.Add(self.btn_settings, 0, wx.EXPAND); gs_util.Add(self.btn_update, 0, wx.EXPAND); gs_util.Add(self.btn_logout, 0, wx.EXPAND); gs_util.Add(self.btn_exit, 0, wx.EXPAND)
         s = wx.BoxSizer(wx.VERTICAL); s.Add(box_contacts, 1, wx.EXPAND|wx.ALL, 5); s.Add(gs_main, 0, wx.CENTER|wx.ALL, 5); s.Add(gs_util, 0, wx.CENTER|wx.ALL, 5); panel.SetSizer(s)
         self.update_button_states()
     def on_settings(self, event):
         app = wx.GetApp()
         with SettingsDialog(self, app.user_config) as dlg:
             if dlg.ShowModal() == wx.ID_OK:
-                selected_pack = dlg.choice.GetStringSelection(); app.user_config['soundpack'] = selected_pack; save_user_config(app.user_config)
+                selected_pack = dlg.choice.GetStringSelection(); app.user_config['soundpack'] = selected_pack
+                app.user_config['tts_enabled'] = dlg.tts_cb.IsChecked(); save_user_config(app.user_config)
                 wx.MessageBox("Settings have been applied.", "Settings Saved", wx.OK | wx.ICON_INFORMATION)
+    def on_conversations(self, _):
+        if self._conversations_dlg:
+            self._conversations_dlg.Raise(); self._conversations_dlg.SetFocus(); return
+        dlg = ConversationsDialog(self); self._conversations_dlg = dlg; dlg.Show()
     def on_user_directory(self, _):
         if self._directory_dlg:
             self._directory_dlg.Raise(); self._directory_dlg.SetFocus(); return
@@ -1192,7 +1264,10 @@ class MainFrame(wx.Frame):
         status = c.get("status_text", "online") if c["online"] and not c["blocked"] else "offline"
         if c.get("is_admin"): status += " (Admin)"
         self._all_contacts.append({"user": c["user"], "status": status, "blocked": c["blocked"]})
+        self._noncontact_senders.discard(c["user"])
+        save_noncontact_senders(self.user, self._noncontact_senders)
         self._apply_search_filter()
+        if self._conversations_dlg: self._conversations_dlg.refresh()
         chat = self.get_chat(c["user"])
         if chat: chat.hide_add_button()
         if self._directory_dlg:
@@ -1258,6 +1333,7 @@ class MainFrame(wx.Frame):
         try: self.sock.close()
         except: pass
         if self._directory_dlg: self._directory_dlg.Destroy(); self._directory_dlg = None
+        if self._conversations_dlg: self._conversations_dlg.Destroy(); self._conversations_dlg = None
         if self.task_bar_icon: self.task_bar_icon.Destroy()
         self.is_exiting = True; self.Destroy()
         app.ExitMainLoop()
@@ -1268,6 +1344,7 @@ class MainFrame(wx.Frame):
         try: self.sock.close()
         except: pass
         if self._directory_dlg: self._directory_dlg.Destroy(); self._directory_dlg = None
+        if self._conversations_dlg: self._conversations_dlg.Destroy(); self._conversations_dlg = None
         app.play_sound("logout.wav"); self.Destroy()
         app.show_login_dialog()
     def on_key(self, evt):
@@ -1302,12 +1379,55 @@ class MainFrame(wx.Frame):
     def receive_message(self, msg):
         wx.GetApp().play_sound("receive.wav");
         app = wx.GetApp(); logging_config = app.user_config.get('chat_logging', {}); is_logging_enabled = logging_config.get(msg["from"], False)
+        is_contact = msg["from"] in self.contact_states
         dlg = self.get_chat(msg["from"])
         if not dlg:
-            is_contact = msg["from"] in self.contact_states
             dlg = ChatDialog(self, msg["from"], self.sock, self.user, is_logging_enabled, is_contact=is_contact)
-        dlg.Show(); dlg.append(msg["msg"], msg["from"], msg["time"]); dlg.input_ctrl.SetFocus(); self.RequestUserAttention()
+        if not is_contact and msg["from"] not in self._noncontact_senders:
+            self._noncontact_senders.add(msg["from"]); self._apply_search_filter()
+            save_noncontact_senders(self.user, self._noncontact_senders)
+        if sys.platform == 'win32' and wx.GetActiveWindow() is None:
+            try:
+                prev_fg = ctypes.windll.user32.GetForegroundWindow()
+            except Exception:
+                prev_fg = None
+        else:
+            prev_fg = None
+        dlg.Show()
+        if prev_fg:
+            try:
+                ctypes.windll.user32.SetForegroundWindow(prev_fg)
+            except Exception:
+                pass
+        dlg.append(msg["msg"], msg["from"], msg["time"])
+        if app.user_config.get('tts_enabled', True):
+            speak(f"{msg['from']}: {msg['msg']}")
+        self.RequestUserAttention()
     def on_message_failed(self, to, reason): chat_dlg = self.get_chat(to); (chat_dlg.append_error(reason) if chat_dlg else wx.MessageBox(reason, "Message Failed", wx.OK | wx.ICON_ERROR))
+    def on_offline_messages(self, messages):
+        if not messages: return
+        by_sender = {}
+        for m in messages:
+            by_sender.setdefault(m["from"], []).append(m)
+        app = wx.GetApp(); logging_config = app.user_config.get('chat_logging', {})
+        any_new_noncontact = False
+        for sender, msgs in by_sender.items():
+            is_contact = sender in self.contact_states
+            dlg = self.get_chat(sender) or ChatDialog(self, sender, self.sock, self.user, logging_config.get(sender, False), is_contact=is_contact)
+            for m in msgs:
+                dlg.append(m["msg"], m["from"], m["time"])
+            if not is_contact and sender not in self._noncontact_senders:
+                self._noncontact_senders.add(sender); any_new_noncontact = True
+        if any_new_noncontact:
+            save_noncontact_senders(self.user, self._noncontact_senders)
+        n_msgs = len(messages); n_senders = len(by_sender)
+        summary = ", ".join(sorted(by_sender.keys()))
+        result = wx.MessageBox(
+            f"You received {n_msgs} message{'s' if n_msgs != 1 else ''} while offline "
+            f"from {n_senders} user{'s' if n_senders != 1 else ''} ({summary}).\n\nWould you like to view {'them' if n_msgs != 1 else 'it'}?",
+            "Missed Messages", wx.YES_NO | wx.ICON_INFORMATION)
+        if result == wx.YES:
+            OfflineMessagesDialog(self, by_sender).Show()
     def get_chat(self, contact):
         for child in self.GetChildren():
             if isinstance(child, ChatDialog) and child.contact == contact: return child
@@ -1359,7 +1479,10 @@ class ChatDialog(wx.Dialog):
     def __init__(self, parent, contact, sock, user, logging_enabled=False, is_contact=True):
         super().__init__(parent, title=f"Chat with {contact}", size=(450, 450))
         self.contact, self.sock, self.user = contact, sock, user
+        self.is_contact = is_contact
+        self._msg_log = []
         self.Bind(wx.EVT_CHAR_HOOK, self.on_key)
+        self.Bind(wx.EVT_CLOSE, self.on_close)
 
         dark_mode_on = is_windows_dark_mode()
         if dark_mode_on:
@@ -1403,6 +1526,15 @@ class ChatDialog(wx.Dialog):
         btn_sizer.Add(btn_file, 1, wx.EXPAND | wx.ALL, 5)
         s.Add(btn_sizer, 0, wx.EXPAND|wx.ALL, 5)
         self.SetSizer(s)
+        if not is_contact:
+            self._load_saved_messages()
+    def _load_saved_messages(self):
+        for m in load_noncontact_messages(self.user, self.contact):
+            self._msg_log.append(m)
+            idx = self.hist.GetItemCount()
+            self.hist.InsertItem(idx, m['sender']); self.hist.SetItem(idx, 1, m['text'])
+            self.hist.SetItem(idx, 2, format_timestamp(m['ts']))
+            if m.get('is_error'): self.hist.SetItemTextColour(idx, wx.RED)
     def on_toggle_save(self, event):
         app = wx.GetApp(); is_enabled = self.save_hist_cb.IsChecked()
         if 'chat_logging' not in app.user_config: app.user_config['chat_logging'] = {}
@@ -1423,6 +1555,14 @@ class ChatDialog(wx.Dialog):
             if event.ShiftDown(): self.input_ctrl.WriteText('\n')
             else: self.on_send(None)
         else: event.Skip()
+    def on_close(self, event):
+        if self.is_contact:
+            event.Skip()
+        else:
+            self.Hide()
+            frame = self.GetParent()
+            if frame._conversations_dlg:
+                frame._conversations_dlg.Raise(); frame._conversations_dlg.SetFocus()
     def on_key(self, event):
         if event.GetKeyCode() == wx.WXK_ESCAPE: self.Close()
         else: event.Skip()
@@ -1441,6 +1581,7 @@ class ChatDialog(wx.Dialog):
         self.sock.sendall(json.dumps({"action": "add_contact", "to": self.contact}).encode() + b"\n")
         self.btn_add_contact.Disable(); self.btn_add_contact.SetLabel("Adding...")
     def hide_add_button(self):
+        self.is_contact = True
         self.btn_add_contact.Hide(); self.GetSizer().Layout()
     def append(self, text, sender, ts, is_error=False):
         idx = self.hist.GetItemCount(); self.hist.InsertItem(idx, sender); self.hist.SetItem(idx, 1, text)
@@ -1449,10 +1590,171 @@ class ChatDialog(wx.Dialog):
         if self.save_hist_cb.IsChecked():
             log_line = f"[{formatted_time}] {sender}: {text}\n"
             self._save_message_to_log(log_line)
+        if not self.is_contact:
+            self._msg_log.append({'sender': sender, 'text': text, 'ts': ts, 'is_error': is_error})
+            save_noncontact_messages(self.user, self.contact, self._msg_log)
     def append_error(self, reason):
         ts = datetime.datetime.now().isoformat()
         self.append(reason, "System", ts, is_error=True)
         self.input_ctrl.SetFocus()
+
+class ConversationsDialog(wx.Dialog):
+    def __init__(self, parent):
+        super().__init__(parent, title="Conversations", size=(300, 350))
+        self.Bind(wx.EVT_CHAR_HOOK, self.on_key)
+        self.Bind(wx.EVT_CLOSE, self.on_close)
+
+        dark_mode_on = is_windows_dark_mode()
+        if dark_mode_on:
+            dark_color = wx.Colour(40, 40, 40); light_text_color = wx.WHITE
+            WxMswDarkMode().enable(self); self.SetBackgroundColour(dark_color)
+
+        s = wx.BoxSizer(wx.VERTICAL)
+        lbl = wx.StaticText(self, label="Users who have messaged you (not in contacts):")
+        self.lv = wx.ListCtrl(self, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
+        self.lv.InsertColumn(0, "User", width=260)
+        self.lv.Bind(wx.EVT_LIST_ITEM_ACTIVATED, self.on_open_chat)
+        self.lv.Bind(wx.EVT_LIST_ITEM_SELECTED, lambda e: (e.Skip(), self._update_buttons()))
+        self.lv.Bind(wx.EVT_LIST_ITEM_DESELECTED, lambda e: (e.Skip(), self._update_buttons()))
+        self.btn_open = wx.Button(self, label="&Open Chat")
+        self.btn_add = wx.Button(self, label="&Add to Contacts")
+        self.btn_block = wx.Button(self, label="&Block")
+        self.btn_close = wx.Button(self, label="C&lose")
+        self.btn_open.Bind(wx.EVT_BUTTON, self.on_open_chat)
+        self.btn_add.Bind(wx.EVT_BUTTON, self.on_add_contact)
+        self.btn_block.Bind(wx.EVT_BUTTON, self.on_block)
+        self.btn_close.Bind(wx.EVT_BUTTON, lambda e: self.Close())
+
+        if dark_mode_on:
+            for w in [self.lv, self.btn_open, self.btn_add, self.btn_block, self.btn_close]:
+                w.SetBackgroundColour(dark_color); w.SetForegroundColour(light_text_color)
+            lbl.SetForegroundColour(light_text_color)
+
+        btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        btn_sizer.Add(self.btn_open, 1, wx.EXPAND | wx.ALL, 5)
+        btn_sizer.Add(self.btn_add, 1, wx.EXPAND | wx.ALL, 5)
+        btn_sizer.Add(self.btn_block, 1, wx.EXPAND | wx.ALL, 5)
+        btn_sizer.Add(self.btn_close, 1, wx.EXPAND | wx.ALL, 5)
+        s.Add(lbl, 0, wx.LEFT | wx.TOP | wx.RIGHT, 10)
+        s.Add(self.lv, 1, wx.EXPAND | wx.ALL, 5)
+        s.Add(btn_sizer, 0, wx.EXPAND | wx.BOTTOM, 5)
+        self.SetSizer(s)
+        self.refresh()
+        self._update_buttons()
+
+    def refresh(self):
+        frame = self.GetParent()
+        self.lv.DeleteAllItems()
+        for username in sorted(frame._noncontact_senders):
+            if username in frame.contact_states: continue
+            self.lv.InsertItem(self.lv.GetItemCount(), username)
+        self._update_buttons()
+
+    def _update_buttons(self):
+        has_sel = self.lv.GetSelectedItemCount() > 0
+        self.btn_open.Enable(has_sel); self.btn_add.Enable(has_sel); self.btn_block.Enable(has_sel)
+
+    def on_open_chat(self, _):
+        sel = self.lv.GetFirstSelected()
+        if sel < 0: return
+        username = self.lv.GetItemText(sel); frame = self.GetParent()
+        app = wx.GetApp(); logging_config = app.user_config.get('chat_logging', {}); is_logging_enabled = logging_config.get(username, False)
+        dlg = frame.get_chat(username) or ChatDialog(frame, username, frame.sock, frame.user, is_logging_enabled, is_contact=False)
+        dlg.Show(); dlg.Raise(); dlg.input_ctrl.SetFocus()
+
+    def on_add_contact(self, _):
+        sel = self.lv.GetFirstSelected()
+        if sel < 0: return
+        username = self.lv.GetItemText(sel)
+        self.GetParent().sock.sendall(json.dumps({"action": "add_contact", "to": username}).encode() + b"\n")
+
+    def on_block(self, _):
+        sel = self.lv.GetFirstSelected()
+        if sel < 0: return
+        username = self.lv.GetItemText(sel); frame = self.GetParent()
+        frame.sock.sendall(json.dumps({"action": "block_contact", "to": username}).encode() + b"\n")
+        chat = frame.get_chat(username)
+        if chat: chat.Destroy()
+        frame._noncontact_senders.discard(username)
+        save_noncontact_senders(frame.user, frame._noncontact_senders)
+        delete_noncontact_messages(frame.user, username)
+        self.refresh()
+
+    def on_close(self, event):
+        self.GetParent()._conversations_dlg = None; event.Skip()
+
+    def on_key(self, event):
+        if event.GetKeyCode() == wx.WXK_ESCAPE: self.Close()
+        else: event.Skip()
+
+class OfflineMessagesDialog(wx.Dialog):
+    def __init__(self, parent, by_sender):
+        super().__init__(parent, title="Missed Messages", size=(350, 400))
+        self._by_sender = by_sender
+        self.Bind(wx.EVT_CHAR_HOOK, self.on_key)
+
+        dark_mode_on = is_windows_dark_mode()
+        if dark_mode_on:
+            dark_color = wx.Colour(40, 40, 40); light_text_color = wx.WHITE
+            WxMswDarkMode().enable(self); self.SetBackgroundColour(dark_color)
+
+        s = wx.BoxSizer(wx.VERTICAL)
+        lbl = wx.StaticText(self, label="Messages received while you were offline:")
+        self.lv = wx.ListCtrl(self, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
+        self.lv.InsertColumn(0, "User", width=200); self.lv.InsertColumn(1, "Messages", width=80)
+        self.lv.Bind(wx.EVT_LIST_ITEM_ACTIVATED, self.on_open_chat)
+        self.lv.Bind(wx.EVT_LIST_ITEM_SELECTED, lambda e: (e.Skip(), self._update_buttons()))
+        self.lv.Bind(wx.EVT_LIST_ITEM_DESELECTED, lambda e: (e.Skip(), self._update_buttons()))
+        for sender in sorted(by_sender.keys()):
+            idx = self.lv.InsertItem(self.lv.GetItemCount(), sender)
+            self.lv.SetItem(idx, 1, str(len(by_sender[sender])))
+        self.btn_open = wx.Button(self, label="&Open Chat")
+        self.btn_add = wx.Button(self, label="&Add to Contacts")
+        self.btn_close = wx.Button(self, label="C&lose")
+        self.btn_open.Bind(wx.EVT_BUTTON, self.on_open_chat)
+        self.btn_add.Bind(wx.EVT_BUTTON, self.on_add_contact)
+        self.btn_close.Bind(wx.EVT_BUTTON, lambda e: self.Close())
+
+        if dark_mode_on:
+            for w in [self.lv, self.btn_open, self.btn_add, self.btn_close]:
+                w.SetBackgroundColour(dark_color); w.SetForegroundColour(light_text_color)
+            lbl.SetForegroundColour(light_text_color)
+
+        btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        btn_sizer.Add(self.btn_open, 1, wx.EXPAND | wx.ALL, 5)
+        btn_sizer.Add(self.btn_add, 1, wx.EXPAND | wx.ALL, 5)
+        btn_sizer.Add(self.btn_close, 1, wx.EXPAND | wx.ALL, 5)
+        s.Add(lbl, 0, wx.LEFT | wx.TOP | wx.RIGHT, 10)
+        s.Add(self.lv, 1, wx.EXPAND | wx.ALL, 5)
+        s.Add(btn_sizer, 0, wx.EXPAND | wx.BOTTOM, 5)
+        self.SetSizer(s)
+        self._update_buttons()
+
+    def _update_buttons(self):
+        sel = self.lv.GetFirstSelected()
+        has_sel = sel >= 0
+        self.btn_open.Enable(has_sel)
+        if has_sel:
+            sender = self.lv.GetItemText(sel)
+            self.btn_add.Enable(sender not in self.GetParent().contact_states)
+        else:
+            self.btn_add.Enable(False)
+
+    def on_open_chat(self, _):
+        sel = self.lv.GetFirstSelected()
+        if sel < 0: return
+        sender = self.lv.GetItemText(sel); frame = self.GetParent()
+        dlg = frame.get_chat(sender)
+        if dlg: dlg.Show(); dlg.Raise(); dlg.input_ctrl.SetFocus()
+
+    def on_add_contact(self, _):
+        sel = self.lv.GetFirstSelected()
+        if sel < 0: return
+        self.GetParent().sock.sendall(json.dumps({"action": "add_contact", "to": self.lv.GetItemText(sel)}).encode() + b"\n")
+
+    def on_key(self, event):
+        if event.GetKeyCode() == wx.WXK_ESCAPE: self.Close()
+        else: event.Skip()
 
 def main():
     app = ClientApp(False); app.MainLoop()

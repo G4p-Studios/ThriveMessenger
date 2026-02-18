@@ -120,6 +120,7 @@ def init_db():
 
     cur.execute('''CREATE TABLE IF NOT EXISTS contacts (owner TEXT, contact TEXT, blocked INTEGER DEFAULT 0, PRIMARY KEY(owner, contact))''')
     cur.execute('''CREATE TABLE IF NOT EXISTS file_bans (username TEXT, file_type TEXT, until_date TEXT, reason TEXT, PRIMARY KEY(username, file_type))''')
+    cur.execute('''CREATE TABLE IF NOT EXISTS offline_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, recipient TEXT NOT NULL, sender TEXT NOT NULL, message TEXT NOT NULL, timestamp TEXT NOT NULL)''')
     # Add file_type column if table was created with an older schema
     fb_cols = [row[1] for row in cur.execute("PRAGMA table_info(file_bans)")]
     if 'file_type' not in fb_cols: cur.execute("ALTER TABLE file_bans ADD COLUMN file_type TEXT")
@@ -297,6 +298,12 @@ def handle_client(cs, addr):
         with lock:
             contacts = [{"user":c, "blocked":b, "online": (c in clients), "is_admin": (c in admins), "status_text": client_statuses.get(c, "offline") if c in clients else "offline"} for c,b in rows]
         sock.sendall((json.dumps({"action":"contact_list","contacts":contacts})+"\n").encode())
+        offline = db.execute("SELECT sender, message, timestamp FROM offline_messages WHERE recipient=? ORDER BY id ASC", (user,)).fetchall()
+        if offline:
+            msgs = [{"from": s, "msg": m, "time": t} for s, m, t in offline]
+            sock.sendall((json.dumps({"action": "offline_messages", "messages": msgs}) + "\n").encode())
+            db.execute("DELETE FROM offline_messages WHERE recipient=?", (user,))
+            db.commit()
         db.close()
         
         broadcast_contact_status(user, True)
@@ -441,8 +448,11 @@ def handle_client(cs, addr):
                     reason = f"Message couldn't be sent because {to} has you blocked."
                 elif sender_has_blocked and sender_has_blocked[0] == 1: 
                     reason = "You have blocked this contact."
-                elif not sock_to: 
-                    reason = f"{to} is offline."
+                elif not sock_to:
+                    con2 = sqlite3.connect(DB)
+                    con2.execute("INSERT INTO offline_messages (recipient, sender, message, timestamp) VALUES (?, ?, ?, ?)", (to, frm, msg["msg"], msg["time"]))
+                    con2.commit(); con2.close()
+                    reason = None
                 else:
                     try: 
                         sock_to.sendall((json.dumps(msg)+"\n").encode())
