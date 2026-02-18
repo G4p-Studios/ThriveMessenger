@@ -1360,11 +1360,11 @@ class ClientApp(wx.App):
             chat = self.frame.get_chat(sender)
             if chat:
                 names = ", ".join(f["filename"] for f in files)
-                chat.append(f"Accepting {len(files)} file(s): {names}...", "System", datetime.datetime.now().isoformat())
+                chat.append(f"Accepting {len(files)} file(s): {names}...", "System", time.time())
         else:
             self.sock.sendall((json.dumps({"action": "file_decline", "transfer_id": transfer_id}) + "\n").encode())
             chat = self.frame.get_chat(sender)
-            if chat: chat.append(f"Declined {len(files)} file(s) from {sender}", "System", datetime.datetime.now().isoformat())
+            if chat: chat.append(f"Declined {len(files)} file(s) from {sender}", "System", time.time())
 
     def on_file_offer_failed(self, msg):
         self.play_sound("file_error.wav")
@@ -1401,7 +1401,7 @@ class ClientApp(wx.App):
         chat = self.frame.get_chat(to)
         if chat:
             names = ", ".join(filenames)
-            chat.append(f"{len(filenames)} file(s) sent: {names}", "System", datetime.datetime.now().isoformat())
+            chat.append(f"{len(filenames)} file(s) sent: {names}", "System", time.time())
 
     def _on_file_send_error(self, to, error):
         self.play_sound("file_error.wav")
@@ -1415,7 +1415,7 @@ class ClientApp(wx.App):
         self.play_sound("file_error.wav")
         names = ", ".join(f["filename"] for f in files)
         chat = self.frame.get_chat(to)
-        if chat: chat.append(f"{to} declined your file(s): {names}", "System", datetime.datetime.now().isoformat())
+        if chat: chat.append(f"{to} declined your file(s): {names}", "System", time.time())
         else: wx.MessageBox(f"{to} declined your file(s): {names}", "File Declined", wx.ICON_INFORMATION)
 
     def on_file_data(self, msg):
@@ -1447,7 +1447,7 @@ class ClientApp(wx.App):
             self.play_sound("file_receive.wav")
             chat = self.frame.get_chat(sender)
             names = ", ".join(saved)
-            if chat: chat.append(f"{len(saved)} file(s) received and saved: {names}", "System", datetime.datetime.now().isoformat())
+            if chat: chat.append(f"{len(saved)} file(s) received and saved: {names}", "System", time.time())
             else:
                 show_notification("Files Received", f"{sender} sent you {len(saved)} file(s)")
             if self.user_config.get('auto_open_received_files', True):
@@ -1474,7 +1474,7 @@ class ClientApp(wx.App):
         chat = self.frame.get_chat(contact)
         if chat:
             names = ", ".join(f["filename"] for f in files)
-            chat.append(f"Sending file offer ({len(files)} file(s)): {names}...", "System", datetime.datetime.now().isoformat())
+            chat.append(f"Sending file offer ({len(files)} file(s)): {names}...", "System", time.time())
 
 class VerificationDialog(wx.Dialog):
     def __init__(self, parent, username):
@@ -3091,11 +3091,19 @@ class MainFrame(wx.Frame):
         return None
 
 def get_day_with_suffix(d): return str(d) + "th" if 11 <= d <= 13 else str(d) + {1: "st", 2: "nd", 3: "rd"}.get(d % 10, "th")
-def format_timestamp(iso_ts):
+def format_timestamp(ts):
     try:
-        dt = datetime.datetime.fromisoformat(iso_ts); day_with_suffix = get_day_with_suffix(dt.day)
-        formatted_hour = dt.strftime('%I:%M %p').lstrip('0'); return dt.strftime(f'%A, %B {day_with_suffix}, %Y at {formatted_hour}')
-    except (ValueError, TypeError): return iso_ts
+        if isinstance(ts, (int, float)):
+            dt = datetime.datetime.fromtimestamp(ts)
+        else:
+            try:
+                dt = datetime.datetime.fromtimestamp(float(ts))
+            except (ValueError, TypeError):
+                dt = datetime.datetime.fromisoformat(ts)  # backward compat with old ISO strings on disk
+        day_with_suffix = get_day_with_suffix(dt.day)
+        formatted_hour = dt.strftime('%I:%M %p').lstrip('0')
+        return dt.strftime(f'%A, %B {day_with_suffix}, %Y at {formatted_hour}')
+    except (ValueError, TypeError, OSError): return str(ts)
 
 class AdminDialog(wx.Dialog):
     def __init__(self, parent, sock):
@@ -3131,7 +3139,7 @@ class AdminDialog(wx.Dialog):
         if not cmd.startswith('/'): self.append_response("Error: Commands must start with /"); return
         msg = {"action":"admin_cmd", "cmd": cmd[1:]}; self.sock.sendall(json.dumps(msg).encode()+b"\n"); self.input_ctrl.Clear(); self.input_ctrl.SetFocus()
     def append_response(self, text):
-        ts = datetime.datetime.now().isoformat(); idx = self.hist.GetItemCount(); self.hist.InsertItem(idx, text); self.hist.SetItem(idx, 1, format_timestamp(ts))
+        ts = time.time(); idx = self.hist.GetItemCount(); self.hist.InsertItem(idx, text); self.hist.SetItem(idx, 1, format_timestamp(ts))
         if text.lower().startswith('error'): self.hist.SetItemTextColour(idx, wx.RED)
 
 class ChatDialog(wx.Dialog):
@@ -3340,7 +3348,7 @@ class ChatDialog(wx.Dialog):
             log_line = f"[{formatted_time}] {sender}: {text}\n"
             self._save_message_to_log(log_line)
     def append_error(self, reason):
-        ts = datetime.datetime.now().isoformat()
+        ts = time.time()
         self.append(reason, "System", ts, is_error=True)
         self.input_ctrl.SetFocus()
 
