@@ -20,8 +20,29 @@ if sys.platform == 'win32':
 else:
     from plyer import notification as _plyer_notification
 
-def show_notification(title, message, timeout=5):
+# Initialize accessible_output2 for speech feedback
+try:
+    from accessible_output2.outputs.auto import Auto as _SpeechOutput
+    _speech = _SpeechOutput()
+except Exception as e:
+    print(f"Could not initialize speech output: {e}")
+    _speech = None
+
+def speak_message(message):
+    """Speak a message using accessible_output2 if speech feedback is enabled."""
     try:
+        if _speech and wx.GetApp() and wx.GetApp().user_config.get('speech_feedback', False):
+            _speech.speak(message, interrupt=False)
+    except Exception as e:
+        print(f"Error speaking message: {e}")
+
+def show_notification(title, message, timeout=5):
+    """Show OS notification if enabled in user preferences."""
+    try:
+        # Check if notifications are enabled in user config
+        if wx.GetApp() and not wx.GetApp().user_config.get('show_notifications', True):
+            return
+        
         if sys.platform == 'win32':
             toast = _WinNotification(app_id="Thrive Messenger", title=title, msg=message, duration="short")
             toast.show()
@@ -127,6 +148,8 @@ def load_user_config():
         'username': '',
         'password': '',
         'soundpack': 'default',
+        'speech_feedback': False,
+        'show_notifications': True,
         'chat_logging': {},
         'tts_enabled': False
     }
@@ -349,18 +372,63 @@ class SettingsDialog(wx.Dialog):
         self.choice = wx.Choice(sound_box.GetStaticBox(), choices=sound_packs); current_pack = self.config.get('soundpack', 'default')
         if current_pack in sound_packs: self.choice.SetStringSelection(current_pack)
         else: self.choice.SetSelection(0)
-
+        
+        sound_box.Add(self.choice, 0, wx.EXPAND | wx.ALL, 5); main_sizer.Add(sound_box, 0, wx.EXPAND | wx.ALL, 5)
+        
+        # Add wx.ListCtrl with checkboxes for notification options
+        notification_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "&Notification Options")
+        if dark_mode_on:
+            notification_box.GetStaticBox().SetForegroundColour(light_text_color)
+            notification_box.GetStaticBox().SetBackgroundColour(dark_color)
+        
+        # Create ListCtrl with checkboxes
+        self.notification_list = wx.ListCtrl(panel, style=wx.LC_REPORT | wx.LC_NO_HEADER | wx.LC_SINGLE_SEL)
+        self.notification_list.EnableCheckBoxes(True)
+        
+        # Add a single column to the list
+        self.notification_list.InsertColumn(0, "Option")
+        
+        # Add notification options as list items
+        self.notification_list.InsertItem(0, "Speech feedback for online/offline status")
+        self.notification_list.InsertItem(1, "Show OS notifications")
+        
+        # Set initial checked states from config
+        self.notification_list.CheckItem(0, self.config.get('speech_feedback', False))
+        self.notification_list.CheckItem(1, self.config.get('show_notifications', True))
+        
+        # Auto-size the column to fit content
+        self.notification_list.SetColumnWidth(0, wx.LIST_AUTOSIZE)
+        
+        # Apply dark mode styling to ListCtrl
+        if dark_mode_on:
+            self.notification_list.SetBackgroundColour(dark_color)
+            self.notification_list.SetForegroundColour(light_text_color)
+        
+        # Add ListCtrl to the notification box
+        notification_box.Add(self.notification_list, 1, wx.EXPAND | wx.ALL, 5)
+        main_sizer.Add(notification_box, 1, wx.EXPAND | wx.ALL, 5)
+        
+        # Add TTS checkbox from main branch
         self.tts_cb = wx.CheckBox(panel, label="&Read new messages aloud")
-        self.tts_cb.SetValue(self.config.get('tts_enabled', True))
+        self.tts_cb.SetValue(self.config.get('tts_enabled', False))
         if not _ao2_available:
             self.tts_cb.Enable(False)
             self.tts_cb.SetToolTip("accessible_output2 is not installed")
-
+        
+        if dark_mode_on:
+            self.tts_cb.SetBackgroundColour(dark_color)
+            self.tts_cb.SetForegroundColour(light_text_color)
+        
+        main_sizer.Add(self.tts_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        
+        # Add Change Password button from main branch
         self.btn_chpass = wx.Button(panel, label="C&hange Password...")
         self.btn_chpass.Bind(wx.EVT_BUTTON, self.on_change_password)
-
-        sound_box.Add(self.choice, 0, wx.EXPAND | wx.ALL, 5); main_sizer.Add(sound_box, 0, wx.EXPAND | wx.ALL, 5)
-        main_sizer.Add(self.tts_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        
+        if dark_mode_on:
+            self.btn_chpass.SetBackgroundColour(dark_color)
+            self.btn_chpass.SetForegroundColour(light_text_color)
+        
         main_sizer.Add(self.btn_chpass, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         btn_sizer = wx.StdDialogButtonSizer()
         ok_btn = wx.Button(panel, wx.ID_OK, label="&Apply"); ok_btn.SetDefault(); cancel_btn = wx.Button(panel, wx.ID_CANCEL)
@@ -1228,9 +1296,11 @@ class MainFrame(wx.Frame):
         if online and not was_online:
             wx.GetApp().play_sound("contact_online.wav")
             show_notification("Contact online", f"{user} has come online.")
+            speak_message(f"{user} has come online.")
         elif not online and was_online:
             wx.GetApp().play_sound("contact_offline.wav")
             show_notification("Contact offline", f"{user} has gone offline.")
+            speak_message(f"{user} has gone offline.")
 
     def __init__(self, user, sock):
         super().__init__(None, title=f"Thrive Messenger – {user}", size=(400,380)); self.user, self.sock = user, sock; self.task_bar_icon = None; self.is_exiting = False; self._directory_dlg = None; self._conversations_dlg = None; self._noncontact_senders = load_noncontact_senders(user)
@@ -1298,7 +1368,12 @@ class MainFrame(wx.Frame):
         with SettingsDialog(self, app.user_config) as dlg:
             if dlg.ShowModal() == wx.ID_OK:
                 selected_pack = dlg.choice.GetStringSelection(); app.user_config['soundpack'] = selected_pack
-                app.user_config['tts_enabled'] = dlg.tts_cb.IsChecked(); save_user_config(app.user_config)
+                # Get checked states from ListCtrl
+                app.user_config['speech_feedback'] = dlg.notification_list.IsItemChecked(0)
+                app.user_config['show_notifications'] = dlg.notification_list.IsItemChecked(1)
+                # Get TTS setting from main branch
+                app.user_config['tts_enabled'] = dlg.tts_cb.IsChecked()
+                save_user_config(app.user_config)
                 wx.MessageBox("Settings have been applied.", "Settings Saved", wx.OK | wx.ICON_INFORMATION)
     def on_conversations(self, _):
         if self._conversations_dlg:
