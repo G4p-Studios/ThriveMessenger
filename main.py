@@ -1072,7 +1072,7 @@ class ServerInfoDialog(wx.Dialog):
 
 class UserDirectoryDialog(wx.Dialog):
     def __init__(self, parent_frame, users, my_username, contact_states):
-        super().__init__(None, title="User Directory", size=(550, 500), style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        super().__init__(parent_frame, title="User Directory", size=(550, 500), style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
         self.parent_frame = parent_frame; self.my_username = my_username; self.contact_states = contact_states
         self._all_users = users; self._selected_user = None
         panel = wx.Panel(self)
@@ -1710,6 +1710,10 @@ class ChatDialog(wx.Dialog):
             else: self.on_send(None)
         else: event.Skip()
     def on_close(self, event):
+        parent = self.GetParent()
+        if parent and hasattr(parent, '_directory_dlg') and parent._directory_dlg and parent._directory_dlg.IsShown():
+            wx.CallAfter(parent._directory_dlg.Raise)
+            wx.CallAfter(parent._directory_dlg.SetFocus)
         if self.is_contact:
             event.Skip()
         else:
