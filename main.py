@@ -277,6 +277,7 @@ def load_user_config():
         'announce_typing': True,
         'enter_key_action': 'send',
         'escape_main_action': 'none',
+        'double_escape_to_close_chat': True,
         'save_chat_history_default': False,
         'message_edit_window_seconds': 300,
         'message_undo_window_seconds': 15,
@@ -319,6 +320,7 @@ def load_user_config():
     except Exception:
         settings['message_undo_window_seconds'] = 15
     settings['allow_cross_server_directory_message'] = bool(settings.get('allow_cross_server_directory_message', True))
+    settings['double_escape_to_close_chat'] = bool(settings.get('double_escape_to_close_chat', True))
     if not isinstance(settings.get('directory_dm_defaults', {}), dict):
         settings['directory_dm_defaults'] = {}
     settings['incoming_popup_on_message'] = bool(settings.get('incoming_popup_on_message', False))
@@ -1162,6 +1164,8 @@ class SettingsDialog(wx.Dialog):
         esc_val = str(self.config.get('escape_main_action', 'none') or 'none')
         self.escape_action_choice.SetSelection(0 if esc_val == 'none' else (1 if esc_val == 'minimize' else 2))
         escape_row.Add(self.escape_action_choice, 1, wx.EXPAND)
+        self.double_escape_chat_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Require double Escape to dismiss chat windows")
+        self.double_escape_chat_cb.SetValue(bool(self.config.get('double_escape_to_close_chat', True)))
 
         cfg = configparser.ConfigParser(interpolation=None)
         self.client_conf_path = "client.conf"
@@ -1233,6 +1237,7 @@ class SettingsDialog(wx.Dialog):
         accessibility_box.Add(self.incoming_alert_cb, 0, wx.ALL, 5)
         accessibility_box.Add(enter_row, 0, wx.EXPAND | wx.ALL, 5)
         accessibility_box.Add(escape_row, 0, wx.EXPAND | wx.ALL, 5)
+        accessibility_box.Add(self.double_escape_chat_cb, 0, wx.ALL, 5)
         audio_sizer = wx.BoxSizer(wx.VERTICAL)
         audio_sizer.Add(sound_box, 0, wx.EXPAND | wx.ALL, 8)
         audio_sizer.Add(call_audio_box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
@@ -1276,7 +1281,7 @@ class SettingsDialog(wx.Dialog):
             self.call_in_label.SetForegroundColour(light_text_color)
             self.call_out_label.SetForegroundColour(light_text_color)
             self.admin_hint.SetForegroundColour(light_text_color)
-            for cb in [self.auto_open_files_cb, self.read_aloud_cb, self.global_chat_logging_cb, self.show_main_actions_cb, self.typing_indicator_cb, self.announce_typing_cb, self.incoming_popup_cb, self.incoming_alert_cb]:
+            for cb in [self.auto_open_files_cb, self.read_aloud_cb, self.global_chat_logging_cb, self.show_main_actions_cb, self.typing_indicator_cb, self.announce_typing_cb, self.incoming_popup_cb, self.incoming_alert_cb, self.double_escape_chat_cb]:
                 cb.SetForegroundColour(light_text_color)
             self.restart_after_save_cb.SetForegroundColour(light_text_color)
             self.allow_cross_server_dm_cb.SetForegroundColour(light_text_color)
@@ -3431,6 +3436,7 @@ class MainFrame(wx.Frame):
                 enter_map = {0: 'send', 1: 'place_call', 2: 'none'}
                 app.user_config['enter_key_action'] = enter_map.get(dlg.enter_action_choice.GetSelection(), 'send')
                 app.user_config['escape_main_action'] = ('none' if dlg.escape_action_choice.GetSelection() == 0 else ('minimize' if dlg.escape_action_choice.GetSelection() == 1 else 'quit'))
+                app.user_config['double_escape_to_close_chat'] = dlg.double_escape_chat_cb.IsChecked()
                 edit_window, undo_window = dlg.message_policy()
                 app.user_config['message_edit_window_seconds'] = edit_window
                 app.user_config['message_undo_window_seconds'] = undo_window
@@ -4735,6 +4741,8 @@ class ChatDialog(wx.Dialog):
         self.is_remote_directory_chat = self.remote_server_entry is not None
         self._pending_message_after_add = None
         self._last_deleted_message = None
+        self._last_escape_ts = 0.0
+        self._allow_close_once = False
         self.Bind(wx.EVT_CHAR_HOOK, self.on_key)
         self.Bind(wx.EVT_CLOSE, self.on_close)
         self.Bind(wx.EVT_SHOW, self.on_show_dialog)
@@ -4913,7 +4921,25 @@ class ChatDialog(wx.Dialog):
             parent = self.GetParent()
             if parent and hasattr(parent, "on_settings"):
                 wx.CallAfter(parent.on_settings, None)
-        elif event.GetKeyCode() == wx.WXK_ESCAPE: self.Close()
+        elif event.CmdDown() and event.GetKeyCode() == ord('W'):
+            self._allow_close_once = True
+            self.Close()
+            return
+        elif event.GetKeyCode() == wx.WXK_ESCAPE:
+            require_double = bool(wx.GetApp().user_config.get('double_escape_to_close_chat', True))
+            if not require_double:
+                self._allow_close_once = True
+                self.Close()
+                return
+            now = time.monotonic()
+            if (now - float(self._last_escape_ts or 0.0)) <= 1.2:
+                self._last_escape_ts = 0.0
+                self._allow_close_once = True
+                self.Close()
+                return
+            self._last_escape_ts = now
+            self.typing_lbl.SetLabel("Press Escape again to dismiss this chat window.")
+            return
         else: event.Skip()
     def on_send(self, _):
         txt = self.input_ctrl.GetValue().strip()
@@ -5117,6 +5143,12 @@ class ChatDialog(wx.Dialog):
             if app.user_config.get('announce_typing', True):
                 speak_text(f"{username} stopped typing")
     def on_close(self, event):
+        # Guard against focus-switch side effects (e.g., Alt-Tab) closing chats.
+        if not self._allow_close_once and not wx.GetApp().IsActive():
+            if event.CanVeto():
+                event.Veto()
+                return
+        self._allow_close_once = False
         self._send_stop_typing()
         event.Skip()
 
