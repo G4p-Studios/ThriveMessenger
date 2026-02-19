@@ -4632,16 +4632,17 @@ class AdminDialog(wx.Dialog):
         else: event.Skip()
     def on_send(self, _):
         cmd = self.input_ctrl.GetValue().strip()
-        if not cmd: return
-        normalized = cmd
-        if cmd in ("help", "?"):
-            normalized = "/help"
-        elif cmd in ("/?",):
-            normalized = "/help"
-        if not normalized.startswith('/'):
-            self.append_response("Error: Commands must start with /. To get more help, type ? or help!")
+        if not cmd:
             return
-        msg = {"action":"admin_cmd", "cmd": normalized[1:]}
+        raw = cmd
+        if raw.startswith("/"):
+            raw = raw[1:].strip()
+        lower_raw = raw.lower()
+        if lower_raw in ("help", "?"):
+            raw = "help"
+        # Allow both slash and non-slash command entry styles.
+        # The server parser expects command text without leading slash.
+        msg = {"action":"admin_cmd", "cmd": raw}
         self.sock.sendall(json.dumps(msg).encode()+b"\n"); self.input_ctrl.Clear(); self.input_ctrl.SetFocus()
     def on_bot_rules(self, _):
         parent = self.GetParent()
