@@ -143,7 +143,7 @@ Note: server owners might place file size limits and certain file type restricti
 
 ### Server side commands
 
-If you see (Admin) beside a contact's online status, it means they are classed as a server admin and can perform server side commands from the client. This is what the aforementioned Use Server Side Commands button is for. Clicking the button will bring up a dialog much like the one that appears when you start a chat with a contact. You will auto focus on the command input field. To run a command, simply type it into the field and press Enter.
+If you see (Admin) beside a contact's online status, it means they are classed as a server admin and can perform server side commands from the client. This is what the aforementioned Use Server Side Commands button is for. Clicking the button will bring up a dialog much like the one that appears when you start a chat with a contact. You will auto focus on the command input field. To run a command, simply type it into the field and press Enter. To get more help in this text box, type `?` or `help` (with or without a leading slash).
 
 Each server side command must start with a forward slash (/). The following server side commands are available.
 

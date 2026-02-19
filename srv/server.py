@@ -787,6 +787,29 @@ def _revoke_bot_token(owner, bot_name):
     con.commit()
     con.close()
 
+def _create_invite_token(invited_user, invited_email, invited_by, expires_hours=168):
+    token = secrets.token_urlsafe(24)
+    now = datetime.datetime.utcnow()
+    expires_at = (now + datetime.timedelta(hours=max(1, int(expires_hours)))).isoformat()
+    con = sqlite3.connect(DB)
+    con.execute(
+        """
+        INSERT OR REPLACE INTO invite_tokens(token, invited_user, invited_email, invited_by, created_at, expires_at, used)
+        VALUES(?,?,?,?,?,?,0)
+        """,
+        (
+            token,
+            str(invited_user or "").strip(),
+            str(invited_email or "").strip(),
+            str(invited_by or "").strip(),
+            now.isoformat(),
+            expires_at,
+        ),
+    )
+    con.commit()
+    con.close()
+    return token
+
 class EmailManager:
     @staticmethod
     def send_email(to_email, subject, body):
@@ -980,6 +1003,7 @@ def init_db():
 
     cur.execute('''CREATE TABLE IF NOT EXISTS contacts (owner TEXT, contact TEXT, blocked INTEGER DEFAULT 0, PRIMARY KEY(owner, contact))''')
     cur.execute('''CREATE TABLE IF NOT EXISTS bot_tokens (owner TEXT, bot TEXT, token TEXT, created_at TEXT, PRIMARY KEY(owner, bot))''')
+    cur.execute('''CREATE TABLE IF NOT EXISTS invite_tokens (token TEXT PRIMARY KEY, invited_user TEXT, invited_email TEXT, invited_by TEXT, created_at TEXT, expires_at TEXT, used INTEGER DEFAULT 0)''')
     cur.execute('''CREATE TABLE IF NOT EXISTS bot_rule_overrides (owner TEXT, bot TEXT, rules TEXT, updated_at TEXT, PRIMARY KEY(owner, bot))''')
     cur.execute('''CREATE TABLE IF NOT EXISTS group_policies (scope TEXT, group_name TEXT, policy_json TEXT, updated_by TEXT, updated_at TEXT, PRIMARY KEY(scope, group_name))''')
     cur.execute('''CREATE TABLE IF NOT EXISTS feature_policies (feature_key TEXT PRIMARY KEY, enabled INTEGER DEFAULT 1, ui_visible INTEGER DEFAULT 1, scope TEXT DEFAULT 'all', description TEXT, updated_by TEXT, updated_at TEXT)''')
@@ -1093,10 +1117,16 @@ def handle_client(cs, addr):
             u_ver = req.get("user")
             code_ver = req.get("code")
             con = sqlite3.connect(DB)
-            row = con.execute("SELECT verification_code FROM users WHERE username=?", (u_ver,)).fetchone()
+            row = con.execute("SELECT verification_code, email FROM users WHERE username=?", (u_ver,)).fetchone()
             if row and row[0] == code_ver:
                 con.execute("UPDATE users SET is_verified=1, verification_code=NULL WHERE username=?", (u_ver,))
                 con.commit(); con.close()
+                if row[1]:
+                    EmailManager.send_email(
+                        row[1],
+                        "Thrive Messenger - Account Verified",
+                        f"Hi {u_ver}, your account on {server_identity} has been verified and is ready to use."
+                    )
                 sock.sendall(json.dumps({"status": "ok"}).encode() + b"\n")
             else:
                 con.close()
@@ -1505,6 +1535,7 @@ def handle_client(cs, addr):
                             "/help or /?  Show this help\n"
                             "/alert <message>  Send an alert to all online users\n"
                             "/create <user> <pass> [email]  Create an account\n"
+                            "/invite <user> <email>  Email invite with magic signup link\n"
                             "/ban <user> <MM/DD/YYYY> <reason>  Ban a user until date\n"
                             "/unban <user>  Remove user ban\n"
                             "/del <user>  Delete a user\n"
@@ -1537,6 +1568,32 @@ def handle_client(cs, addr):
                             response = f"User '{cmd_parts[1]}' created."
                         else:
                             response = f"Error: Username '{cmd_parts[1]}' is already taken."
+                    elif command == "invite" and len(cmd_parts) >= 3:
+                        invite_user = str(cmd_parts[1] or "").strip()
+                        invite_email = str(cmd_parts[2] or "").strip()
+                        if not invite_user or not invite_email or "@" not in invite_email:
+                            response = "Error: invite syntax: /invite <username> <email>"
+                        elif not smtp_config.get('enabled', False):
+                            response = "Error: SMTP email is not enabled on this server."
+                        else:
+                            token = _create_invite_token(invite_user, invite_email, user)
+                            magic_link = (
+                                "https://im.tappedin.fm/thrive-messenger-setup/"
+                                f"?invite={urllib.parse.quote(token)}"
+                                f"&user={urllib.parse.quote(invite_user)}"
+                                f"&email={urllib.parse.quote(invite_email)}"
+                            )
+                            body = (
+                                f"{user} invited you to join Thrive Messenger on {server_identity}.\n\n"
+                                "Use this magic link to start account creation:\n"
+                                f"{magic_link}\n\n"
+                                "After account creation, a verification/confirmation email will be sent automatically."
+                            )
+                            sent = EmailManager.send_email(invite_email, "You're invited to Thrive Messenger", body)
+                            if sent:
+                                response = f"Invite sent to {invite_email} for user '{invite_user}'."
+                            else:
+                                response = f"Error: Invite email failed for {invite_email}."
                     elif command == "ban" and len(cmd_parts) >= 4: 
                         handle_ban(cmd_parts[1], cmd_parts[2], " ".join(cmd_parts[3:]))
                         response = f"User '{cmd_parts[1]}' banned."
