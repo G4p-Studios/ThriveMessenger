@@ -28,8 +28,10 @@ mkdir -p "${UV_CACHE_DIR}"
 run_clip() {
   local prompt_file="$1"
   local out_file="$2"
+  local log_file
+  log_file="$(mktemp)"
   echo "Generating ${out_file} from ${prompt_file}..."
-  uv run --with openai python "${SORA_CLI}" create-and-poll \
+  if uv run --with openai python "${SORA_CLI}" create-and-poll \
     --model "${MODEL}" \
     --prompt-file "${PROMPTS_DIR}/${prompt_file}" \
     --no-augment \
@@ -37,7 +39,17 @@ run_clip() {
     --seconds "${SECONDS}" \
     --download \
     --variant video \
-    --out "${OUT_DIR}/${out_file}"
+    --out "${OUT_DIR}/${out_file}" 2>&1 | tee "${log_file}"; then
+    rm -f "${log_file}"
+    return 0
+  fi
+  if grep -q "billing_hard_limit_reached" "${log_file}"; then
+    echo "Sora billing limit reached. Use external provider fallback for now." >&2
+    echo "Place exported clips into: ${OUT_DIR}" >&2
+    echo "Expected files: promo-onboarding.mp4, promo-chat-files.mp4, promo-admin-tools.mp4" >&2
+  fi
+  rm -f "${log_file}"
+  return 1
 }
 
 run_clip "onboarding.txt" "promo-onboarding.mp4"

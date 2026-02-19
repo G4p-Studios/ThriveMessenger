@@ -23,3 +23,14 @@ For longer edits, use another service (for example Runway/Pika/Kling), then plac
 - `assets/videos/long/`
 
 Keep filenames stable so installers and docs do not break.
+
+Quick import helper:
+
+```bash
+./scripts/import_external_promos.sh /path/to/clip1.mp4 /path/to/clip2.mp4
+```
+
+Recommended standard names:
+- `promo-onboarding.mp4`
+- `promo-chat-files.mp4`
+- `promo-admin-tools.mp4`
