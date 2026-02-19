@@ -268,6 +268,10 @@ def load_user_config():
         'save_chat_history_default': False,
         'message_edit_window_seconds': 300,
         'message_undo_window_seconds': 15,
+        'allow_cross_server_directory_message': True,
+        'directory_dm_defaults': {},
+        'incoming_popup_on_message': False,
+        'incoming_alert_on_message': False,
     }
 
     # 1. Load non-sensitive preferences from JSON
@@ -302,6 +306,11 @@ def load_user_config():
         settings['message_undo_window_seconds'] = max(0, int(settings.get('message_undo_window_seconds', 15)))
     except Exception:
         settings['message_undo_window_seconds'] = 15
+    settings['allow_cross_server_directory_message'] = bool(settings.get('allow_cross_server_directory_message', True))
+    if not isinstance(settings.get('directory_dm_defaults', {}), dict):
+        settings['directory_dm_defaults'] = {}
+    settings['incoming_popup_on_message'] = bool(settings.get('incoming_popup_on_message', False))
+    settings['incoming_alert_on_message'] = bool(settings.get('incoming_alert_on_message', False))
 
     # 3. Load password from Keyring if "Remember me" is active
     if settings.get('username') and settings.get('remember'):
@@ -584,6 +593,31 @@ def _help_docs_dir():
     os.makedirs(path, exist_ok=True)
     return path
 
+def _help_templates_candidates():
+    candidates = []
+    resources_dir = get_bundle_resources_dir()
+    if resources_dir:
+        candidates.append(os.path.join(resources_dir, "assets", "help", "help_docs.json"))
+    candidates.extend([
+        os.path.join(get_program_dir(), "assets", "help", "help_docs.json"),
+        os.path.join(os.getcwd(), "assets", "help", "help_docs.json"),
+        os.path.join(get_config_dir(), "help_docs.json"),
+    ])
+    return candidates
+
+def _load_generated_help_templates():
+    for path in _help_templates_candidates():
+        try:
+            if not os.path.isfile(path):
+                continue
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+        except Exception as e:
+            print(f"Could not load help templates from {path}: {e}")
+    return {}
+
 def ensure_help_docs():
     docs = {
         "general": "<h1>Thrive Messenger Help</h1><p>Press F1 in each window for contextual help. Press Escape or Command+W to close this help window and return.</p>",
@@ -594,12 +628,23 @@ def ensure_help_docs():
         "admin": "<h1>Admin Commands Help</h1><p>Commands start with '/'. Example: /alert message, /create username password, /admin username.</p>",
         "settings": "<h1>Settings Help</h1><p>Configure sound pack, default sound pack selection, sound volume, call input/output levels, and chat accessibility options. Settings are remembered by the app.</p>",
         "server_info": "<h1>Server Info Help</h1><p>Shows active server host, port, encryption state, user counts, and file policy limits.</p>",
+        "bot_rules": "<h1>Bot Rules Help</h1><p>Admins can load, edit, save, and reset bot rules. Non-admin users can view active rules but cannot edit.</p>",
     }
+    generated = _load_generated_help_templates()
+    for key in list(docs.keys()):
+        val = generated.get(key)
+        if isinstance(val, str) and val.strip():
+            docs[key] = val.strip()
     out = {}
     for key, html in docs.items():
         path = os.path.join(_help_docs_dir(), f"{key}.html")
+        body = html.strip()
+        if "<html" in body.lower():
+            final_html = body
+        else:
+            final_html = f"<!doctype html><html><head><meta charset='utf-8'><title>Help</title></head><body>{body}</body></html>"
         with open(path, "w", encoding="utf-8") as f:
-            f.write(f"<!doctype html><html><head><meta charset='utf-8'><title>Help</title></head><body>{html}</body></html>")
+            f.write(final_html)
         out[key] = path
     return out
 
@@ -1081,6 +1126,10 @@ class SettingsDialog(wx.Dialog):
         self.typing_indicator_cb.SetValue(bool(self.config.get('typing_indicators', True)))
         self.announce_typing_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Announce typing start/stop")
         self.announce_typing_cb.SetValue(bool(self.config.get('announce_typing', True)))
+        self.incoming_popup_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Open chat windows automatically on incoming messages (legacy behavior)")
+        self.incoming_popup_cb.SetValue(bool(self.config.get('incoming_popup_on_message', False)))
+        self.incoming_alert_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Play sound/notification on incoming messages")
+        self.incoming_alert_cb.SetValue(bool(self.config.get('incoming_alert_on_message', False)))
         enter_row = wx.BoxSizer(wx.HORIZONTAL)
         enter_row.Add(wx.StaticText(accessibility_box.GetStaticBox(), label="Enter key action:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
         self.enter_action_choice = wx.Choice(accessibility_box.GetStaticBox(), choices=[
@@ -1139,6 +1188,12 @@ class SettingsDialog(wx.Dialog):
         restart_row.Add(self.restart_delay_txt, 1, wx.EXPAND)
         self.btn_open_admin_console = wx.Button(admin_box.GetStaticBox(), label="Open Server Command Console")
         self.btn_open_admin_console.Bind(wx.EVT_BUTTON, self.on_open_admin_console)
+        self.btn_open_bot_rules = wx.Button(admin_box.GetStaticBox(), label="Open Bot Rules Manager")
+        self.btn_open_bot_rules.Bind(wx.EVT_BUTTON, self.on_open_bot_rules)
+        self.btn_open_group_policy = wx.Button(admin_box.GetStaticBox(), label="Open Group Policy Manager")
+        self.btn_open_group_policy.Bind(wx.EVT_BUTTON, self.on_open_group_policy)
+        self.allow_cross_server_dm_cb = wx.CheckBox(admin_box.GetStaticBox(), label="Allow direct messaging from Directory to users on other configured servers")
+        self.allow_cross_server_dm_cb.SetValue(bool(self.config.get('allow_cross_server_directory_message', True)))
         edit_window_row = wx.BoxSizer(wx.HORIZONTAL)
         edit_window_row.Add(wx.StaticText(admin_box.GetStaticBox(), label="Edit window (seconds):"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
         self.message_edit_window_txt = wx.TextCtrl(admin_box.GetStaticBox(), value=str(self.config.get('message_edit_window_seconds', 300)))
@@ -1162,6 +1217,8 @@ class SettingsDialog(wx.Dialog):
         accessibility_box.Add(self.show_main_actions_cb, 0, wx.ALL, 5)
         accessibility_box.Add(self.typing_indicator_cb, 0, wx.ALL, 5)
         accessibility_box.Add(self.announce_typing_cb, 0, wx.ALL, 5)
+        accessibility_box.Add(self.incoming_popup_cb, 0, wx.ALL, 5)
+        accessibility_box.Add(self.incoming_alert_cb, 0, wx.ALL, 5)
         accessibility_box.Add(enter_row, 0, wx.EXPAND | wx.ALL, 5)
         accessibility_box.Add(escape_row, 0, wx.EXPAND | wx.ALL, 5)
         audio_sizer = wx.BoxSizer(wx.VERTICAL)
@@ -1187,7 +1244,10 @@ class SettingsDialog(wx.Dialog):
         admin_box.Add(restart_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         admin_box.Add(edit_window_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         admin_box.Add(undo_window_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        admin_box.Add(self.allow_cross_server_dm_cb, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         admin_box.Add(self.btn_open_admin_console, 0, wx.EXPAND | wx.ALL, 5)
+        admin_box.Add(self.btn_open_bot_rules, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        admin_box.Add(self.btn_open_group_policy, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         admin_sizer = wx.BoxSizer(wx.VERTICAL)
         admin_sizer.Add(admin_box, 1, wx.EXPAND | wx.ALL, 8)
         tab_admin.SetSizer(admin_sizer)
@@ -1204,9 +1264,10 @@ class SettingsDialog(wx.Dialog):
             self.call_in_label.SetForegroundColour(light_text_color)
             self.call_out_label.SetForegroundColour(light_text_color)
             self.admin_hint.SetForegroundColour(light_text_color)
-            for cb in [self.auto_open_files_cb, self.read_aloud_cb, self.global_chat_logging_cb, self.show_main_actions_cb, self.typing_indicator_cb, self.announce_typing_cb]:
+            for cb in [self.auto_open_files_cb, self.read_aloud_cb, self.global_chat_logging_cb, self.show_main_actions_cb, self.typing_indicator_cb, self.announce_typing_cb, self.incoming_popup_cb, self.incoming_alert_cb]:
                 cb.SetForegroundColour(light_text_color)
             self.restart_after_save_cb.SetForegroundColour(light_text_color)
+            self.allow_cross_server_dm_cb.SetForegroundColour(light_text_color)
             for ctrl in [self.admin_host_txt, self.admin_port_txt, self.admin_cafile_txt, self.admin_feed_txt, self.admin_pref_repo_txt, self.admin_fallback_txt, self.message_edit_window_txt, self.message_undo_window_txt]:
                 ctrl.SetBackgroundColour(dark_color); ctrl.SetForegroundColour(light_text_color)
             self.restart_delay_txt.SetBackgroundColour(dark_color); self.restart_delay_txt.SetForegroundColour(light_text_color)
@@ -1214,6 +1275,8 @@ class SettingsDialog(wx.Dialog):
             self.escape_action_choice.SetBackgroundColour(dark_color); self.escape_action_choice.SetForegroundColour(light_text_color)
             self.btn_chpass.SetBackgroundColour(dark_color); self.btn_chpass.SetForegroundColour(light_text_color)
             self.btn_open_admin_console.SetBackgroundColour(dark_color); self.btn_open_admin_console.SetForegroundColour(light_text_color)
+            self.btn_open_bot_rules.SetBackgroundColour(dark_color); self.btn_open_bot_rules.SetForegroundColour(light_text_color)
+            self.btn_open_group_policy.SetBackgroundColour(dark_color); self.btn_open_group_policy.SetForegroundColour(light_text_color)
             ok_btn.SetBackgroundColour(dark_color); ok_btn.SetForegroundColour(light_text_color)
             cancel_btn.SetBackgroundColour(dark_color); cancel_btn.SetForegroundColour(light_text_color)
             
@@ -1238,6 +1301,14 @@ class SettingsDialog(wx.Dialog):
         frame = self.GetParent()
         if frame and hasattr(frame, "on_admin"):
             frame.on_admin(None)
+    def on_open_bot_rules(self, _):
+        frame = self.GetParent()
+        if frame and hasattr(frame, "on_manage_bot_rules"):
+            frame.on_manage_bot_rules(None)
+    def on_open_group_policy(self, _):
+        frame = self.GetParent()
+        if frame and hasattr(frame, "on_manage_group_policy"):
+            frame.on_manage_group_policy(None)
     def apply_admin_config(self):
         cfg = configparser.ConfigParser(interpolation=None)
         cfg.read(self.client_conf_path)
@@ -1682,6 +1753,71 @@ class ClientApp(wx.App):
         except Exception as e:
             print(f"Directory fetch failed for {server_entry}: {e}")
             return []
+
+    def resolve_server_entry_by_name(self, server_name):
+        target = str(server_name or "").strip().lower()
+        active = normalize_server_entry(getattr(self, "active_server_entry", {}))
+        if not target:
+            return active
+        if active.get("name", "").strip().lower() == target:
+            return active
+        for entry in dedupe_server_entries(self.user_config.get("server_entries", [])):
+            normalized = normalize_server_entry(entry)
+            if normalized.get("name", "").strip().lower() == target:
+                return normalized
+        return None
+
+    def send_directory_direct_message(self, server_entry, from_user, to_user, text):
+        try:
+            normalized = normalize_server_entry(server_entry)
+            password = self.session_password or self.user_config.get("password", "")
+            if not password:
+                return False, "No saved session password is available for this server message."
+            ssock = create_secure_socket(normalized)
+            ssock.sendall(json.dumps({"action":"login","user":from_user,"pass":password}).encode()+b"\n")
+            sf = ssock.makefile()
+            resp = json.loads(sf.readline() or "{}")
+            if resp.get("status") != "ok":
+                try:
+                    ssock.close()
+                except Exception:
+                    pass
+                return False, f"Login failed on {normalized.get('name')}: {resp.get('reason', 'unknown error')}"
+            payload = {
+                "action": "msg",
+                "from": from_user,
+                "to": to_user,
+                "msg": text,
+                "time": datetime.datetime.now().isoformat(),
+            }
+            ssock.sendall((json.dumps(payload) + "\n").encode())
+            # Optional immediate error response from server.
+            ssock.settimeout(1.2)
+            try:
+                line = sf.readline()
+                if line:
+                    msg = json.loads(line or "{}")
+                    if msg.get("action") == "msg_failed":
+                        reason = msg.get("reason", "Message failed.")
+                        try:
+                            ssock.sendall(json.dumps({"action":"logout"}).encode()+b"\n")
+                        except Exception:
+                            pass
+                        ssock.close()
+                        return False, reason
+            except Exception:
+                pass
+            try:
+                ssock.sendall(json.dumps({"action":"logout"}).encode()+b"\n")
+            except Exception:
+                pass
+            try:
+                ssock.close()
+            except Exception:
+                pass
+            return True, None
+        except Exception as e:
+            return False, str(e)
     
     def start_main_session(self, username, sock, sf):
         self.username = username; self.sock = sock; self.sockfile = sf; self.pending_file_paths = {}
@@ -1771,6 +1907,15 @@ class ClientApp(wx.App):
                 elif act == "invite_result": wx.CallAfter(self.frame.on_invite_result, msg)
                 elif act == "change_password_result": wx.CallAfter(self.frame.on_change_password_result, msg)
                 elif act == "bot_token_revoked": wx.CallAfter(self.frame.on_bot_token_revoked, msg.get("bot", "bot"))
+                elif act == "bot_rules": wx.CallAfter(self.frame.on_bot_rules, msg)
+                elif act == "bot_rules_update": wx.CallAfter(self.frame.on_bot_rules_update, msg)
+                elif act == "group_policy": wx.CallAfter(self.frame.on_group_policy, msg)
+                elif act == "group_policy_update": wx.CallAfter(self.frame.on_group_policy_update, msg)
+                elif act == "group_call_list_response": wx.CallAfter(self.frame.on_group_call_list_response, msg)
+                elif act == "group_call_event": wx.CallAfter(self.frame.on_group_call_event, msg)
+                elif act == "group_call_result": wx.CallAfter(self.frame.on_group_call_result, msg)
+                elif act == "group_call_signal": wx.CallAfter(self.frame.on_group_call_signal, msg)
+                elif act == "group_call_signal_result": wx.CallAfter(self.frame.on_group_call_signal_result, msg)
                 elif act == "banned_kick": wx.CallAfter(self.on_banned); handled = True; break
         except (IOError, json.JSONDecodeError, ValueError):
             print("Disconnected from server.")
@@ -2567,6 +2712,8 @@ class UserDirectoryDialog(wx.Dialog):
         self.btn_add.SetToolTip("Send a contact request to selected user.")
         self.btn_close.SetToolTip("Close directory window.")
         self._populate_all_tabs(); self.update_button_states()
+    def _cross_server_dm_enabled(self):
+        return bool(wx.GetApp().user_config.get("allow_cross_server_directory_message", True))
     def _get_active_list(self):
         page = self.notebook.GetSelection()
         return self.notebook.GetPage(page) if page != wx.NOT_FOUND else None
@@ -2597,6 +2744,44 @@ class UserDirectoryDialog(wx.Dialog):
         current_server = normalize_server_entry(getattr(wx.GetApp(), "active_server_entry", {})).get("name", "")
         selected_server = str(entry.get("server", current_server)).strip()
         return bool(selected_server and current_server and selected_server != current_server)
+    def _resolve_dm_target_entry(self):
+        entry = self._selected_entry()
+        if not entry:
+            return None
+        username = str(entry.get("user", "")).strip()
+        if not username:
+            return None
+        same_user_entries = [u for u in self._all_users if str(u.get("user", "")).strip() == username]
+        if len(same_user_entries) <= 1:
+            return entry
+        app = wx.GetApp()
+        defaults = app.user_config.get("directory_dm_defaults", {})
+        if not isinstance(defaults, dict):
+            defaults = {}
+        selected_server = str(entry.get("server", "")).strip()
+        preferred_server = str(defaults.get(username, "")).strip()
+        # If the user explicitly focused another server row, treat that as selecting a new default.
+        if selected_server and selected_server != preferred_server:
+            defaults[username] = selected_server
+            app.user_config["directory_dm_defaults"] = defaults
+            save_user_config(app.user_config)
+            return entry
+        if preferred_server:
+            for u in same_user_entries:
+                if str(u.get("server", "")).strip() == preferred_server:
+                    return u
+        choices = [f"{username} on {u.get('server', 'Current')} ({u.get('status_text', 'unknown')})" for u in same_user_entries]
+        with wx.SingleChoiceDialog(self, f"Multiple users named '{username}' were found. Choose who to message.", "Choose User", choices) as dlg:
+            if dlg.ShowModal() != wx.ID_OK:
+                return None
+            idx = dlg.GetSelection()
+        if idx < 0 or idx >= len(same_user_entries):
+            return None
+        chosen = same_user_entries[idx]
+        defaults[username] = str(chosen.get("server", "")).strip()
+        app.user_config["directory_dm_defaults"] = defaults
+        save_user_config(app.user_config)
+        return chosen
     def _populate_all_tabs(self):
         query = self.search_box.GetValue().strip().lower()
         filter_mode = self.filter_choice.GetSelection() if hasattr(self, "filter_choice") else 0
@@ -2637,16 +2822,20 @@ class UserDirectoryDialog(wx.Dialog):
     def update_button_states(self):
         user = self._get_selected_user()
         external = self._is_selected_external_server()
+        allow_cross = self._cross_server_dm_enabled()
         if not user or user == self.my_username:
             self.btn_chat.Disable(); self.btn_file.Disable(); self.btn_block.Disable(); self.btn_add.Disable()
             self.btn_block.SetLabel("&Block"); return
-        self.btn_chat.Enable(not external)
+        self.btn_chat.Enable((not external) or allow_cross)
         self.btn_file.Enable(not external)
         is_contact = user in self.contact_states
         self.btn_add.Enable((not is_contact) and (not external)); self.btn_add.SetLabel("&Add to Contacts")
         self.btn_block.Enable(is_contact and (not external))
         if external:
-            self.btn_chat.SetToolTip("This server does not support cross-server chat from the current connection.")
+            if allow_cross:
+                self.btn_chat.SetToolTip("Start chat with this user on their server.")
+            else:
+                self.btn_chat.SetToolTip("Cross-server direct messaging is disabled by admin settings.")
             self.btn_file.SetToolTip("This server does not support cross-server file transfer from the current connection.")
             self.btn_add.SetToolTip("This server does not support cross-server contacts from the current connection.")
             self.btn_block.SetToolTip("This server does not support cross-server contact blocking from the current connection.")
@@ -2667,14 +2856,41 @@ class UserDirectoryDialog(wx.Dialog):
         self.on_selection_changed(event)
         self.on_start_chat(None)
     def on_start_chat(self, _):
-        user = self._selected_user
-        if self._is_selected_external_server():
-            wx.MessageBox("This server does not support cross-server chat from the current connection.", "Feature Not Supported", wx.OK | wx.ICON_INFORMATION)
+        entry = self._resolve_dm_target_entry()
+        if not entry:
             return
-        if not user or user == self.my_username: return
-        app = wx.GetApp(); is_logging_enabled = is_chat_logging_enabled(app.user_config, user)
-        is_contact = user in self.contact_states
-        dlg = self.parent_frame.get_chat(user) or ChatDialog(self.parent_frame, user, self.parent_frame.sock, self.parent_frame.user, is_logging_enabled, is_contact=is_contact)
+        user = str(entry.get("user", "")).strip()
+        if not user or user == self.my_username:
+            return
+        app = wx.GetApp()
+        is_logging_enabled = is_chat_logging_enabled(app.user_config, user)
+        is_external = False
+        current_server = normalize_server_entry(getattr(app, "active_server_entry", {})).get("name", "")
+        target_server_name = str(entry.get("server", current_server)).strip()
+        if target_server_name and current_server and target_server_name != current_server:
+            is_external = True
+        if is_external and not self._cross_server_dm_enabled():
+            wx.MessageBox("Cross-server direct messaging is disabled by admin settings.", "Feature Disabled", wx.OK | wx.ICON_INFORMATION)
+            return
+        if is_external:
+            target_server_entry = app.resolve_server_entry_by_name(target_server_name)
+            if not target_server_entry:
+                wx.MessageBox(f"Could not resolve server '{target_server_name}' from configured servers.", "Server Not Found", wx.OK | wx.ICON_ERROR)
+                return
+            chat_key = f"{user} @ {target_server_name}"
+            dlg = self.parent_frame.get_chat(chat_key) or ChatDialog(
+                self.parent_frame,
+                chat_key,
+                self.parent_frame.sock,
+                self.parent_frame.user,
+                is_logging_enabled,
+                is_contact=True,
+                remote_server_entry=target_server_entry,
+                remote_target_user=user,
+            )
+        else:
+            is_contact = user in self.contact_states
+            dlg = self.parent_frame.get_chat(user) or ChatDialog(self.parent_frame, user, self.parent_frame.sock, self.parent_frame.user, is_logging_enabled, is_contact=is_contact)
         dlg.Show(); wx.CallAfter(dlg.input_ctrl.SetFocus)
     def on_send_file(self, _):
         if self._is_selected_external_server():
@@ -2727,6 +2943,7 @@ class UserDirectoryDialog(wx.Dialog):
         self._selected_user = self._get_selected_user()
         selected = bool(self._selected_user and self._selected_user != self.my_username)
         external = self._is_selected_external_server()
+        allow_cross = self._cross_server_dm_enabled()
         is_contact = bool(self._selected_user and self._selected_user in self.contact_states)
         menu = wx.Menu()
         mi_chat = menu.Append(wx.ID_ANY, "Start Chat")
@@ -2735,7 +2952,7 @@ class UserDirectoryDialog(wx.Dialog):
         mi_file = menu.Append(wx.ID_ANY, "Send File")
         menu.AppendSeparator()
         mi_refresh = menu.Append(wx.ID_ANY, "Refresh Directory")
-        mi_chat.Enable(selected and not external)
+        mi_chat.Enable(selected and ((not external) or allow_cross))
         mi_add.Enable(selected and (not is_contact) and not external)
         mi_block.Enable(selected and is_contact and not external)
         mi_file.Enable(selected and not external)
@@ -2863,11 +3080,12 @@ class MainFrame(wx.Frame):
             show_notification("Contact offline", f"{user} has gone offline.")
 
     def __init__(self, user, sock):
-        super().__init__(None, title="", size=(400,380)); self.user, self.sock = user, sock; self.task_bar_icon = None; self.is_exiting = False; self._directory_dlg = None
+        super().__init__(None, title="", size=(400,380)); self.user, self.sock = user, sock; self.task_bar_icon = None; self.is_exiting = False; self._directory_dlg = None; self._bot_rules_dlg = None; self._group_policy_dlg = None; self._group_call_dlg = None
         self.refresh_connection_title(connected=True)
         self.current_status = wx.GetApp().user_config.get('status', 'online')
         self._empty_prompt_shown = False
         self._sort_mode = "name_asc"
+        self._unread_counts = {}
         self.notifications = []; self.Bind(wx.EVT_CLOSE, self.on_close_window); panel = wx.Panel(self)
 
         dark_mode_on = is_windows_dark_mode()
@@ -2951,10 +3169,13 @@ class MainFrame(wx.Frame):
         self.mi_delete_contact = file_menu.Append(wx.ID_ANY, "Delete Contact\tDelete")
         self.mi_send_file = file_menu.Append(wx.ID_ANY, "Send File\tAlt+F")
         self.mi_file_transfers = file_menu.Append(wx.ID_ANY, "File Transfers")
+        self.mi_group_calls = file_menu.Append(wx.ID_ANY, "Group Calls")
         file_menu.AppendSeparator()
         self.mi_user_directory = file_menu.Append(wx.ID_ANY, "User Directory\tAlt+Y")
         self.mi_server_info = file_menu.Append(wx.ID_ANY, "Server Info\tAlt+I")
         self.mi_server_manager = file_menu.Append(wx.ID_ANY, "Server Manager")
+        self.mi_bot_rules = file_menu.Append(wx.ID_ANY, "Manage Bot Rules")
+        self.mi_group_policy = file_menu.Append(wx.ID_ANY, "Manage Group Policy")
         self.mi_settings = file_menu.Append(wx.ID_PREFERENCES, "Settings\tCmd+,")
         file_menu.AppendSeparator()
         self.mi_logout = file_menu.Append(wx.ID_ANY, "Logout\tAlt+O")
@@ -3002,9 +3223,12 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.on_delete, self.mi_delete_contact)
         self.Bind(wx.EVT_MENU, self.on_send_file, self.mi_send_file)
         self.Bind(wx.EVT_MENU, self.on_file_transfers, self.mi_file_transfers)
+        self.Bind(wx.EVT_MENU, self.on_group_calls, self.mi_group_calls)
         self.Bind(wx.EVT_MENU, self.on_user_directory, self.mi_user_directory)
         self.Bind(wx.EVT_MENU, self.on_server_info, self.mi_server_info)
         self.Bind(wx.EVT_MENU, self.on_server_manager, self.mi_server_manager)
+        self.Bind(wx.EVT_MENU, self.on_manage_bot_rules, self.mi_bot_rules)
+        self.Bind(wx.EVT_MENU, self.on_manage_group_policy, self.mi_group_policy)
         self.Bind(wx.EVT_MENU, self.on_settings, self.mi_settings)
         self.Bind(wx.EVT_MENU, self.on_logout, self.mi_logout)
         self.Bind(wx.EVT_MENU, self.on_exit, self.mi_exit)
@@ -3064,6 +3288,13 @@ class MainFrame(wx.Frame):
         if sel == wx.NOT_FOUND or sel >= len(self._contact_display_map):
             return None
         return self._contact_display_map[sel]
+    def _clear_unread(self, contact):
+        if contact in self._unread_counts:
+            self._unread_counts.pop(contact, None)
+            self._apply_search_filter()
+    def _mark_unread(self, contact):
+        self._unread_counts[contact] = int(self._unread_counts.get(contact, 0) or 0) + 1
+        self._apply_search_filter()
     def on_submit_logs(self, _):
         app = wx.GetApp()
         ok, err = submit_logs_payload(app.user_config, reason="manual_submit")
@@ -3120,12 +3351,15 @@ class MainFrame(wx.Frame):
                 app.user_config['show_main_action_buttons'] = dlg.show_main_actions_cb.IsChecked()
                 app.user_config['typing_indicators'] = dlg.typing_indicator_cb.IsChecked()
                 app.user_config['announce_typing'] = dlg.announce_typing_cb.IsChecked()
+                app.user_config['incoming_popup_on_message'] = dlg.incoming_popup_cb.IsChecked()
+                app.user_config['incoming_alert_on_message'] = dlg.incoming_alert_cb.IsChecked()
                 enter_map = {0: 'send', 1: 'place_call', 2: 'none'}
                 app.user_config['enter_key_action'] = enter_map.get(dlg.enter_action_choice.GetSelection(), 'send')
                 app.user_config['escape_main_action'] = ('none' if dlg.escape_action_choice.GetSelection() == 0 else ('minimize' if dlg.escape_action_choice.GetSelection() == 1 else 'quit'))
                 edit_window, undo_window = dlg.message_policy()
                 app.user_config['message_edit_window_seconds'] = edit_window
                 app.user_config['message_undo_window_seconds'] = undo_window
+                app.user_config['allow_cross_server_directory_message'] = dlg.allow_cross_server_dm_cb.IsChecked()
                 ok_admin, admin_err = dlg.apply_admin_config()
                 save_user_config(app.user_config)
                 self.apply_action_button_layout()
@@ -3195,6 +3429,59 @@ class MainFrame(wx.Frame):
                 app.user_config['last_server_name'] = app.user_config.get('primary_server_name') or updated_entries[0].get('name', '')
             save_user_config(app.user_config)
             wx.MessageBox("Server list updated. Changes apply on next login.", "Server Manager", wx.OK | wx.ICON_INFORMATION)
+    def _known_bot_names(self):
+        names = {"openclaw-bot", "assistant-bot", "helper-bot"}
+        for c in self._all_contacts:
+            uname = str(c.get("user", "")).strip()
+            if not uname:
+                continue
+            if uname.lower().endswith("-bot") or uname in names:
+                names.add(uname)
+        return sorted(names, key=lambda x: x.lower())
+    def on_manage_bot_rules(self, _):
+        dlg = self._bot_rules_dlg
+        if dlg and dlg.IsShown():
+            dlg.Raise()
+            dlg.SetFocus()
+            return
+        self._bot_rules_dlg = BotRulesDialog(self, self.sock, self._known_bot_names())
+        self._bot_rules_dlg.Show()
+    def on_manage_group_policy(self, _):
+        dlg = self._group_policy_dlg
+        if dlg and dlg.IsShown():
+            dlg.Raise()
+            dlg.SetFocus()
+            return
+        self._group_policy_dlg = GroupPolicyDialog(self, self.sock)
+        self._group_policy_dlg.Show()
+    def on_bot_rules(self, msg):
+        dlg = self._bot_rules_dlg
+        if dlg and dlg.IsShown():
+            dlg.handle_rules_payload(msg)
+            return
+        if not msg.get("ok"):
+            wx.MessageBox(msg.get("reason", "Could not fetch bot rules."), "Bot Rules", wx.OK | wx.ICON_WARNING)
+    def on_bot_rules_update(self, msg):
+        dlg = self._bot_rules_dlg
+        if dlg and dlg.IsShown():
+            dlg.handle_update_payload(msg)
+            return
+        if not msg.get("ok"):
+            wx.MessageBox(msg.get("reason", "Bot rules update failed."), "Bot Rules", wx.OK | wx.ICON_WARNING)
+    def on_group_policy(self, msg):
+        dlg = self._group_policy_dlg
+        if dlg and dlg.IsShown():
+            dlg.handle_policy_payload(msg)
+            return
+        if not msg.get("ok"):
+            wx.MessageBox(msg.get("reason", "Could not fetch group policy."), "Group Policy", wx.OK | wx.ICON_WARNING)
+    def on_group_policy_update(self, msg):
+        dlg = self._group_policy_dlg
+        if dlg and dlg.IsShown():
+            dlg.handle_update_payload(msg)
+            return
+        if not msg.get("ok"):
+            wx.MessageBox(msg.get("reason", "Group policy update failed."), "Group Policy", wx.OK | wx.ICON_WARNING)
     def on_server_info_response(self, msg):
         encrypted = isinstance(self.sock, ssl.SSLSocket)
         app = wx.GetApp()
@@ -3512,6 +3799,37 @@ class MainFrame(wx.Frame):
     def on_file_transfers(self, _):
         with FileTransfersDialog(self, wx.GetApp().transfer_history) as dlg:
             dlg.ShowModal()
+    def on_group_calls(self, _):
+        dlg = self._group_call_dlg
+        if dlg and dlg.IsShown():
+            dlg.Raise()
+            dlg.SetFocus()
+            try:
+                self.sock.sendall((json.dumps({"action": "group_call_list"}) + "\n").encode())
+            except Exception:
+                pass
+            return
+        self._group_call_dlg = GroupCallDialog(self, self.sock, self.user)
+        self._group_call_dlg.Show()
+        try:
+            self.sock.sendall((json.dumps({"action": "group_call_list"}) + "\n").encode())
+        except Exception:
+            pass
+    def on_group_call_list_response(self, msg):
+        if self._group_call_dlg and self._group_call_dlg.IsShown():
+            self._group_call_dlg.set_calls(msg.get("calls", []))
+    def on_group_call_event(self, msg):
+        if self._group_call_dlg and self._group_call_dlg.IsShown():
+            self._group_call_dlg.handle_call_event(msg)
+    def on_group_call_result(self, msg):
+        if self._group_call_dlg and self._group_call_dlg.IsShown():
+            self._group_call_dlg.handle_call_result(msg)
+    def on_group_call_signal(self, msg):
+        if self._group_call_dlg and self._group_call_dlg.IsShown():
+            self._group_call_dlg.handle_call_signal(msg)
+    def on_group_call_signal_result(self, msg):
+        if self._group_call_dlg and self._group_call_dlg.IsShown():
+            self._group_call_dlg.handle_signal_result(msg)
     def on_add(self, _):
         with wx.TextEntryDialog(self, "Enter the username of the contact you wish to add:", "Add Contact") as dlg:
             if dlg.ShowModal() == wx.ID_OK:
@@ -3545,7 +3863,9 @@ class MainFrame(wx.Frame):
             contacts = sorted(contacts, key=lambda c: c["user"].lower())
         for c in contacts:
             if query and query not in c["user"].lower(): continue
-            display = f"{c['user']}  |  {c['status']}"
+            unread = int(self._unread_counts.get(c["user"], 0) or 0)
+            unread_text = f"  |  {c['user']} has {unread} new message{'s' if unread != 1 else ''}" if unread > 0 else ""
+            display = f"{c['user']}  |  {c['status']}{unread_text}"
             self.lv.Append(display)
             idx = self.lv.GetCount() - 1
             self._contact_display_map.append(c["user"])
@@ -3726,6 +4046,7 @@ class MainFrame(wx.Frame):
         app = wx.GetApp(); is_logging_enabled = is_chat_logging_enabled(app.user_config, c)
         dlg = self.get_chat(c) or ChatDialog(self, c, self.sock, self.user, is_logging_enabled)
         dlg.Show(); wx.CallAfter(dlg.input_ctrl.SetFocus)
+        self._clear_unread(c)
     def on_send_file(self, _):
         c = self._selected_contact_name()
         if not c: return
@@ -3745,47 +4066,28 @@ class MainFrame(wx.Frame):
             return
         self.on_send(None)
     def receive_message(self, msg):
-        wx.GetApp().play_sound("receive.wav");
-        app = wx.GetApp(); is_logging_enabled = is_chat_logging_enabled(app.user_config, msg["from"])
-        dlg = self.get_chat(msg["from"])
+        app = wx.GetApp()
+        sender = msg["from"]
+        is_logging_enabled = is_chat_logging_enabled(app.user_config, sender)
+        is_contact = sender in self.contact_states
+        dlg = self.get_chat(sender)
         if not dlg:
-            is_contact = msg["from"] in self.contact_states
-            dlg = ChatDialog(self, msg["from"], self.sock, self.user, is_logging_enabled, is_contact=is_contact)
-        if not is_contact and msg["from"] not in self._noncontact_senders:
-            self._noncontact_senders.add(msg["from"]); self._apply_search_filter()
-            save_noncontact_senders(self.user, self._noncontact_senders)
-        if wx.GetActiveWindow() is not None:
-            dlg.Show()
-        elif sys.platform == 'win32':
-            _shown = False
-            try:
-                hwnd = dlg.GetHandle()
-                # CBT hook blocks HCBT_ACTIVATE for this window during Show() so wx
-                # fully initialises it but WM_ACTIVATE is never sent — no focus change,
-                # no screen reader announcement.  No WS_EX_APPWINDOW: keeping the dialog
-                # as a plain owned window means Windows auto-hides it with the owner and
-                # won't promote it to foreground when the owner is hidden to tray.
-                _CBTProc = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_int, ctypes.WPARAM, ctypes.LPARAM)
-                def _no_activate(nCode, wParam, lParam):
-                    if nCode == 5 and wParam == hwnd:  # HCBT_ACTIVATE for our window
-                        return 1
-                    return ctypes.windll.user32.CallNextHookEx(None, nCode, wParam, lParam)
-                _cb = _CBTProc(_no_activate)
-                tid = ctypes.windll.kernel32.GetCurrentThreadId()
-                hook = ctypes.windll.user32.SetWindowsHookExW(5, _cb, None, tid)  # WH_CBT
-                try:
-                    dlg.Show(); _shown = True
-                finally:
-                    if hook: ctypes.windll.user32.UnhookWindowsHookEx(hook)
-            except Exception:
-                pass
-            if not _shown:
-                dlg.Show()
-        else:
+            dlg = ChatDialog(self, sender, self.sock, self.user, is_logging_enabled, is_contact=is_contact)
+        popup_on_message = bool(app.user_config.get('incoming_popup_on_message', False))
+        alert_on_message = bool(app.user_config.get('incoming_alert_on_message', False))
+        if popup_on_message:
             dlg.Show()
         dlg.append(msg["msg"], msg["from"], msg["time"])
+        is_focused_chat = bool(dlg.IsShown() and wx.GetActiveWindow() is dlg)
+        if not is_focused_chat:
+            self._mark_unread(sender)
+            if alert_on_message:
+                app.play_sound("receive.wav")
+                show_notification("New message", f"{sender} has a new message.", timeout=5)
+        else:
+            self._clear_unread(sender)
         played_bot_tts = play_tts_audio_from_message(msg)
-        if app.user_config.get('read_messages_aloud', False) and not played_bot_tts:
+        if app.user_config.get('read_messages_aloud', False) and not played_bot_tts and is_focused_chat:
             speak_text(f"{msg['from']}: {msg['msg']}")
     def on_typing_event(self, msg):
         from_user = msg.get("from")
@@ -3823,10 +4125,13 @@ class AdminDialog(wx.Dialog):
             dark_color = wx.Colour(40, 40, 40); light_text_color = wx.WHITE
             WxMswDarkMode().enable(self); self.SetBackgroundColour(dark_color)
             
-        self.hist = wx.ListCtrl(self, style=wx.LC_REPORT)
-        self.hist.InsertColumn(0, "Server Response", width=200); self.hist.InsertColumn(1, "Time", width=220)
+        # Use a single ListBox for better screen-reader navigation.
+        self.hist = wx.ListBox(self, style=wx.LB_SINGLE)
+        self.hist.SetToolTip("Command responses history. Use arrow keys to review responses.")
         box_msg = wx.StaticBoxSizer(wx.VERTICAL, self, "&Enter command (e.g., /create user pass)"); self.input_ctrl = wx.TextCtrl(box_msg.GetStaticBox(), style=wx.TE_PROCESS_ENTER)
         btn = wx.Button(self, label="&Send Command")
+        btn_rules = wx.Button(self, label="Manage Bot Rules")
+        btn_group_policy = wx.Button(self, label="Manage Group Policy")
         
         if dark_mode_on:
             self.hist.SetBackgroundColour(dark_color); self.hist.SetForegroundColour(light_text_color)
@@ -3834,12 +4139,21 @@ class AdminDialog(wx.Dialog):
             box_msg.GetStaticBox().SetBackgroundColour(dark_color)
             self.input_ctrl.SetBackgroundColour(dark_color); self.input_ctrl.SetForegroundColour(light_text_color)
             btn.SetBackgroundColour(dark_color); btn.SetForegroundColour(light_text_color)
+            btn_rules.SetBackgroundColour(dark_color); btn_rules.SetForegroundColour(light_text_color)
+            btn_group_policy.SetBackgroundColour(dark_color); btn_group_policy.SetForegroundColour(light_text_color)
             
         s.Add(self.hist, 1, wx.EXPAND|wx.ALL, 5); self.input_ctrl.Bind(wx.EVT_TEXT_ENTER, self.on_send); box_msg.Add(self.input_ctrl, 0, wx.EXPAND|wx.ALL, 5)
-        s.Add(box_msg, 0, wx.EXPAND|wx.ALL, 5); btn.Bind(wx.EVT_BUTTON, self.on_send); s.Add(btn, 0, wx.CENTER|wx.ALL, 5); self.SetSizer(s)
+        s.Add(box_msg, 0, wx.EXPAND|wx.ALL, 5); btn.Bind(wx.EVT_BUTTON, self.on_send); btn_rules.Bind(wx.EVT_BUTTON, self.on_bot_rules); btn_group_policy.Bind(wx.EVT_BUTTON, self.on_group_policy)
+        btn_row = wx.BoxSizer(wx.HORIZONTAL)
+        btn_row.Add(btn, 1, wx.RIGHT, 5)
+        btn_row.Add(btn_rules, 1, wx.LEFT | wx.RIGHT, 5)
+        btn_row.Add(btn_group_policy, 1, wx.LEFT, 5)
+        s.Add(btn_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5); self.SetSizer(s)
     def on_key(self, event):
         if event.GetKeyCode() == wx.WXK_F1:
             open_help_docs_for_context("admin", self)
+        elif event.AltDown() and event.GetKeyCode() == ord('H'):
+            self.hist.SetFocus()
         elif event.GetKeyCode() == wx.WXK_ESCAPE: self.Close()
         else: event.Skip()
     def on_send(self, _):
@@ -3847,15 +4161,471 @@ class AdminDialog(wx.Dialog):
         if not cmd: return
         if not cmd.startswith('/'): self.append_response("Error: Commands must start with /"); return
         msg = {"action":"admin_cmd", "cmd": cmd[1:]}; self.sock.sendall(json.dumps(msg).encode()+b"\n"); self.input_ctrl.Clear(); self.input_ctrl.SetFocus()
+    def on_bot_rules(self, _):
+        parent = self.GetParent()
+        if parent and hasattr(parent, "on_manage_bot_rules"):
+            parent.on_manage_bot_rules(None)
+    def on_group_policy(self, _):
+        parent = self.GetParent()
+        if parent and hasattr(parent, "on_manage_group_policy"):
+            parent.on_manage_group_policy(None)
     def append_response(self, text):
-        ts = time.time(); idx = self.hist.GetItemCount(); self.hist.InsertItem(idx, text); self.hist.SetItem(idx, 1, format_timestamp(ts))
-        if text.lower().startswith('error'): self.hist.SetItemTextColour(idx, wx.RED)
+        ts = format_timestamp(time.time())
+        line = f"{ts} | {text}"
+        self.hist.Append(line)
+        self.hist.SetSelection(self.hist.GetCount() - 1)
+        if wx.GetApp().user_config.get('read_messages_aloud', False):
+            speak_text(text)
+
+class BotRulesDialog(wx.Dialog):
+    def __init__(self, parent, sock, bot_names=None):
+        super().__init__(parent, title="Bot Rules Manager", size=(700, 520))
+        self.sock = sock
+        self.current_bot = ""
+        self.Bind(wx.EVT_CLOSE, self.on_close)
+        self.Bind(wx.EVT_CHAR_HOOK, self.on_key)
+        panel = wx.Panel(self)
+        s = wx.BoxSizer(wx.VERTICAL)
+
+        dark_mode_on = is_windows_dark_mode()
+        if dark_mode_on:
+            dark_color = wx.Colour(40, 40, 40)
+            light_text_color = wx.WHITE
+            WxMswDarkMode().enable(self)
+            self.SetBackgroundColour(dark_color)
+            panel.SetBackgroundColour(dark_color)
+
+        top_row = wx.BoxSizer(wx.HORIZONTAL)
+        top_row.Add(wx.StaticText(panel, label="Bot username:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        self.bot_choice = wx.ComboBox(panel, style=wx.CB_DROPDOWN)
+        for bot in bot_names or []:
+            self.bot_choice.Append(bot)
+        if self.bot_choice.GetCount() == 0:
+            self.bot_choice.Append("openclaw-bot")
+        self.bot_choice.SetSelection(0)
+        top_row.Add(self.bot_choice, 1, wx.EXPAND | wx.RIGHT, 8)
+        self.btn_load = wx.Button(panel, label="Load Rules")
+        self.btn_save = wx.Button(panel, label="Save Rules")
+        self.btn_reset = wx.Button(panel, label="Reset to Global")
+        top_row.Add(self.btn_load, 0, wx.RIGHT, 4)
+        top_row.Add(self.btn_save, 0, wx.RIGHT, 4)
+        top_row.Add(self.btn_reset, 0)
+
+        self.info = wx.StaticText(panel, label="Load a bot to view active rules. Admins can edit and save overrides.")
+        self.info.Wrap(640)
+        self.rules_txt = wx.TextCtrl(panel, style=wx.TE_MULTILINE)
+
+        close_row = wx.BoxSizer(wx.HORIZONTAL)
+        self.btn_close = wx.Button(panel, wx.ID_CLOSE, "Close")
+        close_row.AddStretchSpacer(1)
+        close_row.Add(self.btn_close, 0)
+
+        s.Add(top_row, 0, wx.EXPAND | wx.ALL, 8)
+        s.Add(self.info, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        s.Add(self.rules_txt, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        s.Add(close_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        panel.SetSizer(s)
+
+        if dark_mode_on:
+            panel.SetForegroundColour(light_text_color)
+            self.bot_choice.SetBackgroundColour(dark_color); self.bot_choice.SetForegroundColour(light_text_color)
+            self.rules_txt.SetBackgroundColour(dark_color); self.rules_txt.SetForegroundColour(light_text_color)
+            for b in (self.btn_load, self.btn_save, self.btn_reset, self.btn_close):
+                b.SetBackgroundColour(dark_color); b.SetForegroundColour(light_text_color)
+            self.info.SetForegroundColour(light_text_color)
+
+        self.btn_load.Bind(wx.EVT_BUTTON, self.on_load)
+        self.btn_save.Bind(wx.EVT_BUTTON, self.on_save)
+        self.btn_reset.Bind(wx.EVT_BUTTON, self.on_reset)
+        self.btn_close.Bind(wx.EVT_BUTTON, lambda _: self.Close())
+        self.on_load(None)
+
+    def on_key(self, event):
+        if event.GetKeyCode() == wx.WXK_F1:
+            open_help_docs_for_context("bot_rules", self)
+            return
+        if event.GetKeyCode() == wx.WXK_ESCAPE:
+            self.Close()
+            return
+        event.Skip()
+
+    def on_close(self, event):
+        parent = self.GetParent()
+        if parent and hasattr(parent, "_bot_rules_dlg"):
+            parent._bot_rules_dlg = None
+        event.Skip()
+
+    def _selected_bot(self):
+        bot = self.bot_choice.GetValue().strip()
+        if not bot:
+            bot = "openclaw-bot"
+            self.bot_choice.SetValue(bot)
+        self.current_bot = bot
+        return bot
+
+    def on_load(self, _):
+        bot = self._selected_bot()
+        try:
+            self.sock.sendall((json.dumps({"action": "get_bot_rules", "bot": bot}) + "\n").encode())
+            self.info.SetLabel(f"Loading rules for {bot}...")
+        except Exception as e:
+            wx.MessageBox(f"Failed to request bot rules: {e}", "Bot Rules", wx.OK | wx.ICON_ERROR, self)
+
+    def on_save(self, _):
+        bot = self._selected_bot()
+        rules = self.rules_txt.GetValue()
+        try:
+            self.sock.sendall((json.dumps({"action": "set_bot_rules", "bot": bot, "rules": rules}) + "\n").encode())
+            self.info.SetLabel(f"Saving rules for {bot}...")
+        except Exception as e:
+            wx.MessageBox(f"Failed to save bot rules: {e}", "Bot Rules", wx.OK | wx.ICON_ERROR, self)
+
+    def on_reset(self, _):
+        bot = self._selected_bot()
+        try:
+            self.sock.sendall((json.dumps({"action": "reset_bot_rules", "bot": bot}) + "\n").encode())
+            self.info.SetLabel(f"Resetting rules for {bot}...")
+        except Exception as e:
+            wx.MessageBox(f"Failed to reset bot rules: {e}", "Bot Rules", wx.OK | wx.ICON_ERROR, self)
+
+    def handle_rules_payload(self, msg):
+        ok = bool(msg.get("ok"))
+        if not ok:
+            reason = msg.get("reason", "Could not load bot rules.")
+            self.info.SetLabel(reason)
+            wx.MessageBox(reason, "Bot Rules", wx.OK | wx.ICON_WARNING, self)
+            return
+        bot = str(msg.get("bot", self.current_bot) or self.current_bot)
+        rules = str(msg.get("rules", "") or "")
+        editable = bool(msg.get("editable", False))
+        scope = str(msg.get("scope", "global") or "global")
+        self.current_bot = bot
+        self.bot_choice.SetValue(bot)
+        self.rules_txt.ChangeValue(rules)
+        self.rules_txt.SetEditable(editable)
+        self.btn_save.Enable(editable)
+        self.btn_reset.Enable(editable)
+        self.info.SetLabel(f"Loaded {scope} rules for {bot}. {'Editable' if editable else 'Read-only for non-admins.'}")
+
+    def handle_update_payload(self, msg):
+        ok = bool(msg.get("ok"))
+        bot = str(msg.get("bot", self.current_bot) or self.current_bot)
+        if not ok:
+            reason = msg.get("reason", "Bot rules update failed.")
+            self.info.SetLabel(reason)
+            wx.MessageBox(reason, "Bot Rules", wx.OK | wx.ICON_WARNING, self)
+            return
+        self.info.SetLabel(f"Rules updated for {bot}. Reloading...")
+        self.on_load(None)
+
+class GroupPolicyDialog(wx.Dialog):
+    def __init__(self, parent, sock):
+        super().__init__(parent, title="Group Policy Manager", size=(780, 560))
+        self.sock = sock
+        self.current_group = "__global__"
+        self.schema = {}
+        self.Bind(wx.EVT_CLOSE, self.on_close)
+        self.Bind(wx.EVT_CHAR_HOOK, self.on_key)
+        panel = wx.Panel(self)
+        s = wx.BoxSizer(wx.VERTICAL)
+
+        top = wx.BoxSizer(wx.HORIZONTAL)
+        top.Add(wx.StaticText(panel, label="Group name (blank = global):"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        self.group_txt = wx.TextCtrl(panel, value="")
+        top.Add(self.group_txt, 1, wx.EXPAND | wx.RIGHT, 8)
+        self.btn_load = wx.Button(panel, label="Load")
+        self.btn_save = wx.Button(panel, label="Save")
+        self.btn_reset = wx.Button(panel, label="Reset")
+        top.Add(self.btn_load, 0, wx.RIGHT, 4)
+        top.Add(self.btn_save, 0, wx.RIGHT, 4)
+        top.Add(self.btn_reset, 0)
+
+        self.info = wx.StaticText(panel, label="Edit advanced group chat/call controls as JSON policy.")
+        self.info.Wrap(740)
+        splitter = wx.SplitterWindow(panel, style=wx.SP_LIVE_UPDATE)
+        self.schema_list = wx.ListBox(splitter, style=wx.LB_SINGLE)
+        self.policy_txt = wx.TextCtrl(splitter, style=wx.TE_MULTILINE)
+        splitter.SplitVertically(self.schema_list, self.policy_txt, 320)
+        splitter.SetMinimumPaneSize(220)
+
+        close_row = wx.BoxSizer(wx.HORIZONTAL)
+        close_row.AddStretchSpacer(1)
+        self.btn_close = wx.Button(panel, wx.ID_CLOSE, "Close")
+        close_row.Add(self.btn_close, 0)
+
+        s.Add(top, 0, wx.EXPAND | wx.ALL, 8)
+        s.Add(self.info, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        s.Add(splitter, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        s.Add(close_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        panel.SetSizer(s)
+
+        self.btn_load.Bind(wx.EVT_BUTTON, self.on_load)
+        self.btn_save.Bind(wx.EVT_BUTTON, self.on_save)
+        self.btn_reset.Bind(wx.EVT_BUTTON, self.on_reset)
+        self.btn_close.Bind(wx.EVT_BUTTON, lambda _: self.Close())
+        self.schema_list.SetToolTip("Policy keys and descriptions.")
+        self.policy_txt.SetToolTip("Editable JSON policy payload. Save sends all keys shown.")
+        self.on_load(None)
+
+    def on_key(self, event):
+        if event.GetKeyCode() == wx.WXK_F1:
+            open_help_docs_for_context("settings", self)
+            return
+        if event.GetKeyCode() == wx.WXK_ESCAPE:
+            self.Close()
+            return
+        event.Skip()
+
+    def on_close(self, event):
+        parent = self.GetParent()
+        if parent and hasattr(parent, "_group_policy_dlg"):
+            parent._group_policy_dlg = None
+        event.Skip()
+
+    def _group_value(self):
+        g = self.group_txt.GetValue().strip()
+        return g if g else "__global__"
+
+    def on_load(self, _):
+        group = self._group_value()
+        payload = {"action": "get_group_policy"}
+        if group != "__global__":
+            payload["group"] = group
+        try:
+            self.sock.sendall((json.dumps(payload) + "\n").encode())
+            self.info.SetLabel(f"Loading group policy for {group}...")
+        except Exception as e:
+            wx.MessageBox(f"Failed to request group policy: {e}", "Group Policy", wx.OK | wx.ICON_ERROR, self)
+
+    def on_save(self, _):
+        group = self._group_value()
+        raw = self.policy_txt.GetValue().strip()
+        try:
+            updates = json.loads(raw) if raw else {}
+            if not isinstance(updates, dict):
+                raise ValueError("Policy JSON must be an object.")
+        except Exception as e:
+            wx.MessageBox(f"Invalid policy JSON: {e}", "Group Policy", wx.OK | wx.ICON_ERROR, self)
+            return
+        payload = {"action": "set_group_policy", "updates": updates}
+        if group != "__global__":
+            payload["group"] = group
+        try:
+            self.sock.sendall((json.dumps(payload) + "\n").encode())
+            self.info.SetLabel(f"Saving policy for {group}...")
+        except Exception as e:
+            wx.MessageBox(f"Failed to save group policy: {e}", "Group Policy", wx.OK | wx.ICON_ERROR, self)
+
+    def on_reset(self, _):
+        group = self._group_value()
+        payload = {"action": "reset_group_policy"}
+        if group != "__global__":
+            payload["group"] = group
+        try:
+            self.sock.sendall((json.dumps(payload) + "\n").encode())
+            self.info.SetLabel(f"Resetting policy for {group}...")
+        except Exception as e:
+            wx.MessageBox(f"Failed to reset group policy: {e}", "Group Policy", wx.OK | wx.ICON_ERROR, self)
+
+    def handle_policy_payload(self, msg):
+        if not msg.get("ok"):
+            reason = msg.get("reason", "Failed to load group policy.")
+            self.info.SetLabel(reason)
+            wx.MessageBox(reason, "Group Policy", wx.OK | wx.ICON_WARNING, self)
+            return
+        group = str(msg.get("group", "__global__") or "__global__")
+        policy = msg.get("policy", {}) or {}
+        self.schema = msg.get("schema", {}) or {}
+        self.current_group = group
+        self.group_txt.SetValue("" if group == "__global__" else group)
+        try:
+            self.policy_txt.ChangeValue(json.dumps(policy, indent=2, ensure_ascii=False))
+        except Exception:
+            self.policy_txt.ChangeValue(str(policy))
+        self.schema_list.Clear()
+        for key in sorted(self.schema.keys()):
+            meta = self.schema.get(key, {})
+            t = meta.get("type", "any")
+            d = meta.get("default", "")
+            desc = meta.get("description", "")
+            self.schema_list.Append(f"{key} ({t}, default={d}) - {desc}")
+        editable = bool(msg.get("editable", False))
+        self.policy_txt.SetEditable(editable)
+        self.btn_save.Enable(editable)
+        self.btn_reset.Enable(editable)
+        self.info.SetLabel(f"Loaded policy for {group}. {'Editable' if editable else 'Read-only (admin required).'}")
+
+    def handle_update_payload(self, msg):
+        ok = bool(msg.get("ok"))
+        if not ok:
+            reason = msg.get("reason", "Group policy update failed.")
+            self.info.SetLabel(reason)
+            wx.MessageBox(reason, "Group Policy", wx.OK | wx.ICON_WARNING, self)
+            return
+        self.info.SetLabel("Policy updated. Reloading...")
+        self.on_load(None)
+
+class GroupCallDialog(wx.Dialog):
+    def __init__(self, parent, sock, username):
+        super().__init__(parent, title="Group Calls", size=(720, 500))
+        self.parent_frame = parent
+        self.sock = sock
+        self.username = username
+        self.calls = []
+        self.current_group = ""
+        self.Bind(wx.EVT_CLOSE, self.on_close)
+        panel = wx.Panel(self)
+        s = wx.BoxSizer(wx.VERTICAL)
+
+        top = wx.BoxSizer(wx.HORIZONTAL)
+        top.Add(wx.StaticText(panel, label="Group:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        self.group_txt = wx.TextCtrl(panel)
+        top.Add(self.group_txt, 1, wx.EXPAND | wx.RIGHT, 8)
+        top.Add(wx.StaticText(panel, label="Mode:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        self.mode_choice = wx.Choice(panel, choices=["voice", "video"])
+        self.mode_choice.SetSelection(0)
+        top.Add(self.mode_choice, 0)
+
+        btn_row = wx.BoxSizer(wx.HORIZONTAL)
+        self.btn_join = wx.Button(panel, label="Join")
+        self.btn_leave = wx.Button(panel, label="Leave")
+        self.btn_refresh = wx.Button(panel, label="Refresh")
+        self.btn_ping = wx.Button(panel, label="Send Test Signal")
+        for b in [self.btn_join, self.btn_leave, self.btn_refresh, self.btn_ping]:
+            btn_row.Add(b, 1, wx.EXPAND | wx.ALL, 3)
+        self.btn_join.Bind(wx.EVT_BUTTON, self.on_join)
+        self.btn_leave.Bind(wx.EVT_BUTTON, self.on_leave)
+        self.btn_refresh.Bind(wx.EVT_BUTTON, self.on_refresh)
+        self.btn_ping.Bind(wx.EVT_BUTTON, self.on_ping)
+
+        self.calls_list = wx.ListBox(panel, style=wx.LB_SINGLE)
+        self.calls_list.Bind(wx.EVT_LISTBOX, self.on_select_call)
+        self.log = wx.ListBox(panel, style=wx.LB_SINGLE)
+
+        s.Add(top, 0, wx.EXPAND | wx.ALL, 8)
+        s.Add(btn_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        s.Add(wx.StaticText(panel, label="Active Group Calls"), 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 4)
+        s.Add(self.calls_list, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        s.Add(wx.StaticText(panel, label="Call Events"), 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 4)
+        s.Add(self.log, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        panel.SetSizer(s)
+
+    def on_close(self, event):
+        if self.parent_frame:
+            self.parent_frame._group_call_dlg = None
+        event.Skip()
+
+    def _append_log(self, text):
+        self.log.Append(f"[{format_timestamp(time.time())}] {text}")
+        self.log.SetSelection(self.log.GetCount() - 1)
+
+    def set_calls(self, calls):
+        self.calls = list(calls or [])
+        self.calls_list.Clear()
+        for c in self.calls:
+            group = c.get("group", "")
+            mode = c.get("mode", "voice")
+            count = c.get("count", 0)
+            self.calls_list.Append(f"{group} | {mode} | participants: {count}")
+        if self.calls_list.GetCount() == 0:
+            self.calls_list.Append("(No active group calls)")
+
+    def on_select_call(self, _):
+        idx = self.calls_list.GetSelection()
+        if idx == wx.NOT_FOUND or idx < 0 or idx >= len(self.calls):
+            return
+        call = self.calls[idx]
+        self.current_group = str(call.get("group", "") or "")
+        self.group_txt.SetValue(self.current_group)
+        mode = str(call.get("mode", "voice"))
+        self.mode_choice.SetStringSelection(mode if mode in ("voice", "video") else "voice")
+
+    def on_refresh(self, _):
+        try:
+            self.sock.sendall((json.dumps({"action": "group_call_list"}) + "\n").encode())
+        except Exception as e:
+            self._append_log(f"Refresh failed: {e}")
+
+    def on_join(self, _):
+        group = self.group_txt.GetValue().strip()
+        if not group:
+            wx.MessageBox("Enter a group name first.", "Group Calls", wx.OK | wx.ICON_INFORMATION, self)
+            return
+        self.current_group = group
+        mode = self.mode_choice.GetStringSelection() or "voice"
+        try:
+            self.sock.sendall((json.dumps({"action": "group_call_join", "group": group, "mode": mode}) + "\n").encode())
+        except Exception as e:
+            self._append_log(f"Join failed: {e}")
+
+    def on_leave(self, _):
+        group = self.group_txt.GetValue().strip() or self.current_group
+        if not group:
+            return
+        try:
+            self.sock.sendall((json.dumps({"action": "group_call_leave", "group": group}) + "\n").encode())
+        except Exception as e:
+            self._append_log(f"Leave failed: {e}")
+
+    def on_ping(self, _):
+        group = self.group_txt.GetValue().strip() or self.current_group
+        if not group:
+            wx.MessageBox("Join/select a group call first.", "Group Calls", wx.OK | wx.ICON_INFORMATION, self)
+            return
+        target = ""
+        for c in self.calls:
+            if str(c.get("group", "")) == group:
+                participants = [p for p in c.get("participants", []) if p != self.username]
+                if participants:
+                    target = participants[0]
+                break
+        if not target:
+            self._append_log("No other participant available for test signal.")
+            return
+        payload = {
+            "action": "group_call_signal",
+            "group": group,
+            "to": target,
+            "signal_type": "test",
+            "data": {"message": "ping"},
+        }
+        try:
+            self.sock.sendall((json.dumps(payload) + "\n").encode())
+        except Exception as e:
+            self._append_log(f"Signal failed: {e}")
+
+    def handle_call_event(self, msg):
+        group = msg.get("group", "")
+        event = msg.get("event", "")
+        by = msg.get("by", "")
+        participants = msg.get("participants", [])
+        self._append_log(f"{group}: {by} {event} ({len(participants)} participants)")
+        self.on_refresh(None)
+
+    def handle_call_result(self, msg):
+        if msg.get("ok"):
+            self._append_log(f"Call action OK for group {msg.get('group', '')}.")
+            self.on_refresh(None)
+        else:
+            self._append_log(f"Call action failed: {msg.get('reason', 'unknown error')}")
+
+    def handle_call_signal(self, msg):
+        self._append_log(f"Signal from {msg.get('from', '')} in {msg.get('group', '')}: {msg.get('signal_type', '')}")
+
+    def handle_signal_result(self, msg):
+        if msg.get("ok"):
+            self._append_log(f"Signal sent to {msg.get('to', '')}.")
+        else:
+            self._append_log(f"Signal failed: {msg.get('reason', 'unknown error')}")
 
 class ChatDialog(wx.Dialog):
-    def __init__(self, parent, contact, sock, user, logging_enabled=False, is_contact=True):
+    def __init__(self, parent, contact, sock, user, logging_enabled=False, is_contact=True, remote_server_entry=None, remote_target_user=None):
         super().__init__(parent, title=f"Chat with {contact}", size=(450, 450))
         self.contact, self.sock, self.user = contact, sock, user
         self.is_contact = bool(is_contact)
+        self.remote_server_entry = remote_server_entry
+        self.remote_target_user = str(remote_target_user or contact)
+        self.is_remote_directory_chat = self.remote_server_entry is not None
         self._pending_message_after_add = None
         self._last_deleted_message = None
         self.Bind(wx.EVT_CHAR_HOOK, self.on_key)
@@ -3932,10 +4702,16 @@ class ChatDialog(wx.Dialog):
     def on_show_dialog(self, event):
         if event.IsShown():
             self._focus_input()
+            parent = self.GetParent()
+            if parent and hasattr(parent, "_clear_unread"):
+                parent._clear_unread(self.contact)
         event.Skip()
     def on_activate_dialog(self, event):
         if event.GetActive():
             self._focus_input()
+            parent = self.GetParent()
+            if parent and hasattr(parent, "_clear_unread"):
+                parent._clear_unread(self.contact)
         event.Skip()
     def _save_message_to_log(self, formatted_log_line):
         try:
@@ -3970,6 +4746,9 @@ class ChatDialog(wx.Dialog):
             return
         self._handle_enter_action()
     def on_input_text(self, event):
+        if self.is_remote_directory_chat:
+            event.Skip()
+            return
         app = wx.GetApp()
         if app.user_config.get('typing_indicators', True):
             txt = self.input_ctrl.GetValue().strip()
@@ -3985,6 +4764,9 @@ class ChatDialog(wx.Dialog):
                 self._send_stop_typing()
         event.Skip()
     def _send_stop_typing(self):
+        if self.is_remote_directory_chat:
+            self._sent_typing = False
+            return
         if not self._sent_typing:
             return
         try:
@@ -4043,14 +4825,26 @@ class ChatDialog(wx.Dialog):
             return
         self._send_stop_typing()
         ts = datetime.datetime.now().isoformat()
-        msg = {"action":"msg","to":self.contact,"from":self.user,"msg":txt,"time":ts}
-        self.sock.sendall(json.dumps(msg).encode()+b"\n")
+        if self.is_remote_directory_chat:
+            ok, reason = wx.GetApp().send_directory_direct_message(self.remote_server_entry, self.user, self.remote_target_user, txt)
+            if not ok:
+                self.append_error(reason or "Message failed.")
+                return
+        else:
+            msg = {"action":"msg","to":self.contact,"from":self.user,"msg":txt,"time":ts}
+            self.sock.sendall(json.dumps(msg).encode()+b"\n")
         self.append(txt, self.user, ts)
         wx.GetApp().play_sound("send.wav")
         self.input_ctrl.Clear(); self.input_ctrl.SetFocus()
     def on_send_file(self, _):
+        if self.is_remote_directory_chat:
+            wx.MessageBox("Cross-server file transfer is not supported in directory direct message mode.", "Feature Not Supported", wx.OK | wx.ICON_INFORMATION)
+            return
         wx.GetApp().send_file_to(self.contact)
     def on_place_call(self, _):
+        if self.is_remote_directory_chat:
+            wx.MessageBox("Cross-server calling is not supported in directory direct message mode.", "Feature Not Supported", wx.OK | wx.ICON_INFORMATION)
+            return
         # Dedicated call action; kept separate from Enter so Enter behavior remains user-configurable.
         try:
             self.sock.sendall((json.dumps({"action": "voice_call_request", "to": self.contact}) + "\n").encode())
