@@ -22,6 +22,7 @@ server_started_at = time.time()
 bot_usernames = set()
 bot_status_map = {}
 bot_purpose_map = {}
+bot_service_map = {}
 
 def _parse_bot_map(raw):
     out = {}
@@ -90,6 +91,7 @@ def _ollama_bot_reply(sender_user, bot_name, text):
     model = str(bot_runtime_config.get('ollama_model', 'llama3.2')).strip() or 'llama3.2'
     timeout = int(bot_runtime_config.get('ollama_timeout', 20) or 20)
     purpose = bot_purpose_map.get(bot_name, "").strip()
+    service_scope = bot_service_map.get(bot_name, "").strip()
     system_prompt = str(bot_runtime_config.get('ollama_system_prompt', '') or '').strip()
     if not system_prompt:
         system_prompt = (
@@ -102,6 +104,11 @@ def _ollama_bot_reply(sender_user, bot_name, text):
         )
     if purpose:
         system_prompt += f" Your role on this server: {purpose}."
+    if service_scope:
+        system_prompt += (
+            f" You are trained for these services/features: {service_scope}. "
+            "When users ask about these services, provide concrete usage steps and troubleshooting."
+        )
     user_text = (text or "").strip()
     if not user_text:
         user_text = "Introduce yourself and explain how you can help in one short message."
@@ -278,6 +285,8 @@ def load_config():
     bot_status_map = _parse_bot_map(config.get('bots', 'status_map', fallback=''))
     global bot_purpose_map
     bot_purpose_map = _parse_bot_map(config.get('bots', 'purpose_map', fallback=''))
+    global bot_service_map
+    bot_service_map = _parse_bot_map(config.get('bots', 'service_map', fallback=''))
     global bot_runtime_config
     bot_runtime_config = {
         'ollama_enabled': config.getboolean('bots', 'ollama_enabled', fallback=True),
