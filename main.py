@@ -7,7 +7,7 @@ try:
 except Exception:
     wxhtml2 = None
 
-VERSION_TAG = "v2026-alpha15.1"
+VERSION_TAG = "v2026-alpha15.3"
 URL_REGEX = re.compile(r'(https?://[^\s<>()]+)')
 KEYRING_SERVICE = "ThriveMessenger"
 DEFAULT_SOUNDPACK_BASE_URL = "https://im.tappedin.fm/thrive/sounds"
@@ -3632,24 +3632,38 @@ class MainFrame(wx.Frame):
         dlg = self.get_admin_dialog()
         if dlg: dlg.append_response(response_text)
     def on_close_window(self, event):
-        if self.is_exiting:
-            event.Skip()
-            return
-        # macOS does not reliably expose a tray restore path for this app build.
-        # Closing should fully exit so relaunch always restores a visible window.
-        if sys.platform == "darwin":
-            self.on_exit(None)
-            return
-        self.minimize_to_tray()
-    def minimize_to_tray(self):
-        self.Hide()
-        if not self.task_bar_icon:
-            self.task_bar_icon = ThriveTaskBarIcon(self)
+        if self.is_exiting: event.Skip()
+        else:
+            if sys.platform == 'win32':
+                # While we are still the foreground process, hand focus to the
+                # topmost visible window belonging to another process.  This
+                # prevents Windows from promoting any of our owned windows when
+                # we hide, because focus already belongs to someone else.
+                # We intentionally skip the IsWindowEnabled check because apps
+                # like VMware Workstation report as disabled when the VM has
+                # input capture, but can still legitimately receive foreground.
+                our_pid = ctypes.windll.kernel32.GetCurrentProcessId()
+                EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+                def _find_other(hwnd, _):
+                    if not ctypes.windll.user32.IsWindowVisible(hwnd): return True
+                    pid = ctypes.c_ulong(0)
+                    ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                    if pid.value != our_pid:
+                        ctypes.windll.user32.SetForegroundWindow(hwnd)
+                        return False
+                    return True
+                ctypes.windll.user32.EnumWindows(EnumWindowsProc(_find_other), None)
+            for child in self.GetChildren():
+                if isinstance(child, ChatDialog) and child.IsShown():
+                    child._restore_from_tray = True; child.Hide()
+            self.Hide(); self.task_bar_icon = ThriveTaskBarIcon(self)
     def restore_from_tray(self):
         if self.task_bar_icon: self.task_bar_icon.Destroy(); self.task_bar_icon = None
         self.Show(); self.Raise()
         if self._directory_dlg and self._directory_dlg.IsShown(): self._directory_dlg.Raise()
         for child in self.GetChildren():
+            if isinstance(child, ChatDialog) and getattr(child, '_restore_from_tray', False):
+                child._restore_from_tray = False; child.Show()
             if isinstance(child, (ChatDialog, AdminDialog)) and child.IsShown(): child.Raise()
     def on_exit(self, _):
         print("Exiting application...");
@@ -3737,7 +3751,38 @@ class MainFrame(wx.Frame):
         if not dlg:
             is_contact = msg["from"] in self.contact_states
             dlg = ChatDialog(self, msg["from"], self.sock, self.user, is_logging_enabled, is_contact=is_contact)
-        dlg.Show()
+        if not is_contact and msg["from"] not in self._noncontact_senders:
+            self._noncontact_senders.add(msg["from"]); self._apply_search_filter()
+            save_noncontact_senders(self.user, self._noncontact_senders)
+        if wx.GetActiveWindow() is not None:
+            dlg.Show()
+        elif sys.platform == 'win32':
+            _shown = False
+            try:
+                hwnd = dlg.GetHandle()
+                # CBT hook blocks HCBT_ACTIVATE for this window during Show() so wx
+                # fully initialises it but WM_ACTIVATE is never sent — no focus change,
+                # no screen reader announcement.  No WS_EX_APPWINDOW: keeping the dialog
+                # as a plain owned window means Windows auto-hides it with the owner and
+                # won't promote it to foreground when the owner is hidden to tray.
+                _CBTProc = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_int, ctypes.WPARAM, ctypes.LPARAM)
+                def _no_activate(nCode, wParam, lParam):
+                    if nCode == 5 and wParam == hwnd:  # HCBT_ACTIVATE for our window
+                        return 1
+                    return ctypes.windll.user32.CallNextHookEx(None, nCode, wParam, lParam)
+                _cb = _CBTProc(_no_activate)
+                tid = ctypes.windll.kernel32.GetCurrentThreadId()
+                hook = ctypes.windll.user32.SetWindowsHookExW(5, _cb, None, tid)  # WH_CBT
+                try:
+                    dlg.Show(); _shown = True
+                finally:
+                    if hook: ctypes.windll.user32.UnhookWindowsHookEx(hook)
+            except Exception:
+                pass
+            if not _shown:
+                dlg.Show()
+        else:
+            dlg.Show()
         dlg.append(msg["msg"], msg["from"], msg["time"])
         played_bot_tts = play_tts_audio_from_message(msg)
         if app.user_config.get('read_messages_aloud', False) and not played_bot_tts:
