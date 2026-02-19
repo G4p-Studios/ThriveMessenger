@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VIDEO_DIR="${ROOT_DIR}/assets/videos"
-WORK_DIR="${VIDEO_DIR}/.narration_work"
+WORK_DIR="${TMPDIR:-/tmp}/thrive_narration_work"
 VOICE="${VOICE:-Alex}"
 RATE="${RATE:-185}"
 

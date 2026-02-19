@@ -1,4 +1,4 @@
-import wx, socket, json, threading, datetime, wx.adv, configparser, ssl, sys, os, base64, uuid, subprocess, tempfile, re, random, shutil
+import wx, socket, json, threading, datetime, wx.adv, configparser, ssl, sys, os, base64, uuid, subprocess, tempfile, re, random, shutil, time
 import urllib.request, urllib.parse
 import traceback, platform
 import keyring
@@ -32,6 +32,7 @@ DEMO_VIDEOS = {
 _KEYRING_WRITE_CACHE = {}
 _SOUND_DOWNLOAD_NOTICE_CACHE = set()
 _SOUND_DOWNLOAD_FAILURE_CACHE = set()
+UPDATE_CONTEXT = {}
 if sys.platform == 'win32':
     from winotify import Notification as _WinNotification
 else:
@@ -632,9 +633,37 @@ def parse_github_tag(tag):
     if not m: return None
     return (int(m.group(1)) - 2000, 0, int(m.group(2)), int(m.group(3)) if m.group(3) else 0)
 
+def _load_update_settings():
+    cfg = configparser.ConfigParser(interpolation=None)
+    cfg.read('client.conf')
+    update_feed_url = cfg.get('updates', 'feed_url', fallback='').strip()
+    preferred_repo = cfg.get('updates', 'preferred_repo', fallback='Raywonder/ThriveMessenger').strip()
+    fallback_repos = [x.strip() for x in cfg.get('updates', 'fallback_repos', fallback='G4p-Studios/ThriveMessenger').split(',') if x.strip()]
+    repos = []
+    for candidate in [preferred_repo] + fallback_repos:
+        if '/' in candidate and candidate not in repos:
+            repos.append(candidate)
+    return {
+        "feed_url": update_feed_url,
+        "repos": repos or ["Raywonder/ThriveMessenger", "G4p-Studios/ThriveMessenger"],
+    }
+
 def get_program_dir():
     if getattr(sys, 'frozen', False): return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
+
+def get_macos_app_bundle_path():
+    if sys.platform != 'darwin':
+        return None
+    cur = os.path.abspath(sys.executable)
+    while True:
+        if cur.lower().endswith('.app') and os.path.isdir(cur):
+            return cur
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    return None
 
 def get_bundle_resources_dir():
     if not getattr(sys, 'frozen', False):
@@ -797,19 +826,56 @@ def check_for_update(callback):
     def _check():
         import urllib.request
         try:
-            req = urllib.request.Request("https://api.github.com/repos/G4p-Studios/ThriveMessenger/releases/latest",
-                headers={"Accept": "application/vnd.github+json", "User-Agent": "ThriveMessenger/" + VERSION_TAG})
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read().decode())
-            tag = data.get("tag_name", "")
-            remote = parse_github_tag(tag)
-            if remote is None: wx.CallAfter(callback, None, None, f"Unrecognized release tag: {tag}"); return
             local = parse_github_tag(VERSION_TAG)
-            if local is None: wx.CallAfter(callback, None, None, f"Unrecognized local version tag: {VERSION_TAG}"); return
-            if remote != local:
-                wx.CallAfter(callback, tag, ".".join(str(x) for x in remote), None)
-            else:
-                wx.CallAfter(callback, None, None, None)
+            if local is None:
+                wx.CallAfter(callback, None, None, f"Unrecognized local version tag: {VERSION_TAG}")
+                return
+            settings = _load_update_settings()
+            UPDATE_CONTEXT.clear()
+
+            feed_url = settings.get("feed_url")
+            if feed_url:
+                try:
+                    feed_req = urllib.request.Request(feed_url, headers={"User-Agent": "ThriveMessenger/" + VERSION_TAG, "Accept": "application/json"})
+                    with urllib.request.urlopen(feed_req, timeout=15) as resp:
+                        feed_data = json.loads(resp.read().decode())
+                    tag = str(feed_data.get("tag") or feed_data.get("tag_name") or "").strip()
+                    remote = parse_github_tag(tag)
+                    if remote and remote > local:
+                        UPDATE_CONTEXT.update({
+                            "source": "feed",
+                            "feed_url": feed_url,
+                            "tag": tag,
+                            "zip_url": feed_data.get("zip_url") or feed_data.get("mac_zip_url") or feed_data.get("win_zip_url"),
+                            "installer_url": feed_data.get("installer_url") or feed_data.get("win_installer_url"),
+                            "repo": feed_data.get("repo"),
+                        })
+                        wx.CallAfter(callback, tag, ".".join(str(x) for x in remote), None)
+                        return
+                except Exception as feed_err:
+                    print(f"Update feed check failed: {feed_err}")
+
+            best = None
+            for repo in settings.get("repos", []):
+                url = f"https://api.github.com/repos/{repo}/releases/latest"
+                req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json", "User-Agent": "ThriveMessenger/" + VERSION_TAG})
+                try:
+                    with urllib.request.urlopen(req, timeout=15) as resp:
+                        data = json.loads(resp.read().decode())
+                except Exception as repo_err:
+                    print(f"Update check failed for {repo}: {repo_err}")
+                    continue
+                tag = data.get("tag_name", "")
+                remote = parse_github_tag(tag)
+                if remote is None:
+                    continue
+                if best is None or remote > best["remote"]:
+                    best = {"repo": repo, "tag": tag, "remote": remote}
+            if best and best["remote"] > local:
+                UPDATE_CONTEXT.update({"source": "repo", "repo": best["repo"], "tag": best["tag"]})
+                wx.CallAfter(callback, best["tag"], ".".join(str(x) for x in best["remote"]), None)
+                return
+            wx.CallAfter(callback, None, None, None)
         except Exception as e:
             wx.CallAfter(callback, None, None, str(e))
     threading.Thread(target=_check, daemon=True).start()
@@ -849,6 +915,38 @@ def apply_installer_update(installer_path):
     subprocess.Popen(['cmd', '/c', batch_path], creationflags=0x08000000)
 
 def apply_zip_update(zip_path):
+    if sys.platform == 'darwin':
+        target_app = get_macos_app_bundle_path()
+        if not target_app:
+            raise RuntimeError("Could not determine installed app bundle path for macOS update.")
+        pid = os.getpid()
+        temp_extract = os.path.join(tempfile.gettempdir(), 'thrive_update_extract')
+        script_path = os.path.join(tempfile.gettempdir(), 'thrive_update.sh')
+        target_parent = os.path.dirname(target_app)
+        with open(script_path, 'w', encoding='utf-8') as f:
+            f.write("#!/bin/sh\n")
+            f.write("set -e\n")
+            f.write(f"PID='{pid}'\n")
+            f.write(f"ZIP='{zip_path}'\n")
+            f.write(f"TEMP_EXTRACT='{temp_extract}'\n")
+            f.write(f"TARGET_APP='{target_app}'\n")
+            f.write(f"TARGET_PARENT='{target_parent}'\n")
+            f.write("while kill -0 \"$PID\" 2>/dev/null; do sleep 1; done\n")
+            f.write("/bin/rm -rf \"$TEMP_EXTRACT\"\n")
+            f.write("/bin/mkdir -p \"$TEMP_EXTRACT\"\n")
+            f.write("/usr/bin/ditto -x -k \"$ZIP\" \"$TEMP_EXTRACT\"\n")
+            f.write("NEW_APP=$(/usr/bin/find \"$TEMP_EXTRACT\" -maxdepth 4 -type d -name '*.app' | /usr/bin/head -n 1)\n")
+            f.write("if [ -z \"$NEW_APP\" ]; then exit 1; fi\n")
+            f.write("/bin/rm -rf \"$TARGET_APP\"\n")
+            f.write("/usr/bin/ditto \"$NEW_APP\" \"$TARGET_APP\"\n")
+            f.write("/bin/rm -rf \"$TEMP_EXTRACT\"\n")
+            f.write("/bin/rm -f \"$ZIP\"\n")
+            f.write("/usr/bin/open -a \"$TARGET_APP\"\n")
+            f.write("/bin/rm -f \"$0\"\n")
+        os.chmod(script_path, 0o755)
+        subprocess.Popen(['/bin/sh', script_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)
+        return
+
     program_dir = get_program_dir()
     exe_path = os.path.join(program_dir, 'thrive_messenger.exe')
     pid = os.getpid()
@@ -880,22 +978,36 @@ class ThriveTaskBarIcon(wx.adv.TaskBarIcon):
 
 class SettingsDialog(wx.Dialog):
     def __init__(self, parent, current_config):
-        super().__init__(parent, title="Settings", size=(430, 540)); self.config = current_config
+        super().__init__(parent, title="Settings", size=(560, 650)); self.config = current_config
         self.Bind(wx.EVT_CHAR_HOOK, self.on_key)
-        panel = wx.Panel(self); main_sizer = wx.BoxSizer(wx.VERTICAL); sound_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "&Sound Pack")
-        call_audio_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "Call Audio Levels")
-        accessibility_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "&Chat Accessibility")
+        panel = wx.Panel(self); main_sizer = wx.BoxSizer(wx.VERTICAL)
+        notebook = wx.Notebook(panel)
+        tab_general = wx.Panel(notebook)
+        tab_audio = wx.Panel(notebook)
+        tab_admin = wx.Panel(notebook)
+        notebook.AddPage(tab_general, "General")
+        notebook.AddPage(tab_audio, "Audio")
+        notebook.AddPage(tab_admin, "Administration")
+        sound_box = wx.StaticBoxSizer(wx.VERTICAL, tab_audio, "&Sound Pack")
+        call_audio_box = wx.StaticBoxSizer(wx.VERTICAL, tab_audio, "Call Audio Levels")
+        accessibility_box = wx.StaticBoxSizer(wx.VERTICAL, tab_general, "&Chat Behavior")
+        admin_box = wx.StaticBoxSizer(wx.VERTICAL, tab_admin, "Server and Updater Configuration")
         
         dark_mode_on = is_windows_dark_mode()
         if dark_mode_on:
             dark_color = wx.Colour(40, 40, 40); light_text_color = wx.WHITE
             WxMswDarkMode().enable(self); self.SetBackgroundColour(dark_color); panel.SetBackgroundColour(dark_color)
+            tab_general.SetBackgroundColour(dark_color)
+            tab_audio.SetBackgroundColour(dark_color)
+            tab_admin.SetBackgroundColour(dark_color)
             sound_box.GetStaticBox().SetForegroundColour(light_text_color)
             sound_box.GetStaticBox().SetBackgroundColour(dark_color)
             call_audio_box.GetStaticBox().SetForegroundColour(light_text_color)
             call_audio_box.GetStaticBox().SetBackgroundColour(dark_color)
             accessibility_box.GetStaticBox().SetForegroundColour(light_text_color)
             accessibility_box.GetStaticBox().SetBackgroundColour(dark_color)
+            admin_box.GetStaticBox().SetForegroundColour(light_text_color)
+            admin_box.GetStaticBox().SetBackgroundColour(dark_color)
         
         sound_packs = list_available_sound_packs(self.config)
         self.choice = wx.Choice(sound_box.GetStaticBox(), choices=sound_packs)
@@ -931,10 +1043,12 @@ class SettingsDialog(wx.Dialog):
         enter_row = wx.BoxSizer(wx.HORIZONTAL)
         enter_row.Add(wx.StaticText(accessibility_box.GetStaticBox(), label="Enter key action:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
         self.enter_action_choice = wx.Choice(accessibility_box.GetStaticBox(), choices=[
-            "Send message on Enter (default)",
-            "Insert newline on Enter",
+            "Send message (default)",
+            "Place call",
+            "Do nothing",
         ])
-        self.enter_action_choice.SetSelection(0 if self.config.get('enter_key_action', 'send') == 'send' else 1)
+        enter_val = str(self.config.get('enter_key_action', 'send') or 'send')
+        self.enter_action_choice.SetSelection(0 if enter_val == 'send' else (1 if enter_val == 'place_call' else 2))
         enter_row.Add(self.enter_action_choice, 1, wx.EXPAND)
         escape_row = wx.BoxSizer(wx.HORIZONTAL)
         escape_row.Add(wx.StaticText(accessibility_box.GetStaticBox(), label="Escape in main window:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
@@ -946,6 +1060,44 @@ class SettingsDialog(wx.Dialog):
         esc_val = str(self.config.get('escape_main_action', 'none') or 'none')
         self.escape_action_choice.SetSelection(0 if esc_val == 'none' else (1 if esc_val == 'minimize' else 2))
         escape_row.Add(self.escape_action_choice, 1, wx.EXPAND)
+
+        cfg = configparser.ConfigParser(interpolation=None)
+        self.client_conf_path = "client.conf"
+        cfg.read(self.client_conf_path)
+        self.admin_hint = wx.StaticText(admin_box.GetStaticBox(), label="Admin settings apply to client/server connection and updater sources.")
+        self.admin_hint.Wrap(500)
+        host_row = wx.BoxSizer(wx.HORIZONTAL)
+        host_row.Add(wx.StaticText(admin_box.GetStaticBox(), label="Server host:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        self.admin_host_txt = wx.TextCtrl(admin_box.GetStaticBox(), value=cfg.get('server', 'host', fallback='msg.thecubed.cc'))
+        host_row.Add(self.admin_host_txt, 1, wx.EXPAND)
+        port_row = wx.BoxSizer(wx.HORIZONTAL)
+        port_row.Add(wx.StaticText(admin_box.GetStaticBox(), label="Server port:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        self.admin_port_txt = wx.TextCtrl(admin_box.GetStaticBox(), value=str(cfg.getint('server', 'port', fallback=2005)))
+        port_row.Add(self.admin_port_txt, 1, wx.EXPAND)
+        cafile_row = wx.BoxSizer(wx.HORIZONTAL)
+        cafile_row.Add(wx.StaticText(admin_box.GetStaticBox(), label="TLS CA file:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        self.admin_cafile_txt = wx.TextCtrl(admin_box.GetStaticBox(), value=cfg.get('server', 'cafile', fallback=''))
+        cafile_row.Add(self.admin_cafile_txt, 1, wx.EXPAND)
+        feed_row = wx.BoxSizer(wx.HORIZONTAL)
+        feed_row.Add(wx.StaticText(admin_box.GetStaticBox(), label="Update feed URL:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        self.admin_feed_txt = wx.TextCtrl(admin_box.GetStaticBox(), value=cfg.get('updates', 'feed_url', fallback=''))
+        feed_row.Add(self.admin_feed_txt, 1, wx.EXPAND)
+        pref_row = wx.BoxSizer(wx.HORIZONTAL)
+        pref_row.Add(wx.StaticText(admin_box.GetStaticBox(), label="Preferred repo:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        self.admin_pref_repo_txt = wx.TextCtrl(admin_box.GetStaticBox(), value=cfg.get('updates', 'preferred_repo', fallback='Raywonder/ThriveMessenger'))
+        pref_row.Add(self.admin_pref_repo_txt, 1, wx.EXPAND)
+        fallback_row = wx.BoxSizer(wx.HORIZONTAL)
+        fallback_row.Add(wx.StaticText(admin_box.GetStaticBox(), label="Fallback repos:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        self.admin_fallback_txt = wx.TextCtrl(admin_box.GetStaticBox(), value=cfg.get('updates', 'fallback_repos', fallback='G4p-Studios/ThriveMessenger'))
+        fallback_row.Add(self.admin_fallback_txt, 1, wx.EXPAND)
+        self.restart_after_save_cb = wx.CheckBox(admin_box.GetStaticBox(), label="Restart server after saving admin settings")
+        self.restart_after_save_cb.SetValue(False)
+        restart_row = wx.BoxSizer(wx.HORIZONTAL)
+        restart_row.Add(wx.StaticText(admin_box.GetStaticBox(), label="Restart delay (seconds):"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        self.restart_delay_txt = wx.TextCtrl(admin_box.GetStaticBox(), value="10")
+        restart_row.Add(self.restart_delay_txt, 1, wx.EXPAND)
+        self.btn_open_admin_console = wx.Button(admin_box.GetStaticBox(), label="Open Server Command Console")
+        self.btn_open_admin_console.Bind(wx.EVT_BUTTON, self.on_open_admin_console)
         sound_box.Add(self.choice, 0, wx.EXPAND | wx.ALL, 5)
         sound_box.Add(self.default_soundpack_label, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         sound_box.Add(self.set_selected_default_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
@@ -963,12 +1115,33 @@ class SettingsDialog(wx.Dialog):
         accessibility_box.Add(self.announce_typing_cb, 0, wx.ALL, 5)
         accessibility_box.Add(enter_row, 0, wx.EXPAND | wx.ALL, 5)
         accessibility_box.Add(escape_row, 0, wx.EXPAND | wx.ALL, 5)
-        main_sizer.Add(sound_box, 0, wx.EXPAND | wx.ALL, 5)
-        main_sizer.Add(call_audio_box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
-        main_sizer.Add(accessibility_box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
-        self.btn_chpass = wx.Button(panel, label="C&hange Password...")
+        audio_sizer = wx.BoxSizer(wx.VERTICAL)
+        audio_sizer.Add(sound_box, 0, wx.EXPAND | wx.ALL, 8)
+        audio_sizer.Add(call_audio_box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        tab_audio.SetSizer(audio_sizer)
+
+        general_sizer = wx.BoxSizer(wx.VERTICAL)
+        general_sizer.Add(accessibility_box, 0, wx.EXPAND | wx.ALL, 8)
+        self.btn_chpass = wx.Button(tab_general, label="C&hange Password...")
         self.btn_chpass.Bind(wx.EVT_BUTTON, self.on_change_password)
-        main_sizer.Add(self.btn_chpass, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        general_sizer.Add(self.btn_chpass, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        tab_general.SetSizer(general_sizer)
+
+        admin_box.Add(self.admin_hint, 0, wx.EXPAND | wx.ALL, 5)
+        admin_box.Add(host_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        admin_box.Add(port_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        admin_box.Add(cafile_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        admin_box.Add(feed_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        admin_box.Add(pref_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        admin_box.Add(fallback_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        admin_box.Add(self.restart_after_save_cb, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        admin_box.Add(restart_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        admin_box.Add(self.btn_open_admin_console, 0, wx.EXPAND | wx.ALL, 5)
+        admin_sizer = wx.BoxSizer(wx.VERTICAL)
+        admin_sizer.Add(admin_box, 1, wx.EXPAND | wx.ALL, 8)
+        tab_admin.SetSizer(admin_sizer)
+
+        main_sizer.Add(notebook, 1, wx.EXPAND | wx.ALL, 6)
         btn_sizer = wx.StdDialogButtonSizer()
         ok_btn = wx.Button(panel, wx.ID_OK, label="&Apply"); ok_btn.SetDefault(); cancel_btn = wx.Button(panel, wx.ID_CANCEL)
         
@@ -979,11 +1152,17 @@ class SettingsDialog(wx.Dialog):
             self.sound_volume_label.SetForegroundColour(light_text_color)
             self.call_in_label.SetForegroundColour(light_text_color)
             self.call_out_label.SetForegroundColour(light_text_color)
+            self.admin_hint.SetForegroundColour(light_text_color)
             for cb in [self.auto_open_files_cb, self.read_aloud_cb, self.global_chat_logging_cb, self.show_main_actions_cb, self.typing_indicator_cb, self.announce_typing_cb]:
                 cb.SetForegroundColour(light_text_color)
+            self.restart_after_save_cb.SetForegroundColour(light_text_color)
+            for ctrl in [self.admin_host_txt, self.admin_port_txt, self.admin_cafile_txt, self.admin_feed_txt, self.admin_pref_repo_txt, self.admin_fallback_txt]:
+                ctrl.SetBackgroundColour(dark_color); ctrl.SetForegroundColour(light_text_color)
+            self.restart_delay_txt.SetBackgroundColour(dark_color); self.restart_delay_txt.SetForegroundColour(light_text_color)
             self.enter_action_choice.SetBackgroundColour(dark_color); self.enter_action_choice.SetForegroundColour(light_text_color)
             self.escape_action_choice.SetBackgroundColour(dark_color); self.escape_action_choice.SetForegroundColour(light_text_color)
             self.btn_chpass.SetBackgroundColour(dark_color); self.btn_chpass.SetForegroundColour(light_text_color)
+            self.btn_open_admin_console.SetBackgroundColour(dark_color); self.btn_open_admin_console.SetForegroundColour(light_text_color)
             ok_btn.SetBackgroundColour(dark_color); ok_btn.SetForegroundColour(light_text_color)
             cancel_btn.SetBackgroundColour(dark_color); cancel_btn.SetForegroundColour(light_text_color)
             
@@ -1004,6 +1183,41 @@ class SettingsDialog(wx.Dialog):
                 frame = self.GetParent()
                 try: frame.sock.sendall((json.dumps({"action": "change_password", "current_pass": cur, "new_pass": new}) + "\n").encode())
                 except Exception as e: wx.MessageBox(f"Failed to send request: {e}", "Error", wx.ICON_ERROR)
+    def on_open_admin_console(self, _):
+        frame = self.GetParent()
+        if frame and hasattr(frame, "on_admin"):
+            frame.on_admin(None)
+    def apply_admin_config(self):
+        cfg = configparser.ConfigParser(interpolation=None)
+        cfg.read(self.client_conf_path)
+        if not cfg.has_section('server'):
+            cfg.add_section('server')
+        if not cfg.has_section('updates'):
+            cfg.add_section('updates')
+        try:
+            port = int(self.admin_port_txt.GetValue().strip())
+        except Exception:
+            return False, "Server port must be a valid number."
+        cfg.set('server', 'host', self.admin_host_txt.GetValue().strip())
+        cfg.set('server', 'port', str(port))
+        cfg.set('server', 'cafile', self.admin_cafile_txt.GetValue().strip())
+        cfg.set('updates', 'feed_url', self.admin_feed_txt.GetValue().strip())
+        cfg.set('updates', 'preferred_repo', self.admin_pref_repo_txt.GetValue().strip())
+        cfg.set('updates', 'fallback_repos', self.admin_fallback_txt.GetValue().strip())
+        try:
+            with open(self.client_conf_path, 'w', encoding='utf-8') as f:
+                cfg.write(f)
+        except Exception as e:
+            return False, str(e)
+        return True, None
+    def restart_requested(self):
+        if not self.restart_after_save_cb.IsChecked():
+            return False, 0
+        try:
+            delay = int(self.restart_delay_txt.GetValue().strip() or "10")
+        except Exception:
+            delay = 10
+        return True, max(1, delay)
 
 class ReconnectDialog(wx.Dialog):
     def __init__(self):
@@ -1193,6 +1407,8 @@ class ClientApp(wx.App):
             log_event("warn", "ipc_bind_unavailable_continuing")
         self.user_config = load_user_config()
         self.session_password = ""
+        self.reconnect_in_progress = False
+        self.reconnect_stop_event = threading.Event()
         self.active_server_entry = resolve_default_server_entry(self.user_config)
         self.connected_server_names = set()
         self.transfer_history = []
@@ -1282,7 +1498,7 @@ class ClientApp(wx.App):
                     save_user_config(self.user_config); self.start_main_session(dlg.new_username, sock, sf); return True
             else: return False
     
-    def perform_login(self, username, password, server_entry=None):
+    def perform_login(self, username, password, server_entry=None, suppress_errors=False, show_post_login=True):
         try:
             if server_entry:
                 set_active_server_config(server_entry)
@@ -1295,19 +1511,88 @@ class ClientApp(wx.App):
                 self.active_server_entry = normalize_server_entry(server_entry or SERVER_CONFIG)
                 info = fetch_server_welcome(server_entry or SERVER_CONFIG)
                 post_login = str(info.get('post_login', '') or '').strip()
-                if info.get('enabled') and post_login:
+                if show_post_login and info.get('enabled') and post_login:
                     show_notification("Server Message", post_login, timeout=8)
                 return True, ssock, sf, "Success"
             else:
-                reason = resp.get("reason", "Unknown error"); log_event("error", "login_failed", {"reason": reason}); wx.MessageBox("Login failed: " + reason, "Login Failed", wx.ICON_ERROR); ssock.close(); return False, None, None, reason
+                reason = resp.get("reason", "Unknown error")
+                log_event("error", "login_failed", {"reason": reason})
+                if not suppress_errors:
+                    wx.MessageBox("Login failed: " + reason, "Login Failed", wx.ICON_ERROR)
+                ssock.close()
+                return False, None, None, reason
         except Exception as e:
             log_event("error", "login_connection_error", {"error": str(e)})
-            wx.MessageBox(f"A connection error occurred: {e}", "Connection Error", wx.ICON_ERROR)
-            try:
-                prompt_submit_logs(None, self.user_config, reason="login_connection_error")
-            except Exception:
-                pass
+            if not suppress_errors:
+                wx.MessageBox(f"A connection error occurred: {e}", "Connection Error", wx.ICON_ERROR)
+                try:
+                    prompt_submit_logs(None, self.user_config, reason="login_connection_error")
+                except Exception:
+                    pass
             return False, None, None, str(e)
+
+    def _current_server_label(self):
+        active = normalize_server_entry(getattr(self, "active_server_entry", SERVER_CONFIG))
+        return active.get("name") or active.get("host") or "Server"
+
+    def _set_socket_for_open_windows(self, sock):
+        if not getattr(self, 'frame', None):
+            return
+        self.frame.set_socket(sock)
+
+    def _apply_reconnected_session(self, sock, sf):
+        self.sock = sock
+        self.sockfile = sf
+        self.reconnect_in_progress = False
+        self.reconnect_stop_event.clear()
+        self.intentional_disconnect = False
+        self._set_socket_for_open_windows(sock)
+        if getattr(self, 'frame', None):
+            self.frame.refresh_connection_title(connected=True)
+        show_notification("Reconnected", f"Connected to {self._current_server_label()}.", timeout=5)
+        try:
+            if getattr(self, 'frame', None) and self.frame.current_status != "online":
+                self.sock.sendall((json.dumps({"action": "set_status", "status_text": self.frame.current_status}) + "\n").encode())
+        except Exception:
+            pass
+        threading.Thread(target=self.listen_loop, daemon=True).start()
+
+    def _start_reconnect_loop(self):
+        if self.intentional_disconnect or self.reconnect_in_progress:
+            return
+        self.reconnect_in_progress = True
+        self.reconnect_stop_event.clear()
+        threading.Thread(target=self._reconnect_worker, daemon=True).start()
+
+    def _reconnect_worker(self):
+        username = getattr(self, "username", "") or self.user_config.get("username", "")
+        password = self.session_password or self.user_config.get("password", "")
+        if not username or not password:
+            self.reconnect_in_progress = False
+            wx.CallAfter(show_notification, "Reconnect paused", "Saved login is not available. Sign in again when ready.", 7)
+            return
+        attempt = 0
+        while not self.intentional_disconnect and not self.reconnect_stop_event.is_set():
+            attempt += 1
+            success, sock, sf, reason = self.perform_login(
+                username,
+                password,
+                self.active_server_entry,
+                suppress_errors=True,
+                show_post_login=False,
+            )
+            if success:
+                wx.CallAfter(self._apply_reconnected_session, sock, sf)
+                return
+            if attempt == 1 or attempt % 3 == 0:
+                wx.CallAfter(show_notification, "Reconnecting", f"Connection lost. Retrying ({attempt})...", 5)
+            delay = min(30, max(2, attempt * 2))
+            for _ in range(delay):
+                if self.intentional_disconnect or self.reconnect_stop_event.is_set():
+                    self.reconnect_in_progress = False
+                    return
+                time.sleep(1)
+        self.reconnect_in_progress = False
 
     def fetch_directory_for_server(self, server_entry, username, password):
         try:
@@ -1424,6 +1709,7 @@ class ClientApp(wx.App):
                 elif act == "file_data": wx.CallAfter(self.on_file_data, msg)
                 elif act == "invite_result": wx.CallAfter(self.frame.on_invite_result, msg)
                 elif act == "change_password_result": wx.CallAfter(self.frame.on_change_password_result, msg)
+                elif act == "bot_token_revoked": wx.CallAfter(self.frame.on_bot_token_revoked, msg.get("bot", "bot"))
                 elif act == "banned_kick": wx.CallAfter(self.on_banned); handled = True; break
         except (IOError, json.JSONDecodeError, ValueError):
             print("Disconnected from server.")
@@ -1437,8 +1723,16 @@ class ClientApp(wx.App):
         self._return_to_login("You have been banned.", "Banned")
 
     def on_server_disconnect(self):
-        if self.intentional_disconnect: return
-        self._return_to_login("Connection to the server was lost.", "Connection Lost")
+        if self.intentional_disconnect:
+            return
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+        if getattr(self, 'frame', None):
+            self.frame.refresh_connection_title(connected=False)
+        show_notification("Connection lost", "Reconnecting in the background...", timeout=6)
+        self._start_reconnect_loop()
 
     def _return_to_login(self, message, title):
         if self.intentional_disconnect: return
@@ -2458,6 +2752,36 @@ class InviteUserDialog(wx.Dialog):
         return self.include_link.IsChecked()
 
 class MainFrame(wx.Frame):
+    def _build_connection_title(self):
+        app = wx.GetApp()
+        active_server = normalize_server_entry(getattr(app, "active_server_entry", {}))
+        server_name = active_server.get("name") or active_server.get("host") or SERVER_CONFIG.get("host", "Server")
+        connected_names = set(getattr(app, "connected_server_names", set()) or {server_name})
+        others = max(0, len(connected_names) - 1)
+        suffix = f", and {others} other server{'s' if others != 1 else ''}" if others > 0 else ""
+        return f"Thrive Messenger – {self.user} – connected to {server_name}{suffix}"
+
+    def refresh_connection_title(self, connected=True):
+        base = self._build_connection_title()
+        if connected:
+            self.SetTitle(base)
+        else:
+            self.SetTitle(f"{base} (reconnecting...)")
+
+    def set_socket(self, sock):
+        self.sock = sock
+        for child in self.GetChildren():
+            if hasattr(child, 'sock'):
+                try:
+                    child.sock = sock
+                except Exception:
+                    pass
+        if self._directory_dlg and hasattr(self._directory_dlg, 'sock'):
+            try:
+                self._directory_dlg.sock = sock
+            except Exception:
+                pass
+
     def update_contact_status(self, user, online, status_text=None):
         was_online = False
         for c in self._all_contacts:
@@ -2478,13 +2802,8 @@ class MainFrame(wx.Frame):
             show_notification("Contact offline", f"{user} has gone offline.")
 
     def __init__(self, user, sock):
-        app = wx.GetApp()
-        active_server = normalize_server_entry(getattr(app, "active_server_entry", {}))
-        server_name = active_server.get("name") or active_server.get("host") or SERVER_CONFIG.get("host", "Server")
-        connected_names = set(getattr(app, "connected_server_names", set()) or {server_name})
-        others = max(0, len(connected_names) - 1)
-        suffix = f", and {others} other server{'s' if others != 1 else ''}" if others > 0 else ""
-        super().__init__(None, title=f"Thrive Messenger – {user} – connected to {server_name}{suffix}", size=(400,380)); self.user, self.sock = user, sock; self.task_bar_icon = None; self.is_exiting = False; self._directory_dlg = None
+        super().__init__(None, title="", size=(400,380)); self.user, self.sock = user, sock; self.task_bar_icon = None; self.is_exiting = False; self._directory_dlg = None
+        self.refresh_connection_title(connected=True)
         self.current_status = wx.GetApp().user_config.get('status', 'online')
         self._empty_prompt_shown = False
         self._sort_mode = "name_asc"
@@ -2575,7 +2894,7 @@ class MainFrame(wx.Frame):
         self.mi_user_directory = file_menu.Append(wx.ID_ANY, "User Directory\tAlt+Y")
         self.mi_server_info = file_menu.Append(wx.ID_ANY, "Server Info\tAlt+I")
         self.mi_server_manager = file_menu.Append(wx.ID_ANY, "Server Manager")
-        self.mi_settings = file_menu.Append(wx.ID_ANY, "Settings\tAlt+T")
+        self.mi_settings = file_menu.Append(wx.ID_PREFERENCES, "Settings\tCmd+,")
         file_menu.AppendSeparator()
         self.mi_logout = file_menu.Append(wx.ID_ANY, "Logout\tAlt+O")
         self.mi_exit = file_menu.Append(wx.ID_ANY, "Exit\tAlt+X")
@@ -2740,11 +3059,22 @@ class MainFrame(wx.Frame):
                 app.user_config['show_main_action_buttons'] = dlg.show_main_actions_cb.IsChecked()
                 app.user_config['typing_indicators'] = dlg.typing_indicator_cb.IsChecked()
                 app.user_config['announce_typing'] = dlg.announce_typing_cb.IsChecked()
-                app.user_config['enter_key_action'] = 'send' if dlg.enter_action_choice.GetSelection() == 0 else 'newline'
+                enter_map = {0: 'send', 1: 'place_call', 2: 'none'}
+                app.user_config['enter_key_action'] = enter_map.get(dlg.enter_action_choice.GetSelection(), 'send')
                 app.user_config['escape_main_action'] = ('none' if dlg.escape_action_choice.GetSelection() == 0 else ('minimize' if dlg.escape_action_choice.GetSelection() == 1 else 'quit'))
+                ok_admin, admin_err = dlg.apply_admin_config()
                 save_user_config(app.user_config)
                 self.apply_action_button_layout()
-                wx.MessageBox("Settings have been applied.", "Settings Saved", wx.OK | wx.ICON_INFORMATION)
+                restart_req, restart_delay = dlg.restart_requested()
+                if restart_req:
+                    try:
+                        self.sock.sendall((json.dumps({"action": "schedule_restart", "seconds": int(restart_delay)}) + "\n").encode())
+                    except Exception:
+                        pass
+                if not ok_admin:
+                    wx.MessageBox(f"Settings saved, but admin config could not be written:\n{admin_err}", "Settings Saved With Warning", wx.OK | wx.ICON_WARNING)
+                else:
+                    wx.MessageBox("Settings have been applied.", "Settings Saved", wx.OK | wx.ICON_INFORMATION)
 
     def on_change_password_result(self, msg):
         if msg.get("ok"):
@@ -2969,22 +3299,51 @@ class MainFrame(wx.Frame):
         check_for_update(_callback)
     def _start_update_download(self, tag):
         import urllib.request
-        api_url = f"https://api.github.com/repos/G4p-Studios/ThriveMessenger/releases/tags/{tag}"
-        try:
-            req = urllib.request.Request(api_url, headers={"Accept": "application/vnd.github+json", "User-Agent": "ThriveMessenger/" + VERSION_TAG})
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read().decode())
-        except Exception as e:
-            wx.MessageBox(f"Failed to fetch release info:\n{e}", "Update Error", wx.ICON_ERROR); return
-        assets = data.get("assets", [])
         use_installer = is_installer_install()
-        target_name = "thrive_messenger_installer.exe" if use_installer else "thrive_messenger.zip"
+        if sys.platform == 'darwin':
+            target_candidates = [
+                "thrive_messenger-macos-universal2.zip",
+                "thrive_messenger-macos-arm64.zip",
+                "thrive_messenger-macos-x86_64.zip",
+                "thrive_messenger-macos.zip",
+                "ThriveMessenger-macOS.zip",
+                "thrive_messenger.zip",
+            ]
+        else:
+            target_candidates = ["thrive_messenger_installer.exe"] if use_installer else ["thrive_messenger.zip"]
         asset_url = None
-        for a in assets:
-            if a["name"] == target_name:
-                asset_url = a["browser_download_url"]; break
+
+        if UPDATE_CONTEXT.get("source") == "feed":
+            if sys.platform == 'darwin':
+                asset_url = UPDATE_CONTEXT.get("zip_url")
+            else:
+                asset_url = UPDATE_CONTEXT.get("installer_url") if use_installer else UPDATE_CONTEXT.get("zip_url")
+
         if not asset_url:
-            wx.MessageBox(f"Could not find {target_name} in release assets.", "Update Error", wx.ICON_ERROR); return
+            repo = UPDATE_CONTEXT.get("repo") if UPDATE_CONTEXT.get("repo") else "Raywonder/ThriveMessenger"
+            api_url = f"https://api.github.com/repos/{repo}/releases/tags/{tag}"
+            try:
+                req = urllib.request.Request(api_url, headers={"Accept": "application/vnd.github+json", "User-Agent": "ThriveMessenger/" + VERSION_TAG})
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    data = json.loads(resp.read().decode())
+            except Exception as e:
+                wx.MessageBox(f"Failed to fetch release info:\n{e}", "Update Error", wx.ICON_ERROR); return
+            assets = data.get("assets", [])
+            for name in target_candidates:
+                for a in assets:
+                    if a["name"] == name:
+                        asset_url = a.get("browser_download_url")
+                        break
+                if asset_url:
+                    break
+            if not asset_url and sys.platform == 'darwin':
+                for a in assets:
+                    n = str(a.get("name", "")).lower()
+                    if n.endswith(".zip") and "mac" in n:
+                        asset_url = a.get("browser_download_url")
+                        break
+        if not asset_url:
+            wx.MessageBox(f"Could not find a matching update archive in release assets.", "Update Error", wx.ICON_ERROR); return
         ext = ".exe" if use_installer else ".zip"
         dest = os.path.join(tempfile.gettempdir(), f"thrive_update{ext}")
         progress = wx.ProgressDialog("Downloading Update", "Starting download...", maximum=100, parent=self,
@@ -2992,10 +3351,14 @@ class MainFrame(wx.Frame):
         def _done(success, error):
             progress.Destroy()
             if success:
-                if use_installer:
-                    apply_installer_update(dest)
-                else:
-                    apply_zip_update(dest)
+                try:
+                    if use_installer and sys.platform == 'win32':
+                        apply_installer_update(dest)
+                    else:
+                        apply_zip_update(dest)
+                except Exception as apply_err:
+                    wx.MessageBox(f"Failed to install update:\n{apply_err}", "Update Error", wx.ICON_ERROR)
+                    return
                 app = wx.GetApp(); app.intentional_disconnect = True
                 try: self.sock.sendall(json.dumps({"action":"logout"}).encode()+b"\n")
                 except: pass
@@ -3059,6 +3422,12 @@ class MainFrame(wx.Frame):
         status = c.get("status_text", "online") if c["online"] and not c["blocked"] else "offline"
         if c.get("is_admin"): status += " (Admin)"
         self._all_contacts.append({"user": c["user"], "status": status, "blocked": c["blocked"]})
+        bot_token = str(c.get("bot_auth_token", "") or "").strip()
+        if bot_token:
+            show_notification("Bot Token Issued", f"{c['user']} token created for this client session.", timeout=8)
+            chat = self.get_chat(c["user"])
+            if chat:
+                chat.append(f"OpenClaw auth token issued: {bot_token}", "System", time.time())
         self._apply_search_filter()
         chat = self.get_chat(c["user"])
         if chat:
@@ -3068,6 +3437,11 @@ class MainFrame(wx.Frame):
             for u in self._directory_dlg._all_users:
                 if u["user"] == c["user"]: u["is_contact"] = True; u["is_blocked"] = c["blocked"] == 1; break
             self._directory_dlg._populate_all_tabs(); self._directory_dlg.update_button_states()
+    def on_bot_token_revoked(self, bot_name):
+        show_notification("Bot Token Revoked", f"{bot_name} token removed for this client.", timeout=6)
+        chat = self.get_chat(bot_name)
+        if chat:
+            chat.append("Bot auth token was revoked after contact removal.", "System", time.time())
     def on_server_alert(self, message):
         wx.GetApp().play_sound("receive.wav")
         show_notification("Server Alert", message, timeout=8)
@@ -3213,6 +3587,7 @@ class MainFrame(wx.Frame):
     def on_exit(self, _):
         print("Exiting application...");
         app = wx.GetApp(); app.intentional_disconnect = True
+        app.reconnect_stop_event.set(); app.reconnect_in_progress = False
         try: self.sock.sendall(json.dumps({"action":"logout"}).encode()+b"\n")
         except: pass
         try: self.sock.close()
@@ -3223,6 +3598,7 @@ class MainFrame(wx.Frame):
         app.ExitMainLoop()
     def on_logout(self, _):
         self.is_exiting = True; app = wx.GetApp(); app.intentional_disconnect = True
+        app.reconnect_stop_event.set(); app.reconnect_in_progress = False
         try: self.sock.sendall(json.dumps({"action":"logout"}).encode()+b"\n")
         except: pass
         try: self.sock.close()
@@ -3296,7 +3672,7 @@ class MainFrame(wx.Frame):
             dlg = ChatDialog(self, msg["from"], self.sock, self.user, is_logging_enabled, is_contact=is_contact)
         dlg.Show()
         dlg.append(msg["msg"], msg["from"], msg["time"])
-        if app.user_config.get('tts_enabled', True):
+        if app.user_config.get('read_messages_aloud', False):
             speak_text(f"{msg['from']}: {msg['msg']}")
     def on_typing_event(self, msg):
         from_user = msg.get("from")
@@ -3400,6 +3776,7 @@ class ChatDialog(wx.Dialog):
         self._consume_next_text_enter = False
         btn = wx.Button(self, label="&Send")
         btn_file = wx.Button(self, label="Send &File")
+        btn_call = wx.Button(self, label="Place &Call")
 
         if dark_mode_on:
             self.hist.SetBackgroundColour(dark_color); self.hist.SetForegroundColour(light_text_color)
@@ -3408,10 +3785,10 @@ class ChatDialog(wx.Dialog):
             self.input_ctrl.SetBackgroundColour(dark_color); self.input_ctrl.SetForegroundColour(light_text_color)
             btn.SetBackgroundColour(dark_color); btn.SetForegroundColour(light_text_color)
             btn_file.SetBackgroundColour(dark_color); btn_file.SetForegroundColour(light_text_color)
+            btn_call.SetBackgroundColour(dark_color); btn_call.SetForegroundColour(light_text_color)
 
         s.Add(self.hist, 1, wx.EXPAND|wx.ALL, 5)
         s.Add(self.typing_lbl, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
-        self.input_ctrl.Bind(wx.EVT_KEY_DOWN, self.on_input_key)
         self.input_ctrl.Bind(wx.EVT_CHAR_HOOK, self.on_input_key)
         self.input_ctrl.Bind(wx.EVT_TEXT_ENTER, self.on_text_enter)
         self.input_ctrl.Bind(wx.EVT_TEXT, self.on_input_text)
@@ -3420,9 +3797,11 @@ class ChatDialog(wx.Dialog):
 
         btn.Bind(wx.EVT_BUTTON, self.on_send)
         btn_file.Bind(wx.EVT_BUTTON, self.on_send_file)
+        btn_call.Bind(wx.EVT_BUTTON, self.on_place_call)
         btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
         btn_sizer.Add(btn, 1, wx.EXPAND | wx.ALL, 5)
         btn_sizer.Add(btn_file, 1, wx.EXPAND | wx.ALL, 5)
+        btn_sizer.Add(btn_call, 1, wx.EXPAND | wx.ALL, 5)
         s.Add(btn_sizer, 0, wx.EXPAND|wx.ALL, 5)
         self.SetSizer(s)
         self._focus_input()
@@ -3450,16 +3829,17 @@ class ChatDialog(wx.Dialog):
         keycode = event.GetKeyCode()
         if keycode in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
             self._consume_next_text_enter = True
+            if event.ControlDown() and event.ShiftDown():
+                self.on_place_call(None)
+                return
             if event.ControlDown():
                 self.on_send_file(None)
                 return
-            elif event.CmdDown() or event.ShiftDown():
+            elif event.CmdDown() or event.AltDown() or event.ShiftDown():
                 self.input_ctrl.WriteText('\n')
                 return
             else:
-                # Keep chat input deterministic on macOS and Windows:
-                # Enter sends, Cmd/Shift+Enter inserts newline, Ctrl+Enter sends file.
-                self.on_send(None)
+                self._handle_enter_action()
                 return
         event.Skip()
 
@@ -3467,7 +3847,7 @@ class ChatDialog(wx.Dialog):
         if self._consume_next_text_enter:
             self._consume_next_text_enter = False
             return
-        self.on_send(None)
+        self._handle_enter_action()
     def on_input_text(self, event):
         app = wx.GetApp()
         if app.user_config.get('typing_indicators', True):
@@ -3507,17 +3887,18 @@ class ChatDialog(wx.Dialog):
                     break
                 w = w.GetParent()
             if is_in_input:
-                if event.ControlDown():
+                if event.ControlDown() and event.ShiftDown():
+                    self.on_place_call(None)
+                elif event.ControlDown():
                     self.on_send_file(None)
-                elif event.CmdDown():
+                elif event.CmdDown() or event.AltDown() or event.ShiftDown():
                     self.input_ctrl.WriteText('\n')
                 else:
-                    enter_action = wx.GetApp().user_config.get('enter_key_action', 'send')
-                    if enter_action == 'newline':
-                        self.input_ctrl.WriteText('\n')
-                    else:
-                        self.on_send(None)
+                    self._handle_enter_action()
                 return
+        elif event.ControlDown() and event.GetKeyCode() == ord('L'):
+            self.on_place_call(None)
+            return
         elif event.CmdDown() and event.GetKeyCode() == ord(','):
             parent = self.GetParent()
             if parent and hasattr(parent, "on_settings"):
@@ -3548,6 +3929,23 @@ class ChatDialog(wx.Dialog):
         self.input_ctrl.Clear(); self.input_ctrl.SetFocus()
     def on_send_file(self, _):
         wx.GetApp().send_file_to(self.contact)
+    def on_place_call(self, _):
+        # Dedicated call action; kept separate from Enter so Enter behavior remains user-configurable.
+        try:
+            self.sock.sendall((json.dumps({"action": "voice_call_request", "to": self.contact}) + "\n").encode())
+            show_notification("Calling", f"Placing call to {self.contact}...", timeout=4)
+        except Exception:
+            wx.MessageBox("This server does not support voice calling yet.", "Feature Not Supported", wx.OK | wx.ICON_INFORMATION)
+    def _handle_enter_action(self):
+        action = str(wx.GetApp().user_config.get('enter_key_action', 'send') or 'send')
+        if action == 'place_call':
+            self.on_place_call(None)
+        elif action == 'none':
+            return
+        elif action == 'newline':
+            self.input_ctrl.WriteText('\n')
+        else:
+            self.on_send(None)
     def on_add_contact(self, _):
         self.sock.sendall(json.dumps({"action": "add_contact", "to": self.contact}).encode() + b"\n")
         self.btn_add_contact.Disable(); self.btn_add_contact.SetLabel("Adding...")

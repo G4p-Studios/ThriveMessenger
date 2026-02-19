@@ -4,3 +4,4 @@ build/
 dist/
 dist-macos/
 *.spec
+assets/videos/.narration_work/

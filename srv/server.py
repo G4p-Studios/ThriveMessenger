@@ -23,6 +23,12 @@ bot_usernames = set()
 bot_status_map = {}
 bot_purpose_map = {}
 bot_service_map = {}
+restart_lock = threading.Lock()
+restart_scheduled_for = None
+
+def _is_virtual_bot(username):
+    uname = str(username or "").strip()
+    return uname in bot_usernames or uname.lower() == "openclaw-bot"
 
 def _parse_bot_map(raw):
     out = {}
@@ -38,21 +44,25 @@ def _parse_bot_map(raw):
 
 def _active_usernames():
     with lock:
-        return set(clients.keys()) | set(bot_usernames)
+        extra_bots = {"openclaw-bot"}
+        return set(clients.keys()) | set(bot_usernames) | extra_bots
 
 def _is_online_user(username):
     return username in _active_usernames()
 
 def _status_for_user(username):
-    if username in bot_usernames:
+    if _is_virtual_bot(username):
         status = bot_status_map.get(username, "online")
-        purpose = bot_purpose_map.get(username, "")
+        if str(username).lower() == "openclaw-bot" and username not in bot_purpose_map:
+            purpose = "automation and assistant bot"
+        else:
+            purpose = bot_purpose_map.get(username, "")
         return f"{status} - {purpose}" if purpose else status
     with lock:
         return client_statuses.get(username, "online" if username in clients else "offline")
 
 def _maybe_send_bot_reply(sender_sock, sender_user, to_user, text):
-    if to_user not in bot_usernames:
+    if not _is_virtual_bot(to_user):
         return False
     reply = _ollama_bot_reply(sender_user, to_user, text)
     if not reply:
@@ -92,6 +102,11 @@ def _ollama_bot_reply(sender_user, bot_name, text):
     timeout = int(bot_runtime_config.get('ollama_timeout', 20) or 20)
     purpose = bot_purpose_map.get(bot_name, "").strip()
     service_scope = bot_service_map.get(bot_name, "").strip()
+    if str(bot_name).lower() == "openclaw-bot":
+        if not purpose:
+            purpose = "automation and assistant bot for app and server tasks"
+        if not service_scope:
+            service_scope = "chat contacts settings admin tools server management integrations"
     system_prompt = str(bot_runtime_config.get('ollama_system_prompt', '') or '').strip()
     if not system_prompt:
         system_prompt = (
@@ -140,6 +155,41 @@ def _ollama_bot_reply(sender_user, bot_name, text):
     except Exception as e:
         print(f"Ollama bot reply failed for {bot_name}: {e}")
         return None
+
+def _schedule_restart(delay_seconds, requested_by="admin"):
+    global restart_scheduled_for
+    delay_seconds = max(1, int(delay_seconds))
+    with restart_lock:
+        restart_scheduled_for = time.time() + delay_seconds
+
+    def _worker():
+        global restart_scheduled_for
+        print(f"Restart scheduled by {requested_by} in {delay_seconds} seconds.")
+        broadcast_alert(f"The server is restarting in {delay_seconds} seconds.")
+        time.sleep(delay_seconds)
+        with restart_lock:
+            restart_scheduled_for = None
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+def _upsert_bot_token(owner, bot_name):
+    token = secrets.token_urlsafe(24)
+    created = datetime.datetime.utcnow().isoformat()
+    con = sqlite3.connect(DB)
+    con.execute(
+        "INSERT OR REPLACE INTO bot_tokens(owner, bot, token, created_at) VALUES(?,?,?,?)",
+        (owner, bot_name, token, created),
+    )
+    con.commit()
+    con.close()
+    return token
+
+def _revoke_bot_token(owner, bot_name):
+    con = sqlite3.connect(DB)
+    con.execute("DELETE FROM bot_tokens WHERE owner=? AND bot=?", (owner, bot_name))
+    con.commit()
+    con.close()
 
 class EmailManager:
     @staticmethod
@@ -315,6 +365,7 @@ def init_db():
     if 'reset_code' not in existing_cols: cur.execute("ALTER TABLE users ADD COLUMN reset_code TEXT")
 
     cur.execute('''CREATE TABLE IF NOT EXISTS contacts (owner TEXT, contact TEXT, blocked INTEGER DEFAULT 0, PRIMARY KEY(owner, contact))''')
+    cur.execute('''CREATE TABLE IF NOT EXISTS bot_tokens (owner TEXT, bot TEXT, token TEXT, created_at TEXT, PRIMARY KEY(owner, bot))''')
     cur.execute('''CREATE TABLE IF NOT EXISTS file_bans (username TEXT, file_type TEXT, until_date TEXT, reason TEXT, PRIMARY KEY(username, file_type))''')
     # Add file_type column if table was created with an older schema
     fb_cols = [row[1] for row in cur.execute("PRAGMA table_info(file_bans)")]
@@ -547,7 +598,8 @@ def handle_client(cs, addr):
                     continue
                 con = sqlite3.connect(DB)
                 exists = con.execute("SELECT 1 FROM users WHERE username=?", (contact_to_add,)).fetchone()
-                if not exists and contact_to_add not in bot_usernames:
+                is_bot = _is_virtual_bot(contact_to_add)
+                if not exists and not is_bot:
                     reason = f"User '{contact_to_add}' does not exist."
                     sock.sendall((json.dumps({
                         "action": "add_contact_failed",
@@ -564,6 +616,10 @@ def handle_client(cs, addr):
                     contact_status_text = _status_for_user(contact_to_add)
                     admins = get_admins()
                     contact_data = {"user": contact_to_add, "blocked": 0, "online": is_online, "is_admin": contact_to_add in admins, "status_text": contact_status_text}
+                    if is_bot and str(contact_to_add).lower() == "openclaw-bot":
+                        token = _upsert_bot_token(user, contact_to_add)
+                        contact_data["bot_auth_token"] = token
+                        contact_data["bot_auth_type"] = "openclaw"
                     sock.sendall((json.dumps({"action": "add_contact_success", "contact": contact_data}) + "\n").encode())
                 con.close()
 
@@ -610,10 +666,20 @@ def handle_client(cs, addr):
                 con.close()
                 
             elif action == "delete_contact":
+                deleted_name = msg["to"]
                 con = sqlite3.connect(DB)
-                con.execute("DELETE FROM contacts WHERE owner=? AND contact=?", (user,msg["to"]))
+                con.execute("DELETE FROM contacts WHERE owner=? AND contact=?", (user,deleted_name))
                 con.commit()
                 con.close()
+                if _is_virtual_bot(deleted_name):
+                    _revoke_bot_token(user, deleted_name)
+                    try:
+                        sock.sendall((json.dumps({
+                            "action": "bot_token_revoked",
+                            "bot": deleted_name
+                        }) + "\n").encode())
+                    except Exception:
+                        pass
                 
             elif action == "admin_cmd":
                 if user not in get_admins(): 
@@ -627,13 +693,8 @@ def handle_client(cs, addr):
                         time.sleep(shutdown_timeout)
                         os._exit(0)
                     elif command == "restart" and len(cmd_parts) == 1:
-                        print(f"Restart initiated by admin: {user}")
-                        broadcast_alert(f"The server is restarting in {shutdown_timeout} seconds.")
                         response = f"Server is restarting in {shutdown_timeout} seconds..."
-                        try: sock.sendall((json.dumps({"action":"admin_response", "response": response})+"\n").encode())
-                        except: pass
-                        time.sleep(shutdown_timeout)
-                        os.execv(sys.executable, [sys.executable] + sys.argv)
+                        _schedule_restart(shutdown_timeout, requested_by=user)
                     elif command == "alert" and len(cmd_parts) >= 2:
                         alert_message = " ".join(cmd_parts[1:])
                         broadcast_alert(alert_message)
@@ -683,6 +744,23 @@ def handle_client(cs, addr):
                         response = "Error: Unknown command or incorrect syntax."
                 try: sock.sendall((json.dumps({"action":"admin_response", "response": response})+"\n").encode())
                 except: pass
+
+            elif action == "schedule_restart":
+                if user not in get_admins():
+                    try:
+                        sock.sendall((json.dumps({"action": "admin_response", "response": "Error: You are not authorized to schedule restarts."}) + "\n").encode())
+                    except Exception:
+                        pass
+                    continue
+                try:
+                    delay = int(msg.get("seconds", shutdown_timeout))
+                except Exception:
+                    delay = shutdown_timeout
+                _schedule_restart(delay, requested_by=user)
+                try:
+                    sock.sendall((json.dumps({"action": "admin_response", "response": f"Server restart scheduled in {max(1, delay)} seconds."}) + "\n").encode())
+                except Exception:
+                    pass
                 
             elif action == "server_info":
                 con = sqlite3.connect(DB)
