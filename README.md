@@ -172,6 +172,31 @@ Key behavior:
 * Non-admin users can view active bot rules, but cannot edit them.
 * Reset action restores a bot back to global seeded rules for that admin scope.
 
+### Advanced group chat policy controls
+
+Server admins can define advanced group chat/call policies globally and per group.
+
+Managed in client UI:
+
+* File menu: `Manage Group Policy`
+* Settings -> Administration -> `Open Group Policy Manager`
+* Server Side Commands window -> `Manage Group Policy`
+
+Examples of policy controls:
+
+* Group text, links, files, voice/video/screen share permissions
+* Member invite, pin, and channel-creation permissions
+* Message length limits, attachments per message, max file size
+* Group participants limit and concurrent voice limit
+* Slow mode, rate limits, and retention settings
+
+Admin command shortcuts:
+
+* `/gpolicy keys`
+* `/gpolicy show [group_name]`
+* `/gpolicy set <key> <value> [group_name]`
+* `/gpolicy reset [group_name]`
+
 ### In-app F1 webview documentation generation
 
 This repo includes an Ollama-based generator for contextual in-app help pages used by F1 dialogs/webviews.
