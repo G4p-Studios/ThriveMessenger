@@ -1610,8 +1610,12 @@ class MainFrame(wx.Frame):
         if sel < 0: return
         c = self.lv.GetItemText(sel);
         app = wx.GetApp(); logging_config = app.user_config.get('chat_logging', {}); is_logging_enabled = logging_config.get(c, False)
-        dlg = self.get_chat(c) or ChatDialog(self, c, self.sock, self.user, is_logging_enabled)
-        dlg.Show(); dlg.input_ctrl.SetFocus()
+        dlg = self.get_chat(c) or ChatDialog(self, c, self.sock, self.user, is_logging_enabled, is_contact=True)
+        dlg.Show()
+        if hasattr(dlg, 'input_ctrl'):
+            dlg.input_ctrl.SetFocus()
+        else:
+            print(f"Warning: ChatDialog for {c} missing input_ctrl attribute!")
     def on_send_file(self, _):
         sel = self.lv.GetFirstSelected()
         if sel < 0: return
