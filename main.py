@@ -1,7 +1,7 @@
 import wx, socket, json, threading, datetime, wx.adv, configparser, ssl, sys, os, base64, uuid, subprocess, tempfile, re, time
 import keyring
 
-VERSION_TAG = "v2026-alpha15.1"
+VERSION_TAG = "v2026-alpha15.2"
 
 # Constants
 MAX_CACHED_MESSAGES_PER_CONTACT = 100
@@ -1559,12 +1559,37 @@ class MainFrame(wx.Frame):
         if dlg: dlg.append_response(response_text)
     def on_close_window(self, event):
         if self.is_exiting: event.Skip()
-        else: self.Hide(); self.task_bar_icon = ThriveTaskBarIcon(self)
+        else:
+            if sys.platform == 'win32':
+                # While we are still the foreground process, hand focus to the
+                # topmost visible window belonging to another process.  This
+                # prevents Windows from promoting any of our owned windows when
+                # we hide, because focus already belongs to someone else.
+                # We intentionally skip the IsWindowEnabled check because apps
+                # like VMware Workstation report as disabled when the VM has
+                # input capture, but can still legitimately receive foreground.
+                our_pid = ctypes.windll.kernel32.GetCurrentProcessId()
+                EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+                def _find_other(hwnd, _):
+                    if not ctypes.windll.user32.IsWindowVisible(hwnd): return True
+                    pid = ctypes.c_ulong(0)
+                    ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                    if pid.value != our_pid:
+                        ctypes.windll.user32.SetForegroundWindow(hwnd)
+                        return False
+                    return True
+                ctypes.windll.user32.EnumWindows(EnumWindowsProc(_find_other), None)
+            for child in self.GetChildren():
+                if isinstance(child, ChatDialog) and child.IsShown():
+                    child._restore_from_tray = True; child.Hide()
+            self.Hide(); self.task_bar_icon = ThriveTaskBarIcon(self)
     def restore_from_tray(self):
         if self.task_bar_icon: self.task_bar_icon.Destroy(); self.task_bar_icon = None
         self.Show(); self.Raise()
         if self._directory_dlg and self._directory_dlg.IsShown(): self._directory_dlg.Raise()
         for child in self.GetChildren():
+            if isinstance(child, ChatDialog) and getattr(child, '_restore_from_tray', False):
+                child._restore_from_tray = False; child.Show()
             if isinstance(child, (ChatDialog, AdminDialog)) and child.IsShown(): child.Raise()
     def on_exit(self, _):
         print("Exiting application...");
