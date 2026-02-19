@@ -1,0 +1,13 @@
+Use case: product teaser for accessibility-first desktop chat app
+Primary request: stylized desktop scene with no real person faces, showing a generic user avatar opening Thrive Messenger and signing in
+Scene/background: modern desk setup, neutral lighting
+Subject: generic on-screen avatar and app window
+Action: launch app, sign in, contact list appears
+Camera: medium shot with gentle push-in
+Lighting/mood: clean, calm, confident
+Color palette: blue, slate, white, soft cyan
+Style/format: polished software promo
+Timing/beats: app icon appears, login, contact list loads
+Audio: subtle UI ambience only
+Constraints: no real people, no copyrighted logos except Thrive Messenger UI
+Avoid: jitter, warped text, flicker

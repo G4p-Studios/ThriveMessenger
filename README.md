@@ -75,6 +75,24 @@ If you wish to compile a binary, run the appropriate compile script. Thrive Mess
     compile_pyinstaller.cmd
     ```
 
+### Compiling on macOS (Intel + Apple Silicon)
+
+The repo includes a macOS build script that produces a `.app` zipped archive:
+
+```bash
+chmod +x scripts/build_macos.sh
+scripts/build_macos.sh
+```
+
+This writes output archives to `dist-macos/`.
+
+For automated dual-architecture builds, run the GitHub Actions workflow:
+`Build macOS Desktop`.
+It produces:
+
+- `thrive_messenger-macos-x86_64.zip`
+- `thrive_messenger-macos-arm64.zip`
+
 ### Running compiled
 
 If you don't feel like fighting with UV and Python, a pre-compiled release is provided.
@@ -106,6 +124,8 @@ When you log into Thrive Messenger, you will land on your contact list. Of cours
 * Alt + F will allow you to send a file to the focused contact.
 *   You can delete the focused contact with the Delete button or Alt + D.
 *   The Use Server Side Commands (Alt + V) button will allow you to perform various server side commands; more on these later.
+*   Bot Rules Manager is available from File menu, Settings > Administration, and Server Side Commands. Admins can load, edit, and reset bot rules without editing files manually.
+*   Directory can optionally allow direct messaging users on other configured servers. If duplicate usernames exist across servers, the client lets you choose which server user to message and remembers that default.
 *   The logout (Alt + O) and exit (Alt + X) buttons are self explanatory.
 * The server info button (Alt + I) will show information about the server you're currently logged into.
 * Alt + U will allow you to set an online status that your contacts will see. You can choose from a list of preset statuses, such as online, offline and busy, or you can choose a custom one and type a personal message. Server owners can customize the character limit for custom statuses via max_status_length, so check that you have enough characters before you start setting System of a Down lyrics as your status.
@@ -139,6 +159,59 @@ Each server side command must start with a forward slash (/). The following serv
 *   /exit: Shuts down the Thrive Messenger server.
 
 Shift Tabbing once from the command input field will show a list of outputs for the commands you've run.
+
+### Bot rules and agent rulesets
+
+Thrive bots can follow a shared agent ruleset loaded from an agent ZIP (for example `/home/devinecr/downloads/*.zip`), and server admins can override rules per bot for their own admin account/server workflow.
+
+Key behavior:
+
+* Global fallback rules are loaded from the configured agent ZIP/file.
+* Admin-specific bot rules are seeded from global rules on first use.
+* Admins can edit and save their own bot rule override from the client UI.
+* Non-admin users can view active bot rules, but cannot edit them.
+* Reset action restores a bot back to global seeded rules for that admin scope.
+
+### Advanced group chat policy controls
+
+Server admins can define advanced group chat/call policies globally and per group.
+
+Managed in client UI:
+
+* File menu: `Manage Group Policy`
+* Settings -> Administration -> `Open Group Policy Manager`
+* Server Side Commands window -> `Manage Group Policy`
+
+Examples of policy controls:
+
+* Group text, links, files, voice/video/screen share permissions
+* Member invite, pin, and channel-creation permissions
+* Message length limits, attachments per message, max file size
+* Group participants limit and concurrent voice limit
+* Slow mode, rate limits, and retention settings
+
+Admin command shortcuts:
+
+* `/gpolicy keys`
+* `/gpolicy show [group_name]`
+* `/gpolicy set <key> <value> [group_name]`
+* `/gpolicy reset [group_name]`
+
+### In-app F1 webview documentation generation
+
+This repo includes an Ollama-based generator for contextual in-app help pages used by F1 dialogs/webviews.
+
+Generate help templates:
+
+```bash
+python3 scripts/generate_help_docs_with_ollama.py
+```
+
+Output:
+
+* `assets/help/help_docs.json`
+
+The app loads these templates at runtime and writes per-context HTML help pages from them.
 
 Those of you familiar with IRC will know that this feature was very much inspired by the concept of server and channel operator commands.
 
@@ -180,6 +253,29 @@ With the Thrive Messenger client open and logged in, follow these steps to chang
 The client.conf file controls what server and port the Thrive Messenger client connects to. If you have your own Thrive Messenger server up, or you have one that you like to use, you can simply open client.conf in your text editor of choice, such as Notepad++, and modify the server hostname and port to point to your desired server.
 
 The default server is msg.thecubed.cc, running on port 2005.
+
+You can also control update sources in `client.conf`:
+
+```
+[updates]
+feed_url = https://im.tappedin.fm/updates/latest.json
+preferred_repo = Raywonder/ThriveMessenger
+fallback_repos = G4p-Studios/ThriveMessenger
+```
+
+- `feed_url` is optional. If set, the client checks your hosted feed first.
+- If feed lookup fails, the client falls back to GitHub repos in order.
+- This allows your custom channel and upstream compatibility at the same time.
+
+### Cron-ready update feed sync
+
+This repo includes `srv/scripts/sync_update_feed.sh` to publish a JSON update feed from GitHub Releases.
+
+Example cron (every 5 minutes):
+
+```
+*/5 * * * * /path/to/ThriveMessenger/srv/scripts/sync_update_feed.sh Raywonder/ThriveMessenger /var/www/im.tappedin.fm/updates/latest.json >/var/log/thrive-update-feed.log 2>&1
+```
 
 ### Auto reading of messages
 

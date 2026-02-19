@@ -1,0 +1,8 @@
+promo-onboarding.mp4
+Shows the first-run experience: launching Thrive Messenger, signing in, and arriving on the contact list.
+
+promo-chat-files.mp4
+Shows selecting a contact, sending a message, and sending files with transfer confirmation.
+
+promo-admin-tools.mp4
+Shows opening Server Manager, reviewing multiple servers, and updating primary server settings.
