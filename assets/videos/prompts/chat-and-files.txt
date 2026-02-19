@@ -1,0 +1,14 @@
+Use case: feature highlight
+Primary request: in-app flow showing user selecting a contact, opening chat, sending a message, and sending a file
+Scene/background: desktop app window focused
+Subject: Thrive Messenger UI
+Action: select contact, type short message, send file action, transfer confirmation
+Camera: UI-focused framing, slight pan
+Lighting/mood: clear and energetic
+Color palette: deep blue, gray, white, green accents
+Style/format: crisp product demonstration
+Timing/beats: contact select, message send, file send, success banner
+Audio: optional soft click effects
+Text (verbatim): "Start Chat", "Send File", "Delivered"
+Constraints: no private data, no real faces, no third-party brand marks
+Avoid: unreadable text, stutter, duplicated windows

@@ -1,0 +1,14 @@
+Use case: admin capabilities overview
+Primary request: show admin opening server manager from file menu, viewing multiple servers, and updating settings
+Scene/background: app main window and menu interactions
+Subject: Thrive Messenger admin UI elements
+Action: File menu opens, Server Manager opens, server list is edited
+Camera: stable UI capture with short transitions
+Lighting/mood: professional and trustworthy
+Color palette: navy, silver, white
+Style/format: software walkthrough
+Timing/beats: menu open, manager list, add server, save
+Audio: minimal ambient tone
+Text (verbatim): "Server Manager", "Add / Update", "Set Primary"
+Constraints: no credentials, no personal data, no real people
+Avoid: typos, text overlap, motion blur

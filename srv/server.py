@@ -1,9 +1,7 @@
-import sqlite3, threading, socket, json, datetime, sys, configparser, ssl, os, uuid, base64, time
+import sqlite3, threading, socket, json, datetime, sys, configparser, ssl, os, uuid, base64, time, subprocess, tempfile
 import smtplib, secrets
+import urllib.request, urllib.parse
 from email.mime.text import MIMEText
-from argon2 import PasswordHasher
-from argon2.exceptions import VerifyMismatchError, VerificationError, InvalidHashError
-_ph = PasswordHasher()
 
 DB = 'thrive.db'
 ADMIN_FILE = 'admins.txt'
@@ -11,13 +9,342 @@ clients = {}
 client_statuses = {}
 lock = threading.Lock()
 smtp_config = {}
+flexpbx_config = {}
 file_config = {}
+bot_runtime_config = {}
 shutdown_timeout = 5
 max_status_length = 50
 pending_transfers = {}
 transfer_lock = threading.Lock()
 server_port = 0
 use_ssl = False
+server_started_at = time.time()
+bot_usernames = set()
+bot_status_map = {}
+bot_purpose_map = {}
+bot_service_map = {}
+bot_voice_map = {}
+bot_external_usernames = set()
+allow_external_bot_contacts = True
+docs_cache = {}
+restart_lock = threading.Lock()
+restart_scheduled_for = None
+
+def _is_virtual_bot(username):
+    uname = str(username or "").strip()
+    return uname in bot_usernames or uname.lower() == "openclaw-bot"
+
+def _is_registered_bot(username):
+    uname = str(username or "").strip()
+    if not uname:
+        return False
+    if _is_virtual_bot(uname):
+        return True
+    if uname in bot_external_usernames:
+        return True
+    if allow_external_bot_contacts and uname.lower().endswith("-bot"):
+        return True
+    return False
+
+def _parse_bot_map(raw):
+    out = {}
+    for item in str(raw or "").split(","):
+        if ":" not in item:
+            continue
+        name, value = item.split(":", 1)
+        name = name.strip()
+        value = value.strip()
+        if name and value:
+            out[name] = value
+    return out
+
+def _load_docs_text():
+    key = "docs_text"
+    if key in docs_cache:
+        return docs_cache[key]
+    roots = [
+        os.path.abspath(os.path.join(os.path.dirname(__file__), "..")),
+        os.getcwd(),
+    ]
+    candidates = []
+    for root in roots:
+        candidates.extend([
+            os.path.join(root, "README.md"),
+            os.path.join(root, "F1_HELP.md"),
+            os.path.join(root, "HELP.md"),
+            os.path.join(root, "docs", "README.md"),
+        ])
+    chunks = []
+    for path in candidates:
+        if os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    chunks.append(f"# Source: {os.path.basename(path)}\n{f.read()}")
+            except Exception:
+                pass
+    docs_text = "\n\n".join(chunks)
+    docs_cache[key] = docs_text
+    return docs_text
+
+def _documentation_context_for_query(query, max_chars=2500):
+    docs_text = _load_docs_text()
+    if not docs_text:
+        return ""
+    q = str(query or "").lower()
+    words = [w for w in q.replace("\n", " ").split(" ") if len(w) >= 4]
+    words = words[:8]
+    if not words:
+        return docs_text[:max_chars]
+    lines = docs_text.splitlines()
+    matched = []
+    for i, line in enumerate(lines):
+        ll = line.lower()
+        if any(w in ll for w in words):
+            start = max(0, i - 1)
+            end = min(len(lines), i + 2)
+            matched.extend(lines[start:end])
+            if len("\n".join(matched)) >= max_chars:
+                break
+    snippet = "\n".join(matched).strip()
+    if not snippet:
+        snippet = docs_text[:max_chars]
+    return snippet[:max_chars]
+
+def _active_usernames():
+    with lock:
+        extra_bots = {"openclaw-bot"}
+        return set(clients.keys()) | set(bot_usernames) | set(bot_external_usernames) | extra_bots
+
+def _is_online_user(username):
+    return username in _active_usernames()
+
+def _status_for_user(username):
+    if _is_registered_bot(username):
+        status = bot_status_map.get(username, "online")
+        if str(username).lower() == "openclaw-bot" and username not in bot_purpose_map:
+            purpose = "automation and assistant bot"
+        else:
+            purpose = bot_purpose_map.get(username, "")
+        return f"{status} - {purpose}" if purpose else status
+    with lock:
+        return client_statuses.get(username, "online" if username in clients else "offline")
+
+def _maybe_send_bot_reply(sender_sock, sender_user, to_user, text):
+    if not _is_virtual_bot(to_user):
+        return False
+    reply = _ollama_bot_reply(sender_user, to_user, text)
+    if not reply:
+        lower = (text or "").strip().lower()
+        if not lower:
+            reply = "I'm online and ready. Ask me for help, commands, or server status."
+        elif any(w in lower for w in ("hi", "hello", "hey")):
+            reply = f"Hi {sender_user}. I'm {to_user}. How can I help?"
+        elif "help" in lower:
+            reply = "You can ask me about status, contacts, file transfers, or admin features."
+        elif "status" in lower:
+            reply = "I can report server presence and room/user status where available."
+        elif "file" in lower:
+            reply = "File transfers are available from chat and user menus. Check File Transfers for history."
+        elif "admin" in lower:
+            reply = "Admin actions are available from Server Side Commands and admin menus, based on your role."
+        else:
+            reply = "I couldn't reach the model right now. Ask again in a moment."
+    tts_payload = _build_bot_tts_payload(to_user, reply, text)
+    payload = {
+        "action": "msg",
+        "from": to_user,
+        "to": sender_user,
+        "time": datetime.datetime.now().isoformat(),
+        "msg": reply,
+    }
+    if tts_payload:
+        payload.update(tts_payload)
+    try:
+        sender_sock.sendall((json.dumps(payload) + "\n").encode())
+    except Exception:
+        pass
+    return True
+
+def _ollama_bot_reply(sender_user, bot_name, text):
+    if not bot_runtime_config.get('ollama_enabled', False):
+        return None
+    base_url = str(bot_runtime_config.get('ollama_url', 'http://127.0.0.1:11434')).rstrip('/')
+    model = str(bot_runtime_config.get('ollama_model', 'llama3.2')).strip() or 'llama3.2'
+    timeout = int(bot_runtime_config.get('ollama_timeout', 20) or 20)
+    purpose = bot_purpose_map.get(bot_name, "").strip()
+    service_scope = bot_service_map.get(bot_name, "").strip()
+    if str(bot_name).lower() == "openclaw-bot":
+        if not purpose:
+            purpose = "automation and assistant bot for app and server tasks"
+        if not service_scope:
+            service_scope = "chat contacts settings admin tools server management integrations"
+    system_prompt = str(bot_runtime_config.get('ollama_system_prompt', '') or '').strip()
+    if not system_prompt:
+        system_prompt = (
+            "You are the Thrive Messenger assistant bot. "
+            "You help users with any app-related task and you know the Thrive Messenger client and server features. "
+            "Give practical step-by-step instructions for chat, contacts, file transfer, server manager, settings, "
+            "admin tools, and troubleshooting. Be concise, clear, and action-oriented. "
+            "You can also handle normal friendly chat, but prioritize helping users use the app when they ask app questions. "
+            "Use a natural conversational style, not an instruction-manual tone. "
+            "If the user asks a direct question, answer directly first in one sentence, then add brief context if needed. "
+            "For status-style questions like 'who is online', provide the direct answer immediately. "
+            "Avoid repeating the user's message. If a feature is unsupported, say that clearly and suggest alternatives."
+        )
+    if purpose:
+        system_prompt += f" Your role on this server: {purpose}."
+    if service_scope:
+        system_prompt += (
+            f" You are trained for these services/features: {service_scope}. "
+            "When users ask about these services, provide concrete usage steps and troubleshooting."
+        )
+    user_text = (text or "").strip()
+    if not user_text:
+        user_text = "Introduce yourself and explain how you can help in one short message."
+    docs_context = _documentation_context_for_query(user_text)
+    if docs_context:
+        system_prompt += (
+            " Always verify feature and usage answers against the documentation context provided. "
+            "If docs do not confirm a detail, say it is not documented/uncertain instead of guessing."
+        )
+
+    payload = {
+        "model": model,
+        "stream": False,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": f"Documentation context:\n{docs_context}" if docs_context else "Documentation context unavailable."},
+            {"role": "user", "content": f"User '{sender_user}' says: {user_text}"}
+        ]
+    }
+    req = urllib.request.Request(
+        f"{base_url}/api/chat",
+        data=json.dumps(payload).encode('utf-8'),
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode('utf-8', errors='replace')
+        data = json.loads(raw)
+        message = data.get("message", {}) if isinstance(data, dict) else {}
+        content = message.get("content", "") if isinstance(message, dict) else ""
+        content = str(content or "").strip()
+        if not content:
+            return None
+        return content[:700]
+    except Exception as e:
+        print(f"Ollama bot reply failed for {bot_name}: {e}")
+        return None
+
+def _build_bot_tts_payload(bot_name, reply_text, request_text):
+    if not bot_runtime_config.get('piper_enabled', False):
+        return None
+    reply = str(reply_text or "").strip()
+    if not reply:
+        return None
+    # If users ask how they sound, provide a clear voice-preview response.
+    asked_preview = any(
+        k in str(request_text or "").lower()
+        for k in ("how i sound", "how do i sound", "hear my voice", "my voice")
+    )
+    if asked_preview:
+        reply += " I can preview my configured voice. To hear your own real voice, send a recording and I can play it back."
+    audio = _synthesize_bot_tts(bot_name, reply)
+    if not audio:
+        return None
+    return {
+        "tts_audio_b64": audio,
+        "tts_mime": "audio/wav",
+        "tts_voice": _bot_voice_name(bot_name),
+        "tts_engine": "piper",
+    }
+
+def _bot_voice_name(bot_name):
+    voice = str(bot_voice_map.get(bot_name, "") or "").strip()
+    if not voice:
+        voice = str(bot_runtime_config.get('piper_default_voice', '') or '').strip()
+    return voice or "default"
+
+def _resolve_piper_model(bot_name):
+    voice_model = _bot_voice_name(bot_name)
+    models_dir = str(bot_runtime_config.get('piper_models_dir', './voices') or './voices').strip()
+    if voice_model.endswith(".onnx"):
+        if os.path.isabs(voice_model):
+            return voice_model
+        return os.path.join(models_dir, voice_model)
+    if os.path.isabs(voice_model):
+        return voice_model
+    return os.path.join(models_dir, f"{voice_model}.onnx")
+
+def _synthesize_bot_tts(bot_name, text):
+    piper_bin = str(bot_runtime_config.get('piper_bin', '/usr/local/bin/piper') or '/usr/local/bin/piper').strip()
+    model_path = _resolve_piper_model(bot_name)
+    if not os.path.isfile(model_path):
+        print(f"Piper model missing for {bot_name}: {model_path}")
+        return None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+            out_path = tmp.name
+        cmd = [piper_bin, "--model", model_path, "--output_file", out_path]
+        proc = subprocess.run(
+            cmd,
+            input=str(text).encode("utf-8"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=max(3, int(bot_runtime_config.get('piper_timeout', 12) or 12)),
+            check=False,
+        )
+        if proc.returncode != 0:
+            print(f"Piper synthesis failed for {bot_name}: {proc.stderr.decode('utf-8', errors='ignore')[:300]}")
+            return None
+        with open(out_path, "rb") as f:
+            audio = base64.b64encode(f.read()).decode("ascii")
+        return audio
+    except Exception as e:
+        print(f"Piper synthesis error for {bot_name}: {e}")
+        return None
+    finally:
+        try:
+            if 'out_path' in locals() and os.path.exists(out_path):
+                os.remove(out_path)
+        except Exception:
+            pass
+
+def _schedule_restart(delay_seconds, requested_by="admin"):
+    global restart_scheduled_for
+    delay_seconds = max(1, int(delay_seconds))
+    with restart_lock:
+        restart_scheduled_for = time.time() + delay_seconds
+
+    def _worker():
+        global restart_scheduled_for
+        print(f"Restart scheduled by {requested_by} in {delay_seconds} seconds.")
+        broadcast_alert(f"The server is restarting in {delay_seconds} seconds.")
+        time.sleep(delay_seconds)
+        with restart_lock:
+            restart_scheduled_for = None
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+def _upsert_bot_token(owner, bot_name):
+    token = secrets.token_urlsafe(24)
+    created = datetime.datetime.utcnow().isoformat()
+    con = sqlite3.connect(DB)
+    con.execute(
+        "INSERT OR REPLACE INTO bot_tokens(owner, bot, token, created_at) VALUES(?,?,?,?)",
+        (owner, bot_name, token, created),
+    )
+    con.commit()
+    con.close()
+    return token
+
+def _revoke_bot_token(owner, bot_name):
+    con = sqlite3.connect(DB)
+    con.execute("DELETE FROM bot_tokens WHERE owner=? AND bot=?", (owner, bot_name))
+    con.commit()
+    con.close()
 
 class EmailManager:
     @staticmethod
@@ -39,39 +366,44 @@ class EmailManager:
             return False
 
     @staticmethod
-    def generate_code():
-        return secrets.token_hex(16)  # 32-char hex, 128-bit entropy
+    def generate_code(length=6):
+        if length <= 6:
+            # Preserve a short user-facing code option while using CSPRNG.
+            return ''.join(secrets.choice('0123456789') for _ in range(length))
+        return secrets.token_hex(max(1, length // 2))
 
-# In-memory rate limiting (resets on server restart)
-_email_send_times = {}   # email -> [unix_timestamp, ...]
-_code_fail_times  = {}   # username -> [unix_timestamp, ...]
-_MAIL_LIMIT       = 3    # max outbound emails per address per hour
-_MAIL_WINDOW      = 3600
-_CODE_FAIL_LIMIT  = 10   # max wrong code attempts per username per hour
-_CODE_FAIL_WINDOW = 3600
-
-def _email_allowed(email):
-    """Return True if another email may be sent to this address, else False."""
-    now = time.time()
-    times = [t for t in _email_send_times.get(email, []) if now - t < _MAIL_WINDOW]
-    if len(times) >= _MAIL_LIMIT:
-        _email_send_times[email] = times; return False
-    times.append(now); _email_send_times[email] = times; return True
-
-def _code_attempts_ok(username):
-    """Return True if the user has not exceeded the failed-attempt limit."""
-    now = time.time()
-    fails = [t for t in _code_fail_times.get(username, []) if now - t < _CODE_FAIL_WINDOW]
-    _code_fail_times[username] = fails
-    return len(fails) < _CODE_FAIL_LIMIT
-
-def _record_code_fail(username):
-    now = time.time()
-    fails = [t for t in _code_fail_times.get(username, []) if now - t < _CODE_FAIL_WINDOW]
-    fails.append(now); _code_fail_times[username] = fails
-
-def _clear_code_fails(username):
-    _code_fail_times.pop(username, None)
+class FlexPBXManager:
+    @staticmethod
+    def send_sms(to_number, message):
+        if not flexpbx_config.get('enabled', False):
+            return False, "SMS module is not enabled."
+        api_url = flexpbx_config.get('api_url', '').strip()
+        api_token = flexpbx_config.get('api_token', '').strip()
+        from_number = flexpbx_config.get('from_number', '').strip()
+        if not api_url or not api_token:
+            return False, "FlexPBX API is not configured."
+        payload = urllib.parse.urlencode({
+            "to": to_number,
+            "from": from_number,
+            "message": message,
+        }).encode()
+        req = urllib.request.Request(
+            api_url,
+            data=payload,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {api_token}",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                body = resp.read().decode(errors='ignore')
+                if resp.status >= 200 and resp.status < 300:
+                    return True, body
+                return False, body or f"HTTP {resp.status}"
+        except Exception as e:
+            return False, str(e)
 
 def get_admins():
     try:
@@ -124,15 +456,62 @@ def load_config():
         'email': config.get('smtp', 'email', fallback=''),
         'password': config.get('smtp', 'password', fallback='')
     }
+    global flexpbx_config
+    flexpbx_config = {
+        'enabled': config.getboolean('flexpbx', 'enabled', fallback=False),
+        'api_url': config.get('flexpbx', 'api_url', fallback=''),
+        'api_token': config.get('flexpbx', 'api_token', fallback=''),
+        'from_number': config.get('flexpbx', 'from_number', fallback=''),
+    }
+    enforce_blackfiles = config.getboolean('server', 'enforce_blackfile_list', fallback=False)
     global file_config
     file_config = {
         'size_limit': config.getint('server', 'size_limit', fallback=0),
-        'blackfiles': [ext.strip().lower() for ext in config.get('server', 'blackfiles', fallback='').split(',') if ext.strip()],
+        'blackfiles': [ext.strip().lower() for ext in config.get('server', 'blackfiles', fallback='').split(',') if ext.strip()] if enforce_blackfiles else [],
     }
     global shutdown_timeout
     shutdown_timeout = config.getint('server', 'shutdown_timeout', fallback=5)
     global max_status_length
     max_status_length = config.getint('server', 'max_status_length', fallback=50)
+    global server_identity
+    server_identity = config.get('server', 'name', fallback=config.get('server', 'host', fallback='Server'))
+    global welcome_config
+    welcome_config = {
+        'enabled': config.getboolean('welcome', 'enabled', fallback=False),
+        'pre_login': config.get('welcome', 'pre_login', fallback=''),
+        'post_login': config.get('welcome', 'post_login', fallback=''),
+    }
+    global bot_usernames
+    raw_bots = config.get('bots', 'names', fallback='assistant-bot,helper-bot')
+    bot_usernames = {name.strip() for name in raw_bots.split(',') if name.strip()}
+    if not bot_usernames:
+        bot_usernames = {"assistant-bot", "helper-bot"}
+    global bot_status_map
+    bot_status_map = _parse_bot_map(config.get('bots', 'status_map', fallback=''))
+    global bot_purpose_map
+    bot_purpose_map = _parse_bot_map(config.get('bots', 'purpose_map', fallback=''))
+    global bot_service_map
+    bot_service_map = _parse_bot_map(config.get('bots', 'service_map', fallback=''))
+    global bot_external_usernames
+    raw_external = config.get('bots', 'external_names', fallback='')
+    bot_external_usernames = {name.strip() for name in raw_external.split(',') if name.strip()}
+    global allow_external_bot_contacts
+    allow_external_bot_contacts = config.getboolean('bots', 'allow_external_bot_contacts', fallback=True)
+    global bot_voice_map
+    bot_voice_map = _parse_bot_map(config.get('bots', 'voice_map', fallback=''))
+    global bot_runtime_config
+    bot_runtime_config = {
+        'ollama_enabled': config.getboolean('bots', 'ollama_enabled', fallback=True),
+        'ollama_url': config.get('bots', 'ollama_url', fallback='http://127.0.0.1:11434'),
+        'ollama_model': config.get('bots', 'ollama_model', fallback='llama3.2'),
+        'ollama_timeout': config.getint('bots', 'ollama_timeout', fallback=20),
+        'ollama_system_prompt': config.get('bots', 'ollama_system_prompt', fallback=''),
+        'piper_enabled': config.getboolean('bots', 'piper_enabled', fallback=False),
+        'piper_bin': config.get('bots', 'piper_bin', fallback='/usr/local/bin/piper'),
+        'piper_models_dir': config.get('bots', 'piper_models_dir', fallback='./voices'),
+        'piper_default_voice': config.get('bots', 'piper_default_voice', fallback='en_US-lessac-medium'),
+        'piper_timeout': config.getint('bots', 'piper_timeout', fallback=12),
+    }
     return {
         'port': config.getint('server', 'port', fallback=5005),
         'certfile': config.get('server', 'certfile', fallback='server.crt'),
@@ -151,11 +530,10 @@ def init_db():
     if 'verification_code' not in existing_cols: cur.execute("ALTER TABLE users ADD COLUMN verification_code TEXT")
     if 'is_verified' not in existing_cols: cur.execute("ALTER TABLE users ADD COLUMN is_verified INTEGER DEFAULT 1") # Default 1 for old users
     if 'reset_code' not in existing_cols: cur.execute("ALTER TABLE users ADD COLUMN reset_code TEXT")
-    if 'code_expires' not in existing_cols: cur.execute("ALTER TABLE users ADD COLUMN code_expires TEXT")
 
     cur.execute('''CREATE TABLE IF NOT EXISTS contacts (owner TEXT, contact TEXT, blocked INTEGER DEFAULT 0, PRIMARY KEY(owner, contact))''')
+    cur.execute('''CREATE TABLE IF NOT EXISTS bot_tokens (owner TEXT, bot TEXT, token TEXT, created_at TEXT, PRIMARY KEY(owner, bot))''')
     cur.execute('''CREATE TABLE IF NOT EXISTS file_bans (username TEXT, file_type TEXT, until_date TEXT, reason TEXT, PRIMARY KEY(username, file_type))''')
-    cur.execute('''CREATE TABLE IF NOT EXISTS offline_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, recipient TEXT NOT NULL, sender TEXT NOT NULL, message TEXT NOT NULL, timestamp TEXT NOT NULL)''')
     # Add file_type column if table was created with an older schema
     fb_cols = [row[1] for row in cur.execute("PRAGMA table_info(file_bans)")]
     if 'file_type' not in fb_cols: cur.execute("ALTER TABLE file_bans ADD COLUMN file_type TEXT")
@@ -200,103 +578,96 @@ def handle_client(cs, addr):
         except (UnicodeDecodeError, json.JSONDecodeError): return
 
         action = req.get("action")
+
+        # --- Welcome Message (pre-login safe endpoint) ---
+        if action == "get_welcome":
+            sock.sendall((json.dumps({
+                "action": "welcome_info",
+                "enabled": bool(welcome_config.get('enabled', False)),
+                "pre_login": welcome_config.get('pre_login', '') if welcome_config.get('enabled', False) else '',
+                "post_login": welcome_config.get('post_login', '') if welcome_config.get('enabled', False) else '',
+            }) + "\n").encode())
+            return
         
         # --- Create Account ---
         if action == "create_account":
             new_user = req.get("user")
             new_pass = req.get("pass")
             email = req.get("email", "")
-            if not new_user or not new_pass:
+            if not new_user or not new_pass: 
                 sock.sendall((json.dumps({"action": "create_account_failed", "reason": "Missing fields."}) + "\n").encode())
                 return
-
+            
             con = sqlite3.connect(DB)
-            row = con.execute("SELECT is_verified FROM users WHERE LOWER(username)=LOWER(?)", (new_user,)).fetchone()
-
-            # Allow overwriting unverified users only
+            row = con.execute("SELECT is_verified FROM users WHERE username=?", (new_user,)).fetchone()
+            
+            # Allow overwriting unverified users
             if row and (row[0] == 1 or not smtp_config['enabled']):
                 sock.sendall((json.dumps({"action": "create_account_failed", "reason": "Username is already taken."}) + "\n").encode())
                 con.close(); return
-
-            new_pass = _ph.hash(new_pass)
+            
+            # Logic: If SMTP is on, set verified=0, gen code, send email. Else verified=1.
             verified = 1 if not smtp_config['enabled'] else 0
-            code = None; expires = None
-
-            if not verified:
-                # Block registration with an email already owned by a verified account
-                if email:
-                    taken = con.execute("SELECT 1 FROM users WHERE LOWER(email)=LOWER(?) AND is_verified=1", (email,)).fetchone()
-                    if taken:
-                        sock.sendall((json.dumps({"action": "create_account_failed", "reason": "Email is already in use."}) + "\n").encode())
-                        con.close(); return
-                # Rate-limit outbound verification emails per address
-                if not _email_allowed(email or new_user):
-                    sock.sendall((json.dumps({"action": "create_account_failed", "reason": "Too many verification attempts. Try again later."}) + "\n").encode())
-                    con.close(); return
-                code = EmailManager.generate_code()
-                expires = (datetime.datetime.utcnow() + datetime.timedelta(hours=1)).isoformat()
-
-            if row:  # Overwriting unverified
-                con.execute("UPDATE users SET password=?, email=?, verification_code=?, is_verified=?, code_expires=? WHERE username=?",
-                            (new_pass, email, code, verified, expires, new_user))
+            code = EmailManager.generate_code() if not verified else None
+            
+            if row: # Overwriting unverified
+                con.execute("UPDATE users SET password=?, email=?, verification_code=?, is_verified=? WHERE username=?", (new_pass, email, code, verified, new_user))
             else:
-                con.execute("INSERT INTO users(username, password, email, verification_code, is_verified, code_expires) VALUES(?,?,?,?,?,?)",
-                            (new_user, new_pass, email, code, verified, expires))
-            con.commit(); con.close()
+                con.execute("INSERT INTO users(username, password, email, verification_code, is_verified) VALUES(?,?,?,?,?)", (new_user, new_pass, email, code, verified))
+            con.commit()
+            con.close()
 
             if not verified:
                 if EmailManager.send_email(email, "Thrive Messenger - Verify Account", f"Your verification code is: {code}"):
                     sock.sendall((json.dumps({"action": "verify_pending"}) + "\n").encode())
                 else:
+                    # Fallback if email fails? For now just say success but maybe log it.
                     print("Failed to send verification email.")
                     sock.sendall((json.dumps({"action": "create_account_failed", "reason": "Could not send verification email."}) + "\n").encode())
             else:
                 sock.sendall((json.dumps({"action": "create_account_success"}) + "\n").encode())
+                if email:
+                    EmailManager.send_email(
+                        email,
+                        "Welcome to Thrive Messenger",
+                        f"Hi {new_user}, your account is ready to use on {server_identity}."
+                    )
             return
 
         # --- Verify Account ---
         if action == "verify_account":
             u_ver = req.get("user")
             code_ver = req.get("code")
-            if not _code_attempts_ok(u_ver):
-                sock.sendall(json.dumps({"status": "error", "reason": "Too many failed attempts. Try again later."}).encode() + b"\n")
-                return
             con = sqlite3.connect(DB)
-            row = con.execute("SELECT verification_code, code_expires FROM users WHERE username=?", (u_ver,)).fetchone()
-            if row and row[0] and row[0] == code_ver:
-                if row[1] and datetime.datetime.utcnow().isoformat() > row[1]:
-                    con.close(); _record_code_fail(u_ver)
-                    sock.sendall(json.dumps({"status": "error", "reason": "Code has expired. Please register again."}).encode() + b"\n")
-                else:
-                    con.execute("UPDATE users SET is_verified=1, verification_code=NULL, code_expires=NULL WHERE username=?", (u_ver,))
-                    con.commit(); con.close(); _clear_code_fails(u_ver)
-                    sock.sendall(json.dumps({"status": "ok"}).encode() + b"\n")
+            row = con.execute("SELECT verification_code FROM users WHERE username=?", (u_ver,)).fetchone()
+            if row and row[0] == code_ver:
+                con.execute("UPDATE users SET is_verified=1, verification_code=NULL WHERE username=?", (u_ver,))
+                con.commit(); con.close()
+                sock.sendall(json.dumps({"status": "ok"}).encode() + b"\n")
             else:
-                con.close(); _record_code_fail(u_ver)
-                sock.sendall(json.dumps({"status": "error", "reason": "Invalid code."}).encode() + b"\n")
+                con.close()
+                sock.sendall(json.dumps({"status": "error", "reason": "Invalid code"}).encode() + b"\n")
             return
 
         # --- Request Password Reset ---
         if action == "request_reset":
             ident = req.get("identifier")
             con = sqlite3.connect(DB)
+            # Find user by email or username
             row = con.execute("SELECT username, email FROM users WHERE username=? OR email=?", (ident, ident)).fetchone()
             if row:
                 t_user, t_email = row
                 if t_email:
-                    if not _email_allowed(t_email):
-                        con.close()
-                        sock.sendall(json.dumps({"status": "error", "reason": "Too many reset attempts. Try again later."}).encode() + b"\n")
-                        return
                     code = EmailManager.generate_code()
-                    expires = (datetime.datetime.utcnow() + datetime.timedelta(hours=1)).isoformat()
-                    con.execute("UPDATE users SET reset_code=?, code_expires=? WHERE username=?", (code, expires, t_user))
+                    con.execute("UPDATE users SET reset_code=? WHERE username=?", (code, t_user))
                     con.commit()
                     EmailManager.send_email(t_email, "Thrive Messenger - Password Reset", f"Your password reset code is: {code}")
+                    # Return OK even if email fails to prevent enumeration, mostly.
                     sock.sendall(json.dumps({"status": "ok", "user": t_user}).encode() + b"\n")
                 else:
                     sock.sendall(json.dumps({"status": "error", "reason": "No email on file."}).encode() + b"\n")
             else:
+                # Security: Don't reveal user existence? For this app, we'll just say ok to pretend.
                 sock.sendall(json.dumps({"status": "ok"}).encode() + b"\n")
             con.close()
             return
@@ -306,22 +677,15 @@ def handle_client(cs, addr):
             t_user = req.get("user")
             t_code = req.get("code")
             new_p = req.get("new_pass")
-            if not _code_attempts_ok(t_user):
-                sock.sendall(json.dumps({"status": "error", "reason": "Too many failed attempts. Try again later."}).encode() + b"\n")
-                return
             con = sqlite3.connect(DB)
-            row = con.execute("SELECT reset_code, code_expires FROM users WHERE username=?", (t_user,)).fetchone()
-            if row and row[0] and row[0] == t_code:
-                if row[1] and datetime.datetime.utcnow().isoformat() > row[1]:
-                    con.close(); _record_code_fail(t_user)
-                    sock.sendall(json.dumps({"status": "error", "reason": "Code has expired."}).encode() + b"\n")
-                else:
-                    con.execute("UPDATE users SET password=?, reset_code=NULL, code_expires=NULL WHERE username=?", (_ph.hash(new_p), t_user))
-                    con.commit(); con.close(); _clear_code_fails(t_user)
-                    sock.sendall(json.dumps({"status": "ok"}).encode() + b"\n")
+            row = con.execute("SELECT reset_code FROM users WHERE username=?", (t_user,)).fetchone()
+            if row and row[0] == t_code and t_code:
+                con.execute("UPDATE users SET password=?, reset_code=NULL WHERE username=?", (new_p, t_user))
+                con.commit(); con.close()
+                sock.sendall(json.dumps({"status": "ok"}).encode() + b"\n")
             else:
-                con.close(); _record_code_fail(t_user)
-                sock.sendall(json.dumps({"status": "error", "reason": "Invalid code."}).encode() + b"\n")
+                con.close()
+                sock.sendall(json.dumps({"status": "error", "reason": "Invalid code"}).encode() + b"\n")
             return
 
         if action != "login": 
@@ -330,28 +694,39 @@ def handle_client(cs, addr):
 
         db = sqlite3.connect(DB)
         cur = db.cursor()
-        cur.execute("SELECT password,banned_until,ban_reason,is_verified FROM users WHERE username=?", (req["user"],))
-        row = cur.fetchone()
-        
-        stored, incoming = (row[0] if row else None), req["pass"]
-        password_ok = False; needs_rehash = False
-        if stored:
-            if stored.startswith("$argon2"):
-                try:
-                    _ph.verify(stored, incoming); password_ok = True
-                    if _ph.check_needs_rehash(stored): needs_rehash = True
-                except (VerifyMismatchError, VerificationError, InvalidHashError):
-                    pass
-            else:  # legacy plain-text — accept and rehash transparently
-                if stored == incoming: password_ok = True; needs_rehash = True
-        if not password_ok:
+
+        input_user = str(req.get("user", "")).strip()
+        if not input_user:
             sock.sendall(b'{"status":"error","reason":"Invalid credentials"}\n')
-            db.close(); return
-        if needs_rehash:
-            db.execute("UPDATE users SET password=? WHERE username=?", (_ph.hash(incoming), req["user"]))
-            db.commit()
-            
-        bi, br, verified = row[1], row[2], row[3]
+            db.close()
+            return
+
+        # Case-insensitive username login with canonical identity from DB.
+        # If multiple usernames differ only by case, reject to avoid ambiguous auth.
+        cur.execute(
+            """
+            SELECT username, password, banned_until, ban_reason, is_verified
+            FROM users
+            WHERE username = ? COLLATE NOCASE
+            ORDER BY CASE WHEN username = ? THEN 0 ELSE 1 END, username
+            LIMIT 2
+            """,
+            (input_user, input_user),
+        )
+        rows = cur.fetchall()
+        if len(rows) > 1:
+            sock.sendall(b'{"status":"error","reason":"Ambiguous username. Contact admin."}\n')
+            db.close()
+            return
+        row = rows[0] if rows else None
+
+        if not row or row[1] != req["pass"]:
+            sock.sendall(b'{"status":"error","reason":"Invalid credentials"}\n')
+            db.close()
+            return
+
+        user = row[0]
+        bi, br, verified = row[2], row[3], row[4]
         
         if smtp_config['enabled'] and verified == 0:
             sock.sendall(b'{"status":"error","reason":"Account not verified. Please recreate account to verify."}\n')
@@ -366,22 +741,14 @@ def handle_client(cs, addr):
                 return
 
         sock.sendall(b'{"status":"ok"}\n')
-        user = req["user"]
         with lock:
             clients[user] = sock
             client_statuses[user] = "online"
 
         admins = get_admins()
         rows = db.execute("SELECT contact,blocked FROM contacts WHERE owner=?", (user,)).fetchall()
-        with lock:
-            contacts = [{"user":c, "blocked":b, "online": (c in clients), "is_admin": (c in admins), "status_text": client_statuses.get(c, "offline") if c in clients else "offline"} for c,b in rows]
+        contacts = [{"user":c, "blocked":b, "online": _is_online_user(c), "is_admin": (c in admins), "status_text": _status_for_user(c)} for c,b in rows]
         sock.sendall((json.dumps({"action":"contact_list","contacts":contacts})+"\n").encode())
-        offline = db.execute("SELECT sender, message, timestamp FROM offline_messages WHERE recipient=? ORDER BY id ASC", (user,)).fetchall()
-        if offline:
-            msgs = [{"from": s, "msg": m, "time": t} for s, m, t in offline]
-            sock.sendall((json.dumps({"action": "offline_messages", "messages": msgs}) + "\n").encode())
-            db.execute("DELETE FROM offline_messages WHERE recipient=?", (user,))
-            db.commit()
         db.close()
         
         broadcast_contact_status(user, True)
@@ -398,19 +765,73 @@ def handle_client(cs, addr):
                     continue
                 con = sqlite3.connect(DB)
                 exists = con.execute("SELECT 1 FROM users WHERE username=?", (contact_to_add,)).fetchone()
-                if not exists: 
+                is_bot = _is_registered_bot(contact_to_add)
+                if not exists and not is_bot:
                     reason = f"User '{contact_to_add}' does not exist."
-                    sock.sendall((json.dumps({"action": "add_contact_failed", "reason": reason}) + "\n").encode())
+                    sock.sendall((json.dumps({
+                        "action": "add_contact_failed",
+                        "reason": reason,
+                        "suggest_invite": True,
+                        "invite_methods": [
+                            m for m, ok in [("email", smtp_config.get("enabled", False)), ("sms", flexpbx_config.get("enabled", False))] if ok
+                        ],
+                    }) + "\n").encode())
                 else:
                     con.execute("INSERT OR IGNORE INTO contacts(owner,contact) VALUES(?,?)", (user, contact_to_add))
                     con.commit()
-                    with lock:
-                        is_online = contact_to_add in clients
-                        contact_status_text = client_statuses.get(contact_to_add, "offline") if is_online else "offline"
+                    is_online = _is_online_user(contact_to_add)
+                    contact_status_text = _status_for_user(contact_to_add)
                     admins = get_admins()
-                    contact_data = {"user": contact_to_add, "blocked": 0, "online": is_online, "is_admin": contact_to_add in admins, "status_text": contact_status_text}
+                    contact_data = {
+                        "user": contact_to_add,
+                        "blocked": 0,
+                        "online": is_online,
+                        "is_admin": contact_to_add in admins,
+                        "status_text": contact_status_text,
+                        "is_bot": bool(is_bot),
+                        "bot_origin": "local" if _is_virtual_bot(contact_to_add) else ("external" if is_bot else "user")
+                    }
+                    if _is_virtual_bot(contact_to_add) and str(contact_to_add).lower() == "openclaw-bot":
+                        token = _upsert_bot_token(user, contact_to_add)
+                        contact_data["bot_auth_token"] = token
+                        contact_data["bot_auth_type"] = "openclaw"
                     sock.sendall((json.dumps({"action": "add_contact_success", "contact": contact_data}) + "\n").encode())
                 con.close()
+
+            elif action == "invite_user":
+                target_user = str(msg.get("username", "")).strip()
+                method = str(msg.get("method", "email")).strip().lower()
+                target = str(msg.get("target", "")).strip()
+                include_link = bool(msg.get("include_link", True))
+                if not target_user or not target:
+                    sock.sendall((json.dumps({
+                        "action": "invite_result",
+                        "ok": False,
+                        "method": method,
+                        "target": target,
+                        "reason": "Invite target username and destination are required."
+                    }) + "\n").encode())
+                    continue
+                if method not in ("email", "sms"):
+                    method = "email" if "@" in target else "sms"
+                invite_text = f"{user} invited you to join Thrive Messenger on {server_identity}."
+                if include_link:
+                    invite_text += " Visit https://im.tappedin.fm/ for setup and sign-in."
+                ok = False
+                reason = "Unsupported invite method."
+                if method == "email":
+                    ok = EmailManager.send_email(target, "You're invited to Thrive Messenger", invite_text)
+                    reason = "Invite email sent." if ok else "Email delivery is unavailable or failed."
+                elif method == "sms":
+                    ok, sms_reason = FlexPBXManager.send_sms(target, invite_text)
+                    reason = "Invite SMS sent." if ok else sms_reason
+                sock.sendall((json.dumps({
+                    "action": "invite_result",
+                    "ok": ok,
+                    "method": method,
+                    "target": target,
+                    "reason": reason
+                }) + "\n").encode())
                 
             elif action in ("block_contact","unblock_contact"):
                 flag = 1 if action=="block_contact" else 0
@@ -420,10 +841,20 @@ def handle_client(cs, addr):
                 con.close()
                 
             elif action == "delete_contact":
+                deleted_name = msg["to"]
                 con = sqlite3.connect(DB)
-                con.execute("DELETE FROM contacts WHERE owner=? AND contact=?", (user,msg["to"]))
+                con.execute("DELETE FROM contacts WHERE owner=? AND contact=?", (user,deleted_name))
                 con.commit()
                 con.close()
+                if _is_virtual_bot(deleted_name):
+                    _revoke_bot_token(user, deleted_name)
+                    try:
+                        sock.sendall((json.dumps({
+                            "action": "bot_token_revoked",
+                            "bot": deleted_name
+                        }) + "\n").encode())
+                    except Exception:
+                        pass
                 
             elif action == "admin_cmd":
                 if user not in get_admins(): 
@@ -437,13 +868,8 @@ def handle_client(cs, addr):
                         time.sleep(shutdown_timeout)
                         os._exit(0)
                     elif command == "restart" and len(cmd_parts) == 1:
-                        print(f"Restart initiated by admin: {user}")
-                        broadcast_alert(f"The server is restarting in {shutdown_timeout} seconds.")
                         response = f"Server is restarting in {shutdown_timeout} seconds..."
-                        try: sock.sendall((json.dumps({"action":"admin_response", "response": response})+"\n").encode())
-                        except: pass
-                        time.sleep(shutdown_timeout)
-                        os.execv(sys.executable, [sys.executable] + sys.argv)
+                        _schedule_restart(shutdown_timeout, requested_by=user)
                     elif command == "alert" and len(cmd_parts) >= 2:
                         alert_message = " ".join(cmd_parts[1:])
                         broadcast_alert(alert_message)
@@ -493,13 +919,44 @@ def handle_client(cs, addr):
                         response = "Error: Unknown command or incorrect syntax."
                 try: sock.sendall((json.dumps({"action":"admin_response", "response": response})+"\n").encode())
                 except: pass
+
+            elif action == "schedule_restart":
+                if user not in get_admins():
+                    try:
+                        sock.sendall((json.dumps({"action": "admin_response", "response": "Error: You are not authorized to schedule restarts."}) + "\n").encode())
+                    except Exception:
+                        pass
+                    continue
+                try:
+                    delay = int(msg.get("seconds", shutdown_timeout))
+                except Exception:
+                    delay = shutdown_timeout
+                _schedule_restart(delay, requested_by=user)
+                try:
+                    sock.sendall((json.dumps({"action": "admin_response", "response": f"Server restart scheduled in {max(1, delay)} seconds."}) + "\n").encode())
+                except Exception:
+                    pass
                 
             elif action == "server_info":
                 con = sqlite3.connect(DB)
                 total_users = con.execute("SELECT COUNT(*) FROM users").fetchone()[0]
                 con.close()
-                with lock: online_count = len(clients)
-                info = {"action": "server_info_response", "port": server_port, "ssl": use_ssl, "total_users": total_users, "online_users": online_count, "size_limit": file_config.get('size_limit', 0), "blackfiles": file_config.get('blackfiles', []), "max_status_length": max_status_length}
+                with lock:
+                    online_count = len(clients)
+                    online_admins = sum(1 for uname in clients.keys() if uname in get_admins())
+                uptime_seconds = int(max(0, time.time() - server_started_at))
+                info = {
+                    "action": "server_info_response",
+                    "port": server_port,
+                    "ssl": use_ssl,
+                    "total_users": total_users,
+                    "online_users": online_count,
+                    "online_admin_users": online_admins,
+                    "uptime_seconds": uptime_seconds,
+                    "size_limit": file_config.get('size_limit', 0),
+                    "blackfiles": file_config.get('blackfiles', []),
+                    "max_status_length": max_status_length
+                }
                 try: sock.sendall((json.dumps(info) + "\n").encode())
                 except: pass
 
@@ -510,40 +967,59 @@ def handle_client(cs, addr):
                 con.close()
                 admins = get_admins()
                 directory = []
-                with lock:
-                    for (uname,) in all_users:
-                        is_online = uname in clients
-                        directory.append({"user": uname, "online": is_online, "status_text": client_statuses.get(uname, "offline") if is_online else "offline", "is_admin": uname in admins, "is_contact": uname in user_contacts, "is_blocked": user_contacts.get(uname, 0) == 1})
+                known = {uname for (uname,) in all_users}
+                for uname in sorted(known | bot_usernames | bot_external_usernames):
+                    directory.append({
+                        "user": uname,
+                        "online": _is_online_user(uname),
+                        "status_text": _status_for_user(uname),
+                        "is_admin": uname in admins,
+                        "is_contact": uname in user_contacts,
+                        "is_blocked": user_contacts.get(uname, 0) == 1,
+                        "server": server_identity,
+                        "is_bot": _is_registered_bot(uname),
+                        "bot_origin": "local" if _is_virtual_bot(uname) else ("external" if _is_registered_bot(uname) else "user")
+                    })
                 try: sock.sendall((json.dumps({"action": "user_directory_response", "users": directory}) + "\n").encode())
                 except: pass
 
             elif action == "msg":
-                to = msg["to"]
-                frm = user  # always use the authenticated identity; never trust client-supplied "from"
+                to, frm = msg["to"], msg["from"]
                 con = sqlite3.connect(DB)
                 recipient_has_blocked = con.execute("SELECT blocked FROM contacts WHERE owner=? AND contact=?", (to, frm)).fetchone()
                 sender_has_blocked = con.execute("SELECT blocked FROM contacts WHERE owner=? AND contact=?", (frm, to)).fetchone()
                 con.close()
-
+                
                 with lock: sock_to = clients.get(to)
                 reason = None
                 if recipient_has_blocked and recipient_has_blocked[0] == 1:
                     reason = f"Message couldn't be sent because {to} has you blocked."
-                elif sender_has_blocked and sender_has_blocked[0] == 1:
+                elif sender_has_blocked and sender_has_blocked[0] == 1: 
                     reason = "You have blocked this contact."
-                elif not sock_to:
-                    con2 = sqlite3.connect(DB)
-                    con2.execute("INSERT INTO offline_messages (recipient, sender, message, timestamp) VALUES (?, ?, ?, ?)", (to, frm, msg["msg"], msg["time"]))
-                    con2.commit(); con2.close()
+                elif _maybe_send_bot_reply(sock, frm, to, msg.get("msg", "")):
                     reason = None
+                elif not sock_to: 
+                    reason = f"{to} is offline."
                 else:
-                    try:
-                        outgoing = {"action": "msg", "from": frm, "to": to, "msg": msg["msg"], "time": msg["time"]}
-                        sock_to.sendall((json.dumps(outgoing) + "\n").encode())
+                    try: 
+                        sock_to.sendall((json.dumps(msg)+"\n").encode())
                         reason = None
                     except: pass
-                if reason:
+                if reason: 
                     sock.sendall(json.dumps({"action": "msg_failed", "to": to, "reason": reason}).encode() + b"\n")
+
+            elif action == "typing":
+                to = msg.get("to")
+                typing = bool(msg.get("typing", False))
+                if not to:
+                    continue
+                with lock:
+                    sock_to = clients.get(to)
+                if sock_to:
+                    try:
+                        sock_to.sendall((json.dumps({"action": "typing", "from": user, "typing": typing}) + "\n").encode())
+                    except Exception:
+                        pass
                     
             elif action == "file_offer":
                 to = msg["to"]
@@ -624,10 +1100,8 @@ def handle_client(cs, addr):
 
             elif action == "file_data":
                 transfer_id = msg["transfer_id"]
-                with transfer_lock: transfer = pending_transfers.get(transfer_id)
+                with transfer_lock: transfer = pending_transfers.pop(transfer_id, None)
                 if not transfer: continue
-                if transfer["from"] != user: continue  # only the original sender may deliver data
-                with transfer_lock: pending_transfers.pop(transfer_id, None)
                 recipient = transfer["to"]
                 with lock: sock_to = clients.get(recipient)
                 if sock_to:
@@ -761,7 +1235,7 @@ def handle_create(user, password, email=""):
     con = sqlite3.connect(DB)
     existing = con.execute("SELECT 1 FROM users WHERE LOWER(username)=LOWER(?)", (user,)).fetchone()
     if not existing:
-        con.execute("INSERT INTO users(username,password,email,is_verified) VALUES(?,?,?,1)", (user, _ph.hash(password), email))
+        con.execute("INSERT INTO users(username,password,email,is_verified) VALUES(?,?,?,1)", (user, password, email))
         con.commit(); con.close()
         print(f"User '{user}' created.")
         return True
@@ -799,13 +1273,15 @@ def handle_delete(user):
 
 def run_cli():
     print("Thrive Server Admin Console")
-    print("Available commands: create, ban, unban, del, admin, unadmin, alert, banfile, unbanfile, restart, exit")
+    print("Available commands: help, create, ban, unban, del, admin, unadmin, alert, banfile, unbanfile, restart, exit")
     while True:
         try:
             cmd_line = input("> ").strip()
             parts = cmd_line.split()
             if not parts: continue
             command = parts[0].lower()
+            if command == "help":
+                print("Available commands: help, create, ban, unban, del, admin, unadmin, alert, banfile, unbanfile, restart, exit")
             if command == "exit":
                 broadcast_alert(f"The server is shutting down in {shutdown_timeout} seconds.")
                 print(f"Server shutting down in {shutdown_timeout} seconds...")

@@ -1,0 +1,48 @@
+name: Build macOS Desktop
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "main.py"
+      - "client.conf"
+      - "sounds/**"
+      - "scripts/build_macos.sh"
+      - ".github/workflows/build-macos.yml"
+      - "pyproject.toml"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-13
+            arch: x86_64
+          - os: macos-14
+            arch: arm64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build app archive
+        run: |
+          chmod +x scripts/build_macos.sh
+          scripts/build_macos.sh "${{ matrix.arch }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: thrive-messenger-macos-${{ matrix.arch }}
+          path: dist-macos/*.zip
+          if-no-files-found: error

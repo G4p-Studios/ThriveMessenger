@@ -75,6 +75,24 @@ If you wish to compile a binary, run the appropriate compile script. Thrive Mess
     compile_pyinstaller.cmd
     ```
 
+### Compiling on macOS (Intel + Apple Silicon)
+
+The repo includes a macOS build script that produces a `.app` zipped archive:
+
+```bash
+chmod +x scripts/build_macos.sh
+scripts/build_macos.sh
+```
+
+This writes output archives to `dist-macos/`.
+
+For automated dual-architecture builds, run the GitHub Actions workflow:
+`Build macOS Desktop`.
+It produces:
+
+- `thrive_messenger-macos-x86_64.zip`
+- `thrive_messenger-macos-arm64.zip`
+
 ### Running compiled
 
 If you don't feel like fighting with UV and Python, a pre-compiled release is provided.
@@ -180,6 +198,29 @@ With the Thrive Messenger client open and logged in, follow these steps to chang
 The client.conf file controls what server and port the Thrive Messenger client connects to. If you have your own Thrive Messenger server up, or you have one that you like to use, you can simply open client.conf in your text editor of choice, such as Notepad++, and modify the server hostname and port to point to your desired server.
 
 The default server is msg.thecubed.cc, running on port 2005.
+
+You can also control update sources in `client.conf`:
+
+```
+[updates]
+feed_url = https://im.tappedin.fm/updates/latest.json
+preferred_repo = Raywonder/ThriveMessenger
+fallback_repos = G4p-Studios/ThriveMessenger
+```
+
+- `feed_url` is optional. If set, the client checks your hosted feed first.
+- If feed lookup fails, the client falls back to GitHub repos in order.
+- This allows your custom channel and upstream compatibility at the same time.
+
+### Cron-ready update feed sync
+
+This repo includes `srv/scripts/sync_update_feed.sh` to publish a JSON update feed from GitHub Releases.
+
+Example cron (every 5 minutes):
+
+```
+*/5 * * * * /path/to/ThriveMessenger/srv/scripts/sync_update_feed.sh Raywonder/ThriveMessenger /var/www/im.tappedin.fm/updates/latest.json >/var/log/thrive-update-feed.log 2>&1
+```
 
 ### Auto reading of messages
 

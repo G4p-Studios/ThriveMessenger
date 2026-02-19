@@ -1,0 +1,66 @@
+name: Upstream Sync
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 */6 * * *"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync-upstream:
+    runs-on: ubuntu-latest
+    env:
+      TARGET_BRANCH: feature/generic-chat-typing-welcome-20260217
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add and fetch upstream
+        run: |
+          git remote add upstream https://github.com/G4p-Studios/ThriveMessenger.git
+          git fetch upstream main
+          git fetch origin "${TARGET_BRANCH}"
+
+      - name: Prepare sync branch and merge upstream/main
+        id: merge
+        run: |
+          SYNC_BRANCH="bot/upstream-sync-${{ github.run_id }}"
+          echo "sync_branch=${SYNC_BRANCH}" >> "${GITHUB_OUTPUT}"
+          git checkout -B "${SYNC_BRANCH}" "origin/${TARGET_BRANCH}"
+          if git merge --no-ff upstream/main -m "chore: sync upstream/main into ${TARGET_BRANCH}"; then
+            echo "merged=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "merged=false" >> "${GITHUB_OUTPUT}"
+            git merge --abort || true
+          fi
+
+      - name: Open PR with sync changes
+        if: steps.merge.outputs.merged == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore: sync upstream/main"
+          title: "chore: sync upstream/main"
+          body: |
+            Automated upstream sync PR.
+            - Source: `G4p-Studios/ThriveMessenger:main`
+            - Target: `${{ env.TARGET_BRANCH }}`
+          branch: ${{ steps.merge.outputs.sync_branch }}
+          base: ${{ env.TARGET_BRANCH }}
+          delete-branch: true
+
+      - name: Fail if merge had conflicts
+        if: steps.merge.outputs.merged != 'true'
+        run: |
+          echo "Upstream sync failed due to merge conflicts. Resolve manually."
+          exit 1
