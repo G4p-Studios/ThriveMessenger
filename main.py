@@ -3163,6 +3163,9 @@ class MainFrame(wx.Frame):
     def on_key(self, evt):
         if evt.GetKeyCode() == wx.WXK_F1:
             open_help_docs_for_context("main", self)
+        elif evt.CmdDown() and evt.GetKeyCode() == ord(','):
+            self.on_settings(None)
+            return
         elif evt.GetKeyCode() == wx.WXK_ESCAPE:
             action = str(wx.GetApp().user_config.get('escape_main_action', 'none') or 'none')
             if action == 'quit':
