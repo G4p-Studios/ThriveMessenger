@@ -289,6 +289,9 @@ def load_user_config():
         settings['primary_server_name'] = primary
     if settings.get('last_server_name') not in [e['name'] for e in merged_entries]:
         settings['last_server_name'] = settings.get('primary_server_name') or merged_entries[0]['name']
+    enter_action = str(settings.get('enter_key_action', 'send') or 'send')
+    if enter_action not in ('send', 'place_call', 'none'):
+        settings['enter_key_action'] = 'send'
 
     # 3. Load password from Keyring if "Remember me" is active
     if settings.get('username') and settings.get('remember'):
@@ -3769,6 +3772,7 @@ class ChatDialog(wx.Dialog):
         self._history_rows = []
         self.hist.Bind(wx.EVT_LISTBOX_DCLICK, self.on_history_item_activated)
         self.hist.Bind(wx.EVT_KEY_DOWN, self.on_history_key)
+        self.hist.Bind(wx.EVT_CONTEXT_MENU, self.on_history_context_menu)
         self.typing_lbl = wx.StaticText(self, label="")
         self.typing_lbl.SetForegroundColour(wx.Colour(120, 180, 255))
         box_msg = wx.StaticBoxSizer(wx.VERTICAL, self, "Type &message")
@@ -3789,7 +3793,7 @@ class ChatDialog(wx.Dialog):
 
         s.Add(self.hist, 1, wx.EXPAND|wx.ALL, 5)
         s.Add(self.typing_lbl, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
-        self.input_ctrl.Bind(wx.EVT_CHAR_HOOK, self.on_input_key)
+        self.input_ctrl.Bind(wx.EVT_KEY_DOWN, self.on_input_key)
         self.input_ctrl.Bind(wx.EVT_TEXT_ENTER, self.on_text_enter)
         self.input_ctrl.Bind(wx.EVT_TEXT, self.on_input_text)
         box_msg.Add(self.input_ctrl, 1, wx.EXPAND|wx.ALL, 5)
@@ -3976,6 +3980,43 @@ class ChatDialog(wx.Dialog):
         ts = time.time()
         self.append(reason, "System", ts, is_error=True)
         self.input_ctrl.SetFocus()
+    def _selected_history_index(self):
+        idx = self.hist.GetSelection()
+        if idx == wx.NOT_FOUND or idx < 0 or idx >= len(self._history_rows):
+            return None
+        return idx
+    def on_history_context_menu(self, event):
+        idx = self._selected_history_index()
+        if idx is None:
+            return
+        row = self._history_rows[idx]
+        own_message = row.get("sender") == self.user and not row.get("error", False)
+        menu = wx.Menu()
+        mi_edit = menu.Append(wx.ID_ANY, "Edit Message")
+        mi_remove = menu.Append(wx.ID_ANY, "Remove Message")
+        mi_edit.Enable(own_message)
+        self.Bind(wx.EVT_MENU, self.on_edit_selected_message, mi_edit)
+        self.Bind(wx.EVT_MENU, self.on_remove_selected_message, mi_remove)
+        self.PopupMenu(menu)
+        menu.Destroy()
+    def on_edit_selected_message(self, _):
+        idx = self._selected_history_index()
+        if idx is None:
+            return
+        row = self._history_rows[idx]
+        if row.get("sender") != self.user or row.get("error", False):
+            return
+        self.input_ctrl.SetValue(str(row.get("text", "")))
+        self.input_ctrl.SetFocus()
+        self.input_ctrl.SetInsertionPointEnd()
+    def on_remove_selected_message(self, _):
+        idx = self._selected_history_index()
+        if idx is None:
+            return
+        self._history_rows.pop(idx)
+        self.hist.Delete(idx)
+        if self.hist.GetCount() > 0:
+            self.hist.SetSelection(max(0, idx - 1))
 
     def on_history_item_activated(self, event):
         idx = self.hist.GetSelection()
