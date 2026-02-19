@@ -17,6 +17,19 @@ Output files:
 - `promo-chat-files.mp4`
 - `promo-admin-tools.mp4`
 
+## Local/offline clips (no cloud)
+
+If Sora/API is unavailable, generate local promo clips with FFmpeg:
+
+```bash
+./scripts/generate_local_promos.sh
+```
+
+Notes:
+- Works fully offline with `ffmpeg`.
+- If local Ollama is available, it will try to produce short beat lines.
+- Output filenames stay the same as Sora flow.
+
 ## Long clips (external provider)
 
 For longer edits, use another service (for example Runway/Pika/Kling), then place final outputs under:
