@@ -942,11 +942,21 @@ def check_for_update(callback):
                     tag = str(feed_data.get("tag") or feed_data.get("tag_name") or "").strip()
                     remote = parse_github_tag(tag)
                     if remote and remote > local:
+                        mac_zip = feed_data.get("mac_zip_url")
+                        win_zip = feed_data.get("win_zip_url")
+                        generic_zip = feed_data.get("zip_url")
+                        preferred_zip = generic_zip
+                        if sys.platform == "darwin":
+                            preferred_zip = mac_zip or generic_zip or win_zip
+                        elif sys.platform == "win32":
+                            preferred_zip = win_zip or generic_zip or mac_zip
                         UPDATE_CONTEXT.update({
                             "source": "feed",
                             "feed_url": feed_url,
                             "tag": tag,
-                            "zip_url": feed_data.get("zip_url") or feed_data.get("mac_zip_url") or feed_data.get("win_zip_url"),
+                            "zip_url": preferred_zip,
+                            "mac_zip_url": mac_zip,
+                            "win_zip_url": win_zip,
                             "installer_url": feed_data.get("installer_url") or feed_data.get("win_installer_url"),
                             "repo": feed_data.get("repo"),
                         })
@@ -3758,9 +3768,9 @@ class MainFrame(wx.Frame):
 
         if UPDATE_CONTEXT.get("source") == "feed":
             if sys.platform == 'darwin':
-                asset_url = UPDATE_CONTEXT.get("zip_url")
+                asset_url = UPDATE_CONTEXT.get("mac_zip_url") or UPDATE_CONTEXT.get("zip_url")
             else:
-                asset_url = UPDATE_CONTEXT.get("installer_url") if use_installer else UPDATE_CONTEXT.get("zip_url")
+                asset_url = UPDATE_CONTEXT.get("installer_url") if use_installer else (UPDATE_CONTEXT.get("win_zip_url") or UPDATE_CONTEXT.get("zip_url"))
 
         if not asset_url:
             repo = UPDATE_CONTEXT.get("repo") if UPDATE_CONTEXT.get("repo") else "Raywonder/ThriveMessenger"
