@@ -810,6 +810,13 @@ def _create_invite_token(invited_user, invited_email, invited_by, expires_hours=
     con.close()
     return token
 
+def _is_invite_expired(expires_at):
+    try:
+        expires = datetime.datetime.fromisoformat(str(expires_at or "").strip())
+    except Exception:
+        return True
+    return datetime.datetime.utcnow() > expires
+
 class EmailManager:
     @staticmethod
     def send_email(to_email, subject, body):
@@ -1066,17 +1073,100 @@ def handle_client(cs, addr):
                 "post_login": welcome_config.get('post_login', '') if welcome_config.get('enabled', False) else '',
             }) + "\n").encode())
             return
+
+        # --- Validate Invite Token (pre-login) ---
+        if action == "validate_invite":
+            invite_token = str(req.get("invite_token", "") or "").strip()
+            if not invite_token:
+                sock.sendall((json.dumps({
+                    "action": "invite_validation",
+                    "status": "error",
+                    "reason": "Missing invite token.",
+                }) + "\n").encode())
+                return
+            con = sqlite3.connect(DB)
+            row = con.execute(
+                "SELECT invited_user, invited_email, invited_by, expires_at, used FROM invite_tokens WHERE token=?",
+                (invite_token,),
+            ).fetchone()
+            con.close()
+            if not row:
+                sock.sendall((json.dumps({
+                    "action": "invite_validation",
+                    "status": "error",
+                    "reason": "Invite token is invalid.",
+                }) + "\n").encode())
+                return
+            invited_user, invited_email, invited_by, expires_at, used = row
+            if int(used or 0) != 0:
+                sock.sendall((json.dumps({
+                    "action": "invite_validation",
+                    "status": "error",
+                    "reason": "Invite token has already been used.",
+                }) + "\n").encode())
+                return
+            if _is_invite_expired(expires_at):
+                sock.sendall((json.dumps({
+                    "action": "invite_validation",
+                    "status": "error",
+                    "reason": "Invite token has expired.",
+                }) + "\n").encode())
+                return
+            sock.sendall((json.dumps({
+                "action": "invite_validation",
+                "status": "ok",
+                "invite_user": str(invited_user or "").strip(),
+                "invite_email": str(invited_email or "").strip(),
+                "invited_by": str(invited_by or "").strip(),
+                "expires_at": str(expires_at or "").strip(),
+            }) + "\n").encode())
+            return
         
         # --- Create Account ---
         if action == "create_account":
             new_user = req.get("user")
             new_pass = req.get("pass")
             email = req.get("email", "")
+            invite_token = str(req.get("invite_token", "") or "").strip()
             if not new_user or not new_pass: 
                 sock.sendall((json.dumps({"action": "create_account_failed", "reason": "Missing fields."}) + "\n").encode())
                 return
             
             con = sqlite3.connect(DB)
+            invite_row = None
+            if invite_token:
+                invite_row = con.execute(
+                    "SELECT invited_user, invited_email, expires_at, used FROM invite_tokens WHERE token=?",
+                    (invite_token,),
+                ).fetchone()
+                if not invite_row:
+                    con.close()
+                    sock.sendall((json.dumps({"action": "create_account_failed", "reason": "Invite token is invalid."}) + "\n").encode())
+                    return
+                invited_user, invited_email, expires_at, used = invite_row
+                if int(used or 0) != 0:
+                    con.close()
+                    sock.sendall((json.dumps({"action": "create_account_failed", "reason": "Invite token has already been used."}) + "\n").encode())
+                    return
+                if _is_invite_expired(expires_at):
+                    con.close()
+                    sock.sendall((json.dumps({"action": "create_account_failed", "reason": "Invite token has expired."}) + "\n").encode())
+                    return
+                invited_user = str(invited_user or "").strip()
+                invited_email = str(invited_email or "").strip()
+                if invited_user and str(new_user).strip().lower() != invited_user.lower():
+                    con.close()
+                    sock.sendall((json.dumps({"action": "create_account_failed", "reason": "Invite token does not match this username."}) + "\n").encode())
+                    return
+                if invited_email:
+                    if str(email or "").strip():
+                        if str(email).strip().lower() != invited_email.lower():
+                            con.close()
+                            sock.sendall((json.dumps({"action": "create_account_failed", "reason": "Invite token does not match this email."}) + "\n").encode())
+                            return
+                    else:
+                        email = invited_email
+
             row = con.execute("SELECT is_verified FROM users WHERE username=?", (new_user,)).fetchone()
             
             # Allow overwriting unverified users
@@ -1092,6 +1182,8 @@ def handle_client(cs, addr):
                 con.execute("UPDATE users SET password=?, email=?, verification_code=?, is_verified=? WHERE username=?", (new_pass, email, code, verified, new_user))
             else:
                 con.execute("INSERT INTO users(username, password, email, verification_code, is_verified) VALUES(?,?,?,?,?)", (new_user, new_pass, email, code, verified))
+            if invite_token:
+                con.execute("UPDATE invite_tokens SET used=1 WHERE token=?", (invite_token,))
             con.commit()
             con.close()
 

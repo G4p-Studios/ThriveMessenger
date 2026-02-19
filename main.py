@@ -571,6 +571,57 @@ def fetch_server_snapshot(server_entry):
         pass
     return snapshot
 
+def parse_invite_context_from_args(argv=None):
+    args = list(argv if argv is not None else sys.argv[1:])
+    pending_invite_flag = False
+    for raw in args:
+        candidate = str(raw or "").strip()
+        if not candidate:
+            continue
+        if pending_invite_flag:
+            pending_invite_flag = False
+            token = candidate.strip()
+            if token:
+                return {"invite_token": token, "invite_user": "", "invite_email": "", "source": "--invite"}
+            continue
+        if candidate == "--invite":
+            pending_invite_flag = True
+            continue
+        if candidate.startswith("--invite="):
+            token = candidate.split("=", 1)[1].strip()
+            if token:
+                return {"invite_token": token, "invite_user": "", "invite_email": "", "source": "--invite"}
+            continue
+        parsed = urllib.parse.urlsplit(candidate)
+        query = urllib.parse.parse_qs(parsed.query if parsed.query else candidate if "=" in candidate and "://" not in candidate else "")
+        token = str((query.get("invite") or [""])[0] or "").strip()
+        if not token:
+            continue
+        return {
+            "invite_token": token,
+            "invite_user": str((query.get("user") or [""])[0] or "").strip(),
+            "invite_email": str((query.get("email") or [""])[0] or "").strip(),
+            "source": candidate,
+        }
+    return {}
+
+def fetch_invite_validation(server_entry, invite_token):
+    token = str(invite_token or "").strip()
+    if not token:
+        return {"status": "error", "reason": "Missing invite token."}
+    try:
+        ssock = create_secure_socket(server_entry)
+        payload = {"action": "validate_invite", "invite_token": token}
+        ssock.sendall((json.dumps(payload) + "\n").encode())
+        line = ssock.makefile().readline()
+        ssock.close()
+        resp = json.loads(line or "{}")
+        if resp.get("action") == "invite_validation":
+            return resp
+    except Exception as e:
+        return {"status": "error", "reason": str(e)}
+    return {"status": "error", "reason": "Invite validation failed."}
+
 def extract_urls(text):
     if not text:
         return []
@@ -1565,13 +1616,15 @@ class ClientApp(wx.App):
             print("IPC port unavailable and no active instance responded; continuing without IPC listener.")
             log_event("warn", "ipc_bind_unavailable_continuing")
         self.user_config = load_user_config()
+        self.launch_invite_context = parse_invite_context_from_args()
         self.session_password = ""
         self.reconnect_in_progress = False
         self.reconnect_stop_event = threading.Event()
         self.active_server_entry = resolve_default_server_entry(self.user_config)
         self.connected_server_names = set()
         self.transfer_history = []
-        if self.user_config.get('autologin') and self.user_config.get('username') and self.user_config.get('password'):
+        has_invite_launch = bool(self.launch_invite_context.get("invite_token"))
+        if self.user_config.get('autologin') and self.user_config.get('username') and self.user_config.get('password') and not has_invite_launch:
             print("Attempting auto-login...")
             selected_server = resolve_default_server_entry(self.user_config)
             success, sock, sf, reason = self.perform_login(self.user_config['username'], self.user_config['password'], selected_server)
@@ -1620,7 +1673,7 @@ class ClientApp(wx.App):
 
     def show_login_dialog(self):
         while True:
-            dlg = LoginDialog(None, self.user_config)
+            dlg = LoginDialog(None, self.user_config, invite_context=self.launch_invite_context)
             result = dlg.ShowModal()
             if result == wx.ID_OK:
                 success, sock, sf, _ = self.perform_login(dlg.username, dlg.password, dlg.selected_server)
@@ -2198,8 +2251,9 @@ class ForgotPasswordDialog(wx.Dialog):
         except Exception as ex: wx.MessageBox(str(ex), "Connection Error")
 
 class CreateAccountDialog(wx.Dialog):
-    def __init__(self, parent):
+    def __init__(self, parent, invite_context=None):
         super().__init__(parent, title="Create New Account", size=(300, 330)); panel = wx.Panel(self); s = wx.BoxSizer(wx.VERTICAL)
+        self.invite_context = invite_context or {}
 
         dark_mode_on = is_windows_dark_mode()
         if dark_mode_on:
@@ -2222,6 +2276,20 @@ class CreateAccountDialog(wx.Dialog):
             ok_btn.SetBackgroundColour(dark_color); ok_btn.SetForegroundColour(light_text_color)
             cancel_btn.SetBackgroundColour(dark_color); cancel_btn.SetForegroundColour(light_text_color)
             self.autologin_cb.SetForegroundColour(light_text_color)
+
+        invite_user = str(self.invite_context.get("invite_user", "") or "").strip()
+        invite_email = str(self.invite_context.get("invite_email", "") or "").strip()
+        invite_token = str(self.invite_context.get("invite_token", "") or "").strip()
+        if invite_token:
+            invite_lbl = wx.StaticText(panel, label="Invite link detected. Account fields are prefilled when provided.")
+            invite_lbl.Wrap(270)
+            if dark_mode_on:
+                invite_lbl.SetForegroundColour(light_text_color)
+            s.Add(invite_lbl, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 8)
+        if invite_user:
+            self.u_text.SetValue(invite_user)
+        if invite_email:
+            self.e_text.SetValue(invite_email)
 
         s.Add(user_box, 0, wx.EXPAND | wx.ALL, 5); s.Add(email_box, 0, wx.EXPAND | wx.ALL, 5); s.Add(pass_box, 0, wx.EXPAND | wx.ALL, 5); s.Add(confirm_box, 0, wx.EXPAND | wx.ALL, 5)
         s.Add(self.autologin_cb, 0, wx.ALL, 10)
@@ -2353,8 +2421,10 @@ class ServerManagerDialog(wx.Dialog):
         return self.entries[0]['name'] if self.entries else ""
 
 class LoginDialog(wx.Dialog):
-    def __init__(self, parent, user_config):
+    def __init__(self, parent, user_config, invite_context=None):
         super().__init__(parent, title="Login", size=(390, 470)); self.user_config = user_config
+        self.invite_context = invite_context or {}
+        self.invite_validation = None
         self.Bind(wx.EVT_CHAR_HOOK, self.on_key)
         panel = wx.Panel(self); s = wx.BoxSizer(wx.VERTICAL)
         self.server_entries = dedupe_server_entries(self.user_config.get('server_entries', []))
@@ -2385,6 +2455,9 @@ class LoginDialog(wx.Dialog):
         self.welcome_preview = wx.StaticText(server_box.GetStaticBox(), label="Welcome: (loading...)")
         self.welcome_preview.Wrap(330)
         server_box.Add(self.welcome_preview, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        self.invite_preview = wx.StaticText(server_box.GetStaticBox(), label="")
+        self.invite_preview.Wrap(330)
+        server_box.Add(self.invite_preview, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
 
         user_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "&Username")
         self.u = wx.TextCtrl(user_box.GetStaticBox()); user_box.Add(self.u, 0, wx.EXPAND | wx.ALL, 5)
@@ -2415,6 +2488,7 @@ class LoginDialog(wx.Dialog):
 
         self.populate_server_choice()
         self.refresh_welcome_preview()
+        self.refresh_invite_preview()
         s.Add(server_box, 0, wx.EXPAND | wx.ALL, 5)
         s.Add(user_box, 0, wx.EXPAND | wx.ALL, 5); s.Add(pass_box, 0, wx.EXPAND | wx.ALL, 5)
         s.Add(self.remember_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10); s.Add(self.autologin_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
@@ -2446,6 +2520,7 @@ class LoginDialog(wx.Dialog):
         if 0 <= idx < len(self.server_entries):
             self.selected_server = self.server_entries[idx]
             self.refresh_welcome_preview()
+            self.refresh_invite_preview()
 
     def on_manage_servers(self, _):
         with ServerManagerDialog(self, self.server_entries, self.primary_server_name) as dlg:
@@ -2466,6 +2541,7 @@ class LoginDialog(wx.Dialog):
                 self.user_config['last_server_name'] = current_name if any(e['name'] == current_name for e in self.server_entries) else self.server_entries[0]['name']
                 self.populate_server_choice()
                 self.refresh_welcome_preview()
+                self.refresh_invite_preview()
 
     def on_set_primary_server(self, _):
         if not self.selected_server:
@@ -2492,6 +2568,27 @@ class LoginDialog(wx.Dialog):
         )
         self.welcome_preview.SetLabel(f"{motd}\n\n{stats}\n\n{guide}")
         self.Layout()
+
+    def refresh_invite_preview(self):
+        token = str(self.invite_context.get("invite_token", "") or "").strip()
+        if not token:
+            self.invite_validation = None
+            self.invite_preview.SetLabel("")
+            self.Layout()
+            return
+        validation = fetch_invite_validation(self.selected_server, token)
+        if validation.get("status") == "ok":
+            self.invite_validation = validation
+            invite_user = str(validation.get("invite_user", "") or "").strip()
+            invite_email = str(validation.get("invite_email", "") or "").strip()
+            who = invite_user or "this account"
+            details = f" ({invite_email})" if invite_email else ""
+            self.invite_preview.SetLabel(f"Invite ready for {who}{details}. Use Create Account to continue.")
+        else:
+            self.invite_validation = None
+            reason = str(validation.get("reason", "Unknown invite error.") or "Unknown invite error.").strip()
+            self.invite_preview.SetLabel(f"Invite link is not valid on this server: {reason}")
+        self.Layout()
     
     def on_forgot(self, event):
         set_active_server_config(self.selected_server)
@@ -2499,12 +2596,22 @@ class LoginDialog(wx.Dialog):
 
     def on_create_account(self, event):
         set_active_server_config(self.selected_server)
-        with CreateAccountDialog(self) as dlg:
+        invite_data = {}
+        if self.invite_context and self.invite_context.get("invite_token"):
+            invite_data = dict(self.invite_context)
+            if self.invite_validation and self.invite_validation.get("status") == "ok":
+                invite_data["invite_user"] = self.invite_validation.get("invite_user", invite_data.get("invite_user", ""))
+                invite_data["invite_email"] = self.invite_validation.get("invite_email", invite_data.get("invite_email", ""))
+        with CreateAccountDialog(self, invite_context=invite_data) as dlg:
             if dlg.ShowModal() == wx.ID_OK:
                 u, p, em, auto = dlg.u_text.GetValue(), dlg.p1_text.GetValue(), dlg.e_text.GetValue(), dlg.autologin_cb.IsChecked()
                 try:
                     ssock = create_secure_socket()
-                    ssock.sendall(json.dumps({"action":"create_account","user":u,"pass":p,"email":em}).encode()+b"\n")
+                    payload = {"action":"create_account","user":u,"pass":p,"email":em}
+                    invite_token = str(invite_data.get("invite_token", "") or "").strip()
+                    if invite_token:
+                        payload["invite_token"] = invite_token
+                    ssock.sendall(json.dumps(payload).encode()+b"\n")
                     resp = json.loads(ssock.makefile().readline() or "{}")
                     ssock.close()
                     
