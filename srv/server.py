@@ -1,4 +1,4 @@
-import sqlite3, threading, socket, json, datetime, sys, configparser, ssl, os, uuid, base64, time, subprocess, tempfile, glob, zipfile
+import sqlite3, threading, socket, json, datetime, sys, configparser, ssl, os, uuid, base64, time, subprocess, tempfile, glob, zipfile, hashlib
 import smtplib, secrets
 import urllib.request, urllib.parse
 from email.mime.text import MIMEText
@@ -817,6 +817,37 @@ def _is_invite_expired(expires_at):
         return True
     return datetime.datetime.utcnow() > expires
 
+def _hash_passkey_secret(raw_secret):
+    return hashlib.sha256(str(raw_secret or "").encode("utf-8")).hexdigest()
+
+def _get_server_setting(key, default_value=None):
+    try:
+        con = sqlite3.connect(DB)
+        row = con.execute("SELECT value FROM server_settings WHERE key=?", (str(key),)).fetchone()
+        con.close()
+        if row and len(row) > 0:
+            return row[0]
+    except Exception:
+        pass
+    return default_value
+
+def _set_server_setting(key, value):
+    con = sqlite3.connect(DB)
+    con.execute(
+        "INSERT OR REPLACE INTO server_settings(key, value) VALUES(?, ?)",
+        (str(key), str(value)),
+    )
+    con.commit()
+    con.close()
+
+def _max_accounts_per_email():
+    raw = _get_server_setting("max_accounts_per_email", "0")
+    try:
+        limit = int(str(raw))
+        return max(0, limit)
+    except Exception:
+        return 0
+
 class EmailManager:
     @staticmethod
     def send_email(to_email, subject, body):
@@ -1011,6 +1042,8 @@ def init_db():
     cur.execute('''CREATE TABLE IF NOT EXISTS contacts (owner TEXT, contact TEXT, blocked INTEGER DEFAULT 0, PRIMARY KEY(owner, contact))''')
     cur.execute('''CREATE TABLE IF NOT EXISTS bot_tokens (owner TEXT, bot TEXT, token TEXT, created_at TEXT, PRIMARY KEY(owner, bot))''')
     cur.execute('''CREATE TABLE IF NOT EXISTS invite_tokens (token TEXT PRIMARY KEY, invited_user TEXT, invited_email TEXT, invited_by TEXT, created_at TEXT, expires_at TEXT, used INTEGER DEFAULT 0)''')
+    cur.execute('''CREATE TABLE IF NOT EXISTS user_passkeys (id TEXT PRIMARY KEY, username TEXT, label TEXT, token_hash TEXT, created_at TEXT, last_used_at TEXT, revoked INTEGER DEFAULT 0)''')
+    cur.execute('''CREATE TABLE IF NOT EXISTS server_settings (key TEXT PRIMARY KEY, value TEXT)''')
     cur.execute('''CREATE TABLE IF NOT EXISTS bot_rule_overrides (owner TEXT, bot TEXT, rules TEXT, updated_at TEXT, PRIMARY KEY(owner, bot))''')
     cur.execute('''CREATE TABLE IF NOT EXISTS group_policies (scope TEXT, group_name TEXT, policy_json TEXT, updated_by TEXT, updated_at TEXT, PRIMARY KEY(scope, group_name))''')
     cur.execute('''CREATE TABLE IF NOT EXISTS feature_policies (feature_key TEXT PRIMARY KEY, enabled INTEGER DEFAULT 1, ui_visible INTEGER DEFAULT 1, scope TEXT DEFAULT 'all', description TEXT, updated_by TEXT, updated_at TEXT)''')
@@ -1023,6 +1056,8 @@ def init_db():
     if 'file_type' not in fb_cols: cur.execute("ALTER TABLE file_bans ADD COLUMN file_type TEXT")
     if 'until_date' not in fb_cols: cur.execute("ALTER TABLE file_bans ADD COLUMN until_date TEXT")
     if 'reason' not in fb_cols: cur.execute("ALTER TABLE file_bans ADD COLUMN reason TEXT")
+    conn.commit()
+    cur.execute("INSERT OR IGNORE INTO server_settings(key, value) VALUES('max_accounts_per_email', '0')")
     conn.commit()
     _seed_feature_defaults()
     conn.close()
@@ -1168,6 +1203,22 @@ def handle_client(cs, addr):
                         email = invited_email
 
             row = con.execute("SELECT is_verified FROM users WHERE username=?", (new_user,)).fetchone()
+            normalized_email = str(email or "").strip().lower()
+            if normalized_email:
+                limit = _max_accounts_per_email()
+                if limit > 0:
+                    count_row = con.execute(
+                        "SELECT COUNT(*) FROM users WHERE lower(trim(email))=?",
+                        (normalized_email,),
+                    ).fetchone()
+                    existing_count = int((count_row or [0])[0] or 0)
+                    if existing_count >= limit and not row:
+                        con.close()
+                        sock.sendall((json.dumps({
+                            "action": "create_account_failed",
+                            "reason": "An account already exists for this email. Please log in with your existing account.",
+                        }) + "\n").encode())
+                        return
             
             # Allow overwriting unverified users
             if row and (row[0] == 1 or not smtp_config['enabled']):
@@ -1264,7 +1315,7 @@ def handle_client(cs, addr):
                 sock.sendall(json.dumps({"status": "error", "reason": "Invalid code"}).encode() + b"\n")
             return
 
-        if action != "login": 
+        if action not in ("login", "login_passkey"):
             sock.sendall(b'{"status":"error","reason":"Expected login"}\n')
             return
 
@@ -1296,10 +1347,36 @@ def handle_client(cs, addr):
             return
         row = rows[0] if rows else None
 
-        if not row or row[1] != req["pass"]:
+        if not row:
             sock.sendall(b'{"status":"error","reason":"Invalid credentials"}\n')
             db.close()
             return
+
+        if action == "login":
+            if row[1] != req.get("pass", ""):
+                sock.sendall(b'{"status":"error","reason":"Invalid credentials"}\n')
+                db.close()
+                return
+        else:
+            passkey_token = str(req.get("passkey_token", "") or "").strip()
+            if not passkey_token:
+                sock.sendall(b'{"status":"error","reason":"Missing passkey token"}\n')
+                db.close()
+                return
+            passkey_hash = _hash_passkey_secret(passkey_token)
+            passkey_row = db.execute(
+                "SELECT id FROM user_passkeys WHERE username=? AND token_hash=? AND revoked=0 LIMIT 1",
+                (row[0], passkey_hash),
+            ).fetchone()
+            if not passkey_row:
+                sock.sendall(b'{"status":"error","reason":"Invalid passkey"}\n')
+                db.close()
+                return
+            db.execute(
+                "UPDATE user_passkeys SET last_used_at=? WHERE id=?",
+                (datetime.datetime.utcnow().isoformat(), passkey_row[0]),
+            )
+            db.commit()
 
         user = row[0]
         bi, br, verified = row[2], row[3], row[4]
@@ -1554,6 +1631,107 @@ def handle_client(cs, addr):
                     sock.sendall((json.dumps({"action": "add_contact_success", "contact": contact_data}) + "\n").encode())
                 con.close()
 
+            elif action == "register_passkey":
+                label = str(msg.get("label", "") or "").strip()
+                raw_token = str(msg.get("passkey_token", "") or "").strip()
+                if not raw_token or len(raw_token) < 24:
+                    try:
+                        sock.sendall((json.dumps({
+                            "action": "passkey_register_result",
+                            "ok": False,
+                            "reason": "Passkey token is missing or too short.",
+                        }) + "\n").encode())
+                    except Exception:
+                        pass
+                    continue
+                if not label:
+                    label = f"Thrive Messenger - {user}"
+                now = datetime.datetime.utcnow().isoformat()
+                token_hash = _hash_passkey_secret(raw_token)
+                con = sqlite3.connect(DB)
+                existing = con.execute(
+                    "SELECT id FROM user_passkeys WHERE username=? AND token_hash=? LIMIT 1",
+                    (user, token_hash),
+                ).fetchone()
+                if existing:
+                    passkey_id = existing[0]
+                    con.execute(
+                        "UPDATE user_passkeys SET label=?, revoked=0 WHERE id=?",
+                        (label, passkey_id),
+                    )
+                else:
+                    passkey_id = str(uuid.uuid4())
+                    con.execute(
+                        "INSERT INTO user_passkeys(id, username, label, token_hash, created_at, last_used_at, revoked) VALUES(?,?,?,?,?,?,0)",
+                        (passkey_id, user, label, token_hash, now, now),
+                    )
+                con.commit()
+                con.close()
+                try:
+                    sock.sendall((json.dumps({
+                        "action": "passkey_register_result",
+                        "ok": True,
+                        "passkey_id": passkey_id,
+                        "label": label,
+                    }) + "\n").encode())
+                except Exception:
+                    pass
+
+            elif action == "list_passkeys":
+                con = sqlite3.connect(DB)
+                rows = con.execute(
+                    "SELECT id, label, created_at, last_used_at, revoked FROM user_passkeys WHERE username=? ORDER BY created_at DESC",
+                    (user,),
+                ).fetchall()
+                con.close()
+                entries = [
+                    {
+                        "id": r[0],
+                        "label": r[1],
+                        "created_at": r[2],
+                        "last_used_at": r[3],
+                        "revoked": bool(r[4]),
+                    }
+                    for r in rows
+                ]
+                try:
+                    sock.sendall((json.dumps({
+                        "action": "passkey_list",
+                        "passkeys": entries,
+                    }) + "\n").encode())
+                except Exception:
+                    pass
+
+            elif action == "revoke_passkey":
+                passkey_id = str(msg.get("passkey_id", "") or "").strip()
+                if not passkey_id:
+                    try:
+                        sock.sendall((json.dumps({
+                            "action": "passkey_revoke_result",
+                            "ok": False,
+                            "reason": "Missing passkey id.",
+                        }) + "\n").encode())
+                    except Exception:
+                        pass
+                    continue
+                con = sqlite3.connect(DB)
+                res = con.execute(
+                    "UPDATE user_passkeys SET revoked=1 WHERE id=? AND username=?",
+                    (passkey_id, user),
+                )
+                con.commit()
+                changed = int(getattr(res, "rowcount", 0) or 0)
+                con.close()
+                try:
+                    sock.sendall((json.dumps({
+                        "action": "passkey_revoke_result",
+                        "ok": changed > 0,
+                        "passkey_id": passkey_id,
+                        "reason": "" if changed > 0 else "Passkey not found.",
+                    }) + "\n").encode())
+                except Exception:
+                    pass
+
             elif action == "invite_user":
                 target_user = str(msg.get("username", "")).strip()
                 method = str(msg.get("method", "email")).strip().lower()
@@ -1628,6 +1806,8 @@ def handle_client(cs, addr):
                             "/alert <message>  Send an alert to all online users\n"
                             "/create <user> <pass> [email]  Create an account\n"
                             "/invite <user> <email>  Email invite with magic signup link\n"
+                            "/accountlimit show  Show max accounts allowed per email (0=unlimited)\n"
+                            "/accountlimit set <number>  Set max accounts per email (1=single account)\n"
                             "/ban <user> <MM/DD/YYYY> <reason>  Ban a user until date\n"
                             "/unban <user>  Remove user ban\n"
                             "/del <user>  Delete a user\n"
@@ -1686,6 +1866,20 @@ def handle_client(cs, addr):
                                 response = f"Invite sent to {invite_email} for user '{invite_user}'."
                             else:
                                 response = f"Error: Invite email failed for {invite_email}."
+                    elif command == "accountlimit" and len(cmd_parts) >= 2:
+                        sub = str(cmd_parts[1] or "").strip().lower()
+                        if sub == "show":
+                            limit = _max_accounts_per_email()
+                            response = f"Current max accounts per email: {limit} (0 means unlimited)."
+                        elif sub == "set" and len(cmd_parts) >= 3:
+                            try:
+                                limit = max(0, int(str(cmd_parts[2]).strip()))
+                                _set_server_setting("max_accounts_per_email", str(limit))
+                                response = f"Updated max accounts per email to {limit}."
+                            except Exception:
+                                response = "Error: accountlimit set requires a non-negative integer."
+                        else:
+                            response = "Error: accountlimit syntax: /accountlimit show OR /accountlimit set <number>"
                     elif command == "ban" and len(cmd_parts) >= 4: 
                         handle_ban(cmd_parts[1], cmd_parts[2], " ".join(cmd_parts[3:]))
                         response = f"User '{cmd_parts[1]}' banned."

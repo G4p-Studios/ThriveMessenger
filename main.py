@@ -1,4 +1,4 @@
-import wx, socket, json, threading, datetime, wx.adv, configparser, ssl, sys, os, base64, uuid, subprocess, tempfile, re, random, shutil, time
+import wx, socket, json, threading, datetime, wx.adv, configparser, ssl, sys, os, base64, uuid, subprocess, tempfile, re, random, shutil, time, secrets
 import urllib.request, urllib.parse
 import traceback, platform
 import keyring
@@ -10,6 +10,7 @@ except Exception:
 VERSION_TAG = "v2026-alpha15.3"
 URL_REGEX = re.compile(r'(https?://[^\s<>()]+)')
 KEYRING_SERVICE = "ThriveMessenger"
+PASSKEY_KEYRING_SERVICE = "ThriveMessengerPasskey"
 DEFAULT_SOUNDPACK_BASE_URL = "https://im.tappedin.fm/thrive/sounds"
 DEFAULT_LOG_SUBMIT_URL = "https://im.tappedin.fm/thrive/logs"
 DEMO_VIDEOS = {
@@ -232,6 +233,46 @@ def _decode_password_fallback(value):
     except Exception:
         return ''
 
+def _passkey_account_for(username, settings=None, server_entry=None):
+    if not username:
+        return ""
+    if server_entry is not None:
+        server = normalize_server_entry(server_entry)
+    else:
+        server = _resolve_server_for_credentials(settings or {})
+    return f"{username}@{server.get('host', '').lower()}:{server.get('port', 2005)}"
+
+def _load_passkey_from_keyring(username, settings=None, server_entry=None):
+    account = _passkey_account_for(username, settings=settings, server_entry=server_entry)
+    if not account:
+        return ""
+    try:
+        return keyring.get_password(PASSKEY_KEYRING_SERVICE, account) or ""
+    except Exception as e:
+        print(f"Keyring error (passkey load): {e}")
+        return ""
+
+def _save_passkey_to_keyring(username, passkey_token, settings=None, server_entry=None):
+    account = _passkey_account_for(username, settings=settings, server_entry=server_entry)
+    if not account:
+        return False
+    try:
+        keyring.set_password(PASSKEY_KEYRING_SERVICE, account, str(passkey_token or ""))
+        return True
+    except Exception as e:
+        print(f"Keyring error (passkey save): {e}")
+        return False
+
+def _delete_passkey_from_keyring(username, settings=None, server_entry=None):
+    account = _passkey_account_for(username, settings=settings, server_entry=server_entry)
+    if not account:
+        return
+    try:
+        if keyring.get_password(PASSKEY_KEYRING_SERVICE, account):
+            keyring.delete_password(PASSKEY_KEYRING_SERVICE, account)
+    except Exception:
+        pass
+
 def _migrate_settings():
     old_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'user_settings.json')
     new_path = get_settings_path()
@@ -257,6 +298,7 @@ def load_user_config():
     settings = {
         'remember': False,
         'autologin': False,
+        'autologin_mode': 'password',
         'username': '',
         'password': '',
         'soundpack': 'default',
@@ -285,6 +327,7 @@ def load_user_config():
         'directory_dm_defaults': {},
         'incoming_popup_on_message': False,
         'incoming_alert_on_message': False,
+        'passkey_ids': {},
     }
 
     # 1. Load non-sensitive preferences from JSON
@@ -325,6 +368,10 @@ def load_user_config():
         settings['directory_dm_defaults'] = {}
     settings['incoming_popup_on_message'] = bool(settings.get('incoming_popup_on_message', False))
     settings['incoming_alert_on_message'] = bool(settings.get('incoming_alert_on_message', False))
+    if str(settings.get('autologin_mode', 'password') or 'password') not in ('password', 'passkey'):
+        settings['autologin_mode'] = 'password'
+    if not isinstance(settings.get('passkey_ids', {}), dict):
+        settings['passkey_ids'] = {}
 
     # 3. Load password from Keyring if "Remember me" is active
     if settings.get('username') and settings.get('remember'):
@@ -1624,10 +1671,17 @@ class ClientApp(wx.App):
         self.connected_server_names = set()
         self.transfer_history = []
         has_invite_launch = bool(self.launch_invite_context.get("invite_token"))
-        if self.user_config.get('autologin') and self.user_config.get('username') and self.user_config.get('password') and not has_invite_launch:
+        if self.user_config.get('autologin') and self.user_config.get('username') and not has_invite_launch:
             print("Attempting auto-login...")
             selected_server = resolve_default_server_entry(self.user_config)
-            success, sock, sf, reason = self.perform_login(self.user_config['username'], self.user_config['password'], selected_server)
+            mode = str(self.user_config.get('autologin_mode', 'password') or 'password')
+            if mode == 'passkey':
+                success, sock, sf, reason = self.perform_passkey_login(self.user_config['username'], selected_server)
+            else:
+                if not self.user_config.get('password'):
+                    success, sock, sf, reason = False, None, None, "Saved password is missing."
+                else:
+                    success, sock, sf, reason = self.perform_login(self.user_config['username'], self.user_config['password'], selected_server)
             if success: self.start_main_session(self.user_config['username'], sock, sf); return True
             else:
                 wx.MessageBox(f"Auto-login failed: {reason}", "Login Failed", wx.ICON_ERROR)
@@ -1676,7 +1730,10 @@ class ClientApp(wx.App):
             dlg = LoginDialog(None, self.user_config, invite_context=self.launch_invite_context)
             result = dlg.ShowModal()
             if result == wx.ID_OK:
-                success, sock, sf, _ = self.perform_login(dlg.username, dlg.password, dlg.selected_server)
+                if getattr(dlg, "login_mode", "password") == "passkey":
+                    success, sock, sf, _ = self.perform_passkey_login(dlg.username, dlg.selected_server)
+                else:
+                    success, sock, sf, _ = self.perform_login(dlg.username, dlg.password, dlg.selected_server)
                 if success:
                     self.user_config['server_entries'] = dlg.server_entries
                     self.user_config['last_server_name'] = dlg.selected_server.get('name', '')
@@ -1686,9 +1743,10 @@ class ClientApp(wx.App):
                         self.user_config['password'] = dlg.password
                         self.user_config['remember'] = True
                         self.user_config['autologin'] = dlg.autologin_checked
+                        self.user_config['autologin_mode'] = getattr(dlg, "login_mode", "password")
                     else:
                         # Clear sensitive data but keep generic settings
-                        self.user_config.update({'username': '', 'password': '', 'remember': False, 'autologin': False})
+                        self.user_config.update({'username': '', 'password': '', 'remember': False, 'autologin': False, 'autologin_mode': 'password'})
 
                     save_user_config(self.user_config)
                     self.start_main_session(dlg.username, sock, sf)
@@ -1701,6 +1759,7 @@ class ClientApp(wx.App):
                         'password': dlg.new_password,
                         'remember': True,
                         'autologin': True,
+                        'autologin_mode': 'password',
                         'soundpack': 'default',
                         'chat_logging': {},
                         'server_entries': dlg.server_entries,
@@ -1743,6 +1802,40 @@ class ClientApp(wx.App):
                     pass
             return False, None, None, str(e)
 
+    def perform_passkey_login(self, username, server_entry=None, suppress_errors=False, show_post_login=True):
+        try:
+            if server_entry:
+                set_active_server_config(server_entry)
+            token = _load_passkey_from_keyring(username, settings=self.user_config, server_entry=server_entry or SERVER_CONFIG)
+            if not token:
+                reason = "No passkey is saved for this account on the selected server."
+                if not suppress_errors:
+                    wx.MessageBox(reason, "Passkey Login Failed", wx.ICON_ERROR)
+                return False, None, None, reason
+            ssock = create_secure_socket(server_entry)
+            ssock.sendall(json.dumps({"action": "login_passkey", "user": username, "passkey_token": token}).encode() + b"\n")
+            sf = ssock.makefile()
+            resp = json.loads(sf.readline() or "{}")
+            if resp.get("status") == "ok":
+                self.session_password = ""
+                self.active_server_entry = normalize_server_entry(server_entry or SERVER_CONFIG)
+                info = fetch_server_welcome(server_entry or SERVER_CONFIG)
+                post_login = str(info.get('post_login', '') or '').strip()
+                if show_post_login and info.get('enabled') and post_login:
+                    show_notification("Server Message", post_login, timeout=8)
+                return True, ssock, sf, "Success"
+            reason = resp.get("reason", "Unknown error")
+            log_event("error", "passkey_login_failed", {"reason": reason})
+            if not suppress_errors:
+                wx.MessageBox("Passkey login failed: " + reason, "Login Failed", wx.ICON_ERROR)
+            ssock.close()
+            return False, None, None, reason
+        except Exception as e:
+            log_event("error", "passkey_login_connection_error", {"error": str(e)})
+            if not suppress_errors:
+                wx.MessageBox(f"A connection error occurred: {e}", "Connection Error", wx.ICON_ERROR)
+            return False, None, None, str(e)
+
     def _current_server_label(self):
         active = normalize_server_entry(getattr(self, "active_server_entry", SERVER_CONFIG))
         return active.get("name") or active.get("host") or "Server"
@@ -1778,21 +1871,33 @@ class ClientApp(wx.App):
 
     def _reconnect_worker(self):
         username = getattr(self, "username", "") or self.user_config.get("username", "")
+        mode = str(self.user_config.get("autologin_mode", "password") or "password")
         password = self.session_password or self.user_config.get("password", "")
-        if not username or not password:
+        if not username:
             self.reconnect_in_progress = False
             wx.CallAfter(show_notification, "Reconnect paused", "Saved login is not available. Sign in again when ready.", 7)
             return
         attempt = 0
         while not self.intentional_disconnect and not self.reconnect_stop_event.is_set():
             attempt += 1
-            success, sock, sf, reason = self.perform_login(
-                username,
-                password,
-                self.active_server_entry,
-                suppress_errors=True,
-                show_post_login=False,
-            )
+            if mode == "passkey":
+                success, sock, sf, reason = self.perform_passkey_login(
+                    username,
+                    self.active_server_entry,
+                    suppress_errors=True,
+                    show_post_login=False,
+                )
+            else:
+                if not password:
+                    success, sock, sf, reason = False, None, None, "Saved password is missing."
+                else:
+                    success, sock, sf, reason = self.perform_login(
+                        username,
+                        password,
+                        self.active_server_entry,
+                        suppress_errors=True,
+                        show_post_login=False,
+                    )
             if success:
                 wx.CallAfter(self._apply_reconnected_session, sock, sf)
                 return
@@ -2425,6 +2530,7 @@ class LoginDialog(wx.Dialog):
         super().__init__(parent, title="Login", size=(390, 470)); self.user_config = user_config
         self.invite_context = invite_context or {}
         self.invite_validation = None
+        self.login_mode = "password"
         self.Bind(wx.EVT_CHAR_HOOK, self.on_key)
         panel = wx.Panel(self); s = wx.BoxSizer(wx.VERTICAL)
         self.server_entries = dedupe_server_entries(self.user_config.get('server_entries', []))
@@ -2473,6 +2579,8 @@ class LoginDialog(wx.Dialog):
         self.remember_cb.Bind(wx.EVT_CHECKBOX, self.on_check_remember)
         
         login_btn = wx.Button(panel, label="&Login"); login_btn.Bind(wx.EVT_BUTTON, self.on_login)
+        passkey_btn = wx.Button(panel, label="Login with Passkey")
+        passkey_btn.Bind(wx.EVT_BUTTON, self.on_login_passkey)
         create_btn = wx.Button(panel, label="&Create Account..."); create_btn.Bind(wx.EVT_BUTTON, self.on_create_account)
         forgot_btn = wx.Button(panel, label="&Forgot Password?"); forgot_btn.Bind(wx.EVT_BUTTON, self.on_forgot)
 
@@ -2482,7 +2590,7 @@ class LoginDialog(wx.Dialog):
                 box.GetStaticBox().SetBackgroundColour(dark_color)
             for ctrl in [self.server_choice, self.u, self.p]:
                 ctrl.SetBackgroundColour(dark_color); ctrl.SetForegroundColour(light_text_color)
-            for btn in [manage_servers_btn, set_primary_btn, login_btn, create_btn, forgot_btn]:
+            for btn in [manage_servers_btn, set_primary_btn, login_btn, passkey_btn, create_btn, forgot_btn]:
                 btn.SetBackgroundColour(dark_color); btn.SetForegroundColour(light_text_color)
             self.remember_cb.SetForegroundColour(light_text_color); self.autologin_cb.SetForegroundColour(light_text_color)
 
@@ -2493,8 +2601,11 @@ class LoginDialog(wx.Dialog):
         s.Add(user_box, 0, wx.EXPAND | wx.ALL, 5); s.Add(pass_box, 0, wx.EXPAND | wx.ALL, 5)
         s.Add(self.remember_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10); s.Add(self.autologin_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         btn_sizer = wx.BoxSizer(wx.HORIZONTAL); 
-        btn_sizer.Add(login_btn, 1, wx.EXPAND | wx.ALL, 2); btn_sizer.Add(create_btn, 1, wx.EXPAND | wx.ALL, 2)
+        btn_sizer.Add(login_btn, 1, wx.EXPAND | wx.ALL, 2); btn_sizer.Add(passkey_btn, 1, wx.EXPAND | wx.ALL, 2)
+        btn_sizer2 = wx.BoxSizer(wx.HORIZONTAL)
+        btn_sizer2.Add(create_btn, 1, wx.EXPAND | wx.ALL, 2)
         s.Add(btn_sizer, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 5)
+        s.Add(btn_sizer2, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 5)
         s.Add(forgot_btn, 0, wx.ALIGN_CENTER | wx.ALL, 5)
         self.p.Bind(wx.EVT_TEXT_ENTER, self.on_login); panel.SetSizer(s); self.on_check_remember(None)
 
@@ -2643,8 +2754,30 @@ class LoginDialog(wx.Dialog):
     def on_login(self, _):
         u, p = self.u.GetValue(), self.p.GetValue()
         if not u or not p: wx.MessageBox("Username and password cannot be empty.", "Login Error", wx.ICON_ERROR); return
+        self.login_mode = "password"
         self.username = u
         self.password = p
+        self.remember_checked = self.remember_cb.IsChecked()
+        self.autologin_checked = self.autologin_cb.IsChecked()
+        for entry in self.server_entries:
+            entry['primary'] = (entry.get('name') == self.primary_server_name)
+        self.user_config['server_entries'] = self.server_entries
+        self.user_config['last_server_name'] = self.selected_server.get('name', '')
+        self.user_config['primary_server_name'] = self.primary_server_name
+        self.EndModal(wx.ID_OK)
+
+    def on_login_passkey(self, _):
+        u = self.u.GetValue().strip()
+        if not u:
+            wx.MessageBox("Username is required for passkey login.", "Login Error", wx.ICON_ERROR)
+            return
+        token = _load_passkey_from_keyring(u, settings=self.user_config, server_entry=self.selected_server)
+        if not token:
+            wx.MessageBox("No passkey is saved for this user on the selected server.", "Passkey Not Found", wx.ICON_ERROR)
+            return
+        self.login_mode = "passkey"
+        self.username = u
+        self.password = ""
         self.remember_checked = self.remember_cb.IsChecked()
         self.autologin_checked = self.autologin_cb.IsChecked()
         for entry in self.server_entries:
@@ -3374,6 +3507,8 @@ class MainFrame(wx.Frame):
         self.mi_bot_rules = file_menu.Append(wx.ID_ANY, "Manage Bot Rules")
         self.mi_group_policy = file_menu.Append(wx.ID_ANY, "Manage Group Policy")
         self.mi_settings = file_menu.Append(wx.ID_PREFERENCES, "Settings\tCmd+,")
+        self.mi_register_passkey = file_menu.Append(wx.ID_ANY, "Register Passkey For This Device")
+        self.mi_manage_devices = file_menu.Append(wx.ID_ANY, "Manage Signed-In Devices")
         file_menu.AppendSeparator()
         self.mi_logout = file_menu.Append(wx.ID_ANY, "Logout\tAlt+O")
         self.mi_exit = file_menu.Append(wx.ID_ANY, "Exit\tAlt+X")
@@ -3427,6 +3562,8 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.on_manage_bot_rules, self.mi_bot_rules)
         self.Bind(wx.EVT_MENU, self.on_manage_group_policy, self.mi_group_policy)
         self.Bind(wx.EVT_MENU, self.on_settings, self.mi_settings)
+        self.Bind(wx.EVT_MENU, self.on_register_passkey, self.mi_register_passkey)
+        self.Bind(wx.EVT_MENU, self.on_manage_devices, self.mi_manage_devices)
         self.Bind(wx.EVT_MENU, self.on_logout, self.mi_logout)
         self.Bind(wx.EVT_MENU, self.on_exit, self.mi_exit)
         self.Bind(wx.EVT_MENU, self.on_block_toggle, self.mi_block_toggle)
@@ -3531,6 +3668,112 @@ class MainFrame(wx.Frame):
         )
         if choice == wx.YES:
             open_path_or_url(clip_path)
+
+    def _passkey_map_key(self):
+        app = wx.GetApp()
+        active = normalize_server_entry(getattr(app, "active_server_entry", SERVER_CONFIG))
+        return _passkey_account_for(self.user, settings=app.user_config, server_entry=active)
+
+    def _list_passkeys(self):
+        try:
+            self.sock.sendall((json.dumps({"action": "list_passkeys"}) + "\n").encode())
+            resp = json.loads(wx.GetApp().sockfile.readline() or "{}")
+            if resp.get("action") == "passkey_list":
+                return resp.get("passkeys", [])
+        except Exception:
+            pass
+        return []
+
+    def on_register_passkey(self, _):
+        app = wx.GetApp()
+        default_label = f"Thrive Messenger - {self.user}"
+        with wx.TextEntryDialog(
+            self,
+            "Enter a name for this device passkey.\nLeave blank to use the default.",
+            "Register Passkey",
+            value=default_label,
+        ) as dlg:
+            if dlg.ShowModal() != wx.ID_OK:
+                return
+            label = dlg.GetValue().strip() or default_label
+        token = secrets.token_urlsafe(48)
+        try:
+            self.sock.sendall((json.dumps({
+                "action": "register_passkey",
+                "label": label,
+                "passkey_token": token,
+            }) + "\n").encode())
+            resp = json.loads(app.sockfile.readline() or "{}")
+        except Exception as e:
+            wx.MessageBox(f"Could not register passkey: {e}", "Passkey Error", wx.OK | wx.ICON_ERROR, self)
+            return
+        if not resp.get("ok"):
+            wx.MessageBox(resp.get("reason", "Unknown error"), "Passkey Error", wx.OK | wx.ICON_ERROR, self)
+            return
+        if not _save_passkey_to_keyring(self.user, token, settings=app.user_config, server_entry=app.active_server_entry):
+            wx.MessageBox("Passkey was registered on server but could not be saved in keychain.", "Passkey Warning", wx.OK | wx.ICON_WARNING, self)
+            return
+        passkey_ids = app.user_config.get("passkey_ids", {})
+        passkey_ids[self._passkey_map_key()] = str(resp.get("passkey_id", "") or "")
+        app.user_config["passkey_ids"] = passkey_ids
+        app.user_config["autologin_mode"] = "passkey"
+        save_user_config(app.user_config)
+        show_notification("Passkey Ready", f"Passkey registered for {label}.", timeout=6)
+        wx.MessageBox("Passkey registered. You can now use Login with Passkey.", "Passkey Ready", wx.OK | wx.ICON_INFORMATION, self)
+
+    def on_manage_devices(self, _):
+        app = wx.GetApp()
+        entries = self._list_passkeys()
+        if not entries:
+            wx.MessageBox("No registered devices were found for this account.", "Manage Devices", wx.OK | wx.ICON_INFORMATION, self)
+            return
+        count = len([e for e in entries if not e.get("revoked")])
+        labels = [f"{e.get('label', 'Device')} | created {e.get('created_at', '')}" for e in entries if not e.get("revoked")]
+        if not labels:
+            wx.MessageBox("All devices are already revoked.", "Manage Devices", wx.OK | wx.ICON_INFORMATION, self)
+            return
+        choice = wx.GetSingleChoiceIndex(
+            f"You are signed in on {count} device(s). Choose one to sign out, or cancel to keep all.",
+            "Manage Signed-In Devices",
+            labels,
+            self,
+        )
+        if choice == -1:
+            res_all = wx.MessageBox(
+                "Do you want to sign out all devices for this account?",
+                "Sign Out All Devices",
+                wx.YES_NO | wx.ICON_QUESTION,
+                self,
+            )
+            if res_all != wx.YES:
+                return
+            for entry in entries:
+                if entry.get("revoked"):
+                    continue
+                try:
+                    self.sock.sendall((json.dumps({"action": "revoke_passkey", "passkey_id": entry.get("id", "")}) + "\n").encode())
+                    _ = json.loads(app.sockfile.readline() or "{}")
+                except Exception:
+                    pass
+            _delete_passkey_from_keyring(self.user, settings=app.user_config, server_entry=app.active_server_entry)
+            show_notification("Devices Updated", "Signed out all devices.", timeout=5)
+            wx.MessageBox("All devices were signed out.", "Manage Devices", wx.OK | wx.ICON_INFORMATION, self)
+            return
+        target = [e for e in entries if not e.get("revoked")][choice]
+        try:
+            self.sock.sendall((json.dumps({"action": "revoke_passkey", "passkey_id": target.get("id", "")}) + "\n").encode())
+            resp = json.loads(app.sockfile.readline() or "{}")
+        except Exception as e:
+            wx.MessageBox(f"Could not revoke selected device: {e}", "Manage Devices", wx.OK | wx.ICON_ERROR, self)
+            return
+        if not resp.get("ok"):
+            wx.MessageBox(resp.get("reason", "Unknown revoke error"), "Manage Devices", wx.OK | wx.ICON_ERROR, self)
+            return
+        if str(target.get("id", "")) == str(app.user_config.get("passkey_ids", {}).get(self._passkey_map_key(), "")):
+            _delete_passkey_from_keyring(self.user, settings=app.user_config, server_entry=app.active_server_entry)
+        show_notification("Device Signed Out", f"{target.get('label', 'Device')} was signed out.", timeout=5)
+        wx.MessageBox("Selected device was signed out.", "Manage Devices", wx.OK | wx.ICON_INFORMATION, self)
+
     def on_settings(self, event):
         app = wx.GetApp()
         with SettingsDialog(self, app.user_config) as dlg:
