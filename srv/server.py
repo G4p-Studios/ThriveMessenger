@@ -172,6 +172,9 @@ def _ollama_bot_reply(sender_user, bot_name, text):
             "Give practical step-by-step instructions for chat, contacts, file transfer, server manager, settings, "
             "admin tools, and troubleshooting. Be concise, clear, and action-oriented. "
             "You can also handle normal friendly chat, but prioritize helping users use the app when they ask app questions. "
+            "Use a natural conversational style, not an instruction-manual tone. "
+            "If the user asks a direct question, answer directly first in one sentence, then add brief context if needed. "
+            "For status-style questions like 'who is online', provide the direct answer immediately. "
             "Avoid repeating the user's message. If a feature is unsupported, say that clearly and suggest alternatives."
         )
     if purpose:
