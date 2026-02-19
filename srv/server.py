@@ -2,6 +2,9 @@ import sqlite3, threading, socket, json, datetime, sys, configparser, ssl, os, u
 import smtplib, secrets
 import urllib.request, urllib.parse
 from email.mime.text import MIMEText
+from argon2 import PasswordHasher
+from argon2.exceptions import VerifyMismatchError, VerificationError, InvalidHashError
+_ph = PasswordHasher()
 
 DB = 'thrive.db'
 ADMIN_FILE = 'admins.txt'
@@ -1064,10 +1067,11 @@ def handle_client(cs, addr):
             verified = 1 if not smtp_config['enabled'] else 0
             code = EmailManager.generate_code() if not verified else None
             
+            hashed_pass = _ph.hash(new_pass)
             if row: # Overwriting unverified
-                con.execute("UPDATE users SET password=?, email=?, verification_code=?, is_verified=? WHERE username=?", (new_pass, email, code, verified, new_user))
+                con.execute("UPDATE users SET password=?, email=?, verification_code=?, is_verified=? WHERE username=?", (hashed_pass, email, code, verified, new_user))
             else:
-                con.execute("INSERT INTO users(username, password, email, verification_code, is_verified) VALUES(?,?,?,?,?)", (new_user, new_pass, email, code, verified))
+                con.execute("INSERT INTO users(username, password, email, verification_code, is_verified) VALUES(?,?,?,?,?)", (new_user, hashed_pass, email, code, verified))
             con.commit()
             con.close()
 
@@ -1134,7 +1138,7 @@ def handle_client(cs, addr):
             con = sqlite3.connect(DB)
             row = con.execute("SELECT reset_code FROM users WHERE username=?", (t_user,)).fetchone()
             if row and row[0] == t_code and t_code:
-                con.execute("UPDATE users SET password=?, reset_code=NULL WHERE username=?", (new_p, t_user))
+                con.execute("UPDATE users SET password=?, reset_code=NULL WHERE username=?", (_ph.hash(new_p), t_user))
                 con.commit(); con.close()
                 sock.sendall(json.dumps({"status": "ok"}).encode() + b"\n")
             else:
@@ -1174,7 +1178,23 @@ def handle_client(cs, addr):
             return
         row = rows[0] if rows else None
 
-        if not row or row[1] != req["pass"]:
+        if not row:
+            sock.sendall(b'{"status":"error","reason":"Invalid credentials"}\n')
+            db.close()
+            return
+        stored = row[1]
+        ok = False
+        needs_rehash = False
+        if stored.startswith("$argon2"):
+            try: _ph.verify(stored, req["pass"]); ok = True; needs_rehash = _ph.check_needs_rehash(stored)
+            except (VerifyMismatchError, VerificationError, InvalidHashError): pass
+        else:
+            ok = (stored == req["pass"])
+            if ok: needs_rehash = True
+        if ok and needs_rehash:
+            db.execute("UPDATE users SET password=? WHERE username=?", (_ph.hash(req["pass"]), row[0]))
+            db.commit()
+        if not ok:
             sock.sendall(b'{"status":"error","reason":"Invalid credentials"}\n')
             db.close()
             return
@@ -2216,7 +2236,7 @@ def handle_create(user, password, email=""):
     con = sqlite3.connect(DB)
     existing = con.execute("SELECT 1 FROM users WHERE LOWER(username)=LOWER(?)", (user,)).fetchone()
     if not existing:
-        con.execute("INSERT INTO users(username,password,email,is_verified) VALUES(?,?,?,1)", (user, password, email))
+        con.execute("INSERT INTO users(username,password,email,is_verified) VALUES(?,?,?,1)", (user, _ph.hash(password), email))
         con.commit(); con.close()
         print(f"User '{user}' created.")
         return True
