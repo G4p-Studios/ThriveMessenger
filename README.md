@@ -2,9 +2,9 @@
 
 ## Introduction
 
-Thrive Messenger is an instant messaging service that aims to bring back the speed, simplicity, accessibility, fun and excitement of instant messengers from the 90s and 2000s, such as AIM, ICQ and MSN/Windows Live Messenger. It is not a revival project like [Escargot Chat](https://escargot.chat). Rather, it is an entirely new IM platform built from scratch. We're not reviving any old services, we're reviving the vibe of those services.
+Thrive Messenger is an instant messaging service that aims to bring back the speed, simplicity, fun and excitement of instant messengers from the 90s and 2000s, such as AIM, ICQ and MSN/Windows Live Messenger. It is not a revival project like [Escargot Chat](https://escargot.chat). Rather, it is an entirely new IM platform built from scratch. We're not reviving any old services, we're reviving the vibe of those services.
 
-Part of the Thrive Essentials suite of software from G4p Studios, Thrive Messenger features a simplistic, accessible user interface that is easy to navigate and use for those who rely on screen readers such as [NVDA](https://nvaccess.org) and [JAWS](https://www.freedomscientific.com/products/software/jaws/). It achieves this with clear labels for UI elements, buttons, text fields, checkboxes etc, and keyboard friendly navigation, allowing the user to use their arrow keys and the tab key to move around menus and other parts of the UI.
+Part of the Thrive Essentials suite of software from G4p Studios, Thrive Messenger features a simplistic, accessible user interface that is easy to navigate and use for those who rely on screen readers such as [NVDA](https://nvaccess.org) and [JAWS](https://www.freedomscientific.com/products/software/jaws/). It achieves this with clear labels for UI elements, buttons, text fields, checkboxes etc, optional auto reading of new messages, and keyboard friendly navigation, allowing the user to use their arrow keys and the tab key to move around menus and other parts of the UI. Back in the day, this level of accessibility either required screen reader vendors to optimise their readers to work with the IM software, or third party scripts and screen reader add-ons from the blind community. Thrive Messenger is designed to be accessible by default, so the program works with the screen reader, not the other way round. Just how the 2000s should have been.
 
 Thrive Messenger is open source, meaning anyone is free to download, view and modify the source code, and decentralised, meaning anyone can host their own Thrive Messenger Server.
 
@@ -222,13 +222,29 @@ Example cron (every 5 minutes):
 */5 * * * * /path/to/ThriveMessenger/srv/scripts/sync_update_feed.sh Raywonder/ThriveMessenger /var/www/im.tappedin.fm/updates/latest.json >/var/log/thrive-update-feed.log 2>&1
 ```
 
+### Auto reading of messages
+
+In the settings dialog accessible with Alt + T, there is an option to have new messages automatically read aloud by your screen reader. This is turned off by default for sighted users.
+
+### The user directory
+
+The user directory, Alt + Y, allows you to quickly find and chat with anyone on your Thrive Messenger server. The user directory is divided into 4 tabs, allowing you to choose between seeing online users, offline users, admins, and the server's entire userbase.
+
+### Offline chats
+
+Think you might have missed messages when you were offline? No problem. When you log back in, the program will check the server for held messages, and if it sees any, will show a dialog asking if you want to see the messages. Clicking yes will show a list of users who sent you messages. Simple press enter on a user to open the chat and see their messages.
+
+### Non-contact chats
+
+Someone sends you a message and they aren't in your contacts. You get to chatting with them for a bit, but then you close the chat to do other things and realise you forgot to add your newfound friend as a contact. This is where the non-contact conversations view comes in. Just like with offline chats, when you open this dialog with Alt C, you will see a list of users who aren't in your contacts but have been chatting with you, allowing you to easily return to the chat and add them if you wish.
+
 * * *
 
 ## Server usage
 
 ### Running the server
 
-The Thrive Messenger server is also written in Python, but it is standard library, meaning it does not require any external dependencies to run.
+The Thrive Messenger server is also written in Python. It is almost standard library, meaning it does not require any external dependencies to run, save for the argon2-cffi library used for hashing passwords.
 Note: the server will technically run on both Windows and Linux, but the following instructions are optimised for Linux, so you will need a Linux machine either in the cloud or on your local network.
 
 1. If for some reason git is not installed on your machine, install it with these commands, substituting apt for your distro's package manager.
@@ -250,26 +266,33 @@ Note: the server will technically run on both Windows and Linux, but the followi
     cd ThriveMessenger/srv
     ```
 
-4. Make a screen session so you're not constantly tied to the terminal when running the server.
+4. Install the argon2-cffi library.
+
+    ```
+    pip3 install --break-system-packages argon2-cffi
+    ```
+
+Note: we aren't actually breaking any packages here, we're just using that argument to stop pip whining about virtual environments.
+
+5. Make a screen session so you're not constantly tied to the terminal when running the server.
 
     ```
     screen -S thrive
     ```
 
-5. Ensure the server's port is allowed through the firewall.
+6. Ensure the server's port is allowed through the firewall.
 
     ```
     sudo ufw allow 2005
     ```
 
-
-6. Finally, runn the server.
+7. Finally, runn the server.
 
     ```
     python3 server.py
     ```
 
-6. Detach yourself from the screen session by pressing Control + A, then press D.
+8. Detach yourself from the screen session by pressing Control + A, then press D.
 
 Please note: the server will run in unencrypted mode by default, meaning data sent from the client will be sent in plain text. This should only be used for testing servers. In a production environment, you must use valid SSL certificates from a trusted certificate authority such as Let's Encrypt.
 
@@ -324,8 +347,6 @@ There are 2 config options available for customising file transfer restrictions 
     blackfiles=exe,bat,cmd,app,vbs
     ```
 .
-
-* * *
 
 * * *
 
