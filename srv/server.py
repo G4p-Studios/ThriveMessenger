@@ -1498,7 +1498,28 @@ def handle_client(cs, addr):
                 else:
                     cmd_parts = msg.get("cmd", "").split()
                     command = cmd_parts[0].lower() if cmd_parts else ""
-                    if command == "exit" and len(cmd_parts) == 1:
+                    if command in ("help", "?"):
+                        response = (
+                            "To get more help, type ? or help!\n"
+                            "Server command help:\n"
+                            "/help or /?  Show this help\n"
+                            "/alert <message>  Send an alert to all online users\n"
+                            "/create <user> <pass> [email]  Create an account\n"
+                            "/ban <user> <MM/DD/YYYY> <reason>  Ban a user until date\n"
+                            "/unban <user>  Remove user ban\n"
+                            "/del <user>  Delete a user\n"
+                            "/admin <user>  Grant admin role\n"
+                            "/unadmin <user>  Remove admin role\n"
+                            "/banfile <user> <ext|all> [MM/DD/YYYY] <reason>  Ban file uploads\n"
+                            "/unbanfile <user> [ext]  Remove file upload ban\n"
+                            "/gpolicy show [group]  Show group policy\n"
+                            "/gpolicy set <key> <value> [group]  Set group policy key\n"
+                            "/gpolicy reset [group]  Reset group policy to defaults\n"
+                            "/gpolicy keys  List available group policy keys\n"
+                            "/restart  Restart server after configured timeout\n"
+                            "/exit  Shut down server after configured timeout"
+                        )
+                    elif command == "exit" and len(cmd_parts) == 1:
                         print(f"Shutdown initiated by admin: {user}")
                         broadcast_alert(f"The server is shutting down in {shutdown_timeout} seconds.")
                         time.sleep(shutdown_timeout)
@@ -1582,7 +1603,7 @@ def handle_client(cs, addr):
                         else:
                             response = "Error: gpolicy syntax: /gpolicy show [group], /gpolicy set <key> <value> [group], /gpolicy reset [group], /gpolicy keys"
                     else:
-                        response = "Error: Unknown command or incorrect syntax."
+                        response = "Error: Unknown command or incorrect syntax. To get more help, type ? or help!"
                 try: sock.sendall((json.dumps({"action":"admin_response", "response": response})+"\n").encode())
                 except: pass
 

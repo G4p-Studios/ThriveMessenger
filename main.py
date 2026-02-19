@@ -4251,7 +4251,8 @@ class AdminDialog(wx.Dialog):
         # Use a single ListBox for better screen-reader navigation.
         self.hist = wx.ListBox(self, style=wx.LB_SINGLE)
         self.hist.SetToolTip("Command responses history. Use arrow keys to review responses.")
-        box_msg = wx.StaticBoxSizer(wx.VERTICAL, self, "&Enter command (e.g., /create user pass)"); self.input_ctrl = wx.TextCtrl(box_msg.GetStaticBox(), style=wx.TE_PROCESS_ENTER)
+        box_msg = wx.StaticBoxSizer(wx.VERTICAL, self, "&Enter command (e.g., /create user pass or /help)"); self.input_ctrl = wx.TextCtrl(box_msg.GetStaticBox(), style=wx.TE_PROCESS_ENTER)
+        self.input_ctrl.SetToolTip("To get more help, type ? or help! You can also use /help or /?.")
         btn = wx.Button(self, label="&Send Command")
         btn_rules = wx.Button(self, label="Manage Bot Rules")
         btn_group_policy = wx.Button(self, label="Manage Group Policy")
@@ -4282,8 +4283,16 @@ class AdminDialog(wx.Dialog):
     def on_send(self, _):
         cmd = self.input_ctrl.GetValue().strip()
         if not cmd: return
-        if not cmd.startswith('/'): self.append_response("Error: Commands must start with /"); return
-        msg = {"action":"admin_cmd", "cmd": cmd[1:]}; self.sock.sendall(json.dumps(msg).encode()+b"\n"); self.input_ctrl.Clear(); self.input_ctrl.SetFocus()
+        normalized = cmd
+        if cmd in ("help", "?"):
+            normalized = "/help"
+        elif cmd in ("/?",):
+            normalized = "/help"
+        if not normalized.startswith('/'):
+            self.append_response("Error: Commands must start with /. To get more help, type ? or help!")
+            return
+        msg = {"action":"admin_cmd", "cmd": normalized[1:]}
+        self.sock.sendall(json.dumps(msg).encode()+b"\n"); self.input_ctrl.Clear(); self.input_ctrl.SetFocus()
     def on_bot_rules(self, _):
         parent = self.GetParent()
         if parent and hasattr(parent, "on_manage_bot_rules"):
