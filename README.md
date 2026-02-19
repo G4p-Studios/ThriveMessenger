@@ -259,8 +259,8 @@ You can also control update sources in `client.conf`:
 ```
 [updates]
 feed_url = https://im.tappedin.fm/updates/latest.json
-preferred_repo = Raywonder/ThriveMessenger
-fallback_repos = G4p-Studios/ThriveMessenger
+preferred_repo = G4p-Studios/ThriveMessenger
+fallback_repos = Raywonder/ThriveMessenger
 ```
 
 - `feed_url` is optional. If set, the client checks your hosted feed first.

@@ -737,15 +737,15 @@ def _load_update_settings():
     cfg = configparser.ConfigParser(interpolation=None)
     cfg.read('client.conf')
     update_feed_url = cfg.get('updates', 'feed_url', fallback='').strip()
-    preferred_repo = cfg.get('updates', 'preferred_repo', fallback='Raywonder/ThriveMessenger').strip()
-    fallback_repos = [x.strip() for x in cfg.get('updates', 'fallback_repos', fallback='G4p-Studios/ThriveMessenger').split(',') if x.strip()]
+    preferred_repo = cfg.get('updates', 'preferred_repo', fallback='G4p-Studios/ThriveMessenger').strip()
+    fallback_repos = [x.strip() for x in cfg.get('updates', 'fallback_repos', fallback='Raywonder/ThriveMessenger').split(',') if x.strip()]
     repos = []
     for candidate in [preferred_repo] + fallback_repos:
         if '/' in candidate and candidate not in repos:
             repos.append(candidate)
     return {
         "feed_url": update_feed_url,
-        "repos": repos or ["Raywonder/ThriveMessenger", "G4p-Studios/ThriveMessenger"],
+        "repos": repos or ["G4p-Studios/ThriveMessenger", "Raywonder/ThriveMessenger"],
     }
 
 def get_program_dir():
@@ -1200,11 +1200,11 @@ class SettingsDialog(wx.Dialog):
         feed_row.Add(self.admin_feed_txt, 1, wx.EXPAND)
         pref_row = wx.BoxSizer(wx.HORIZONTAL)
         pref_row.Add(wx.StaticText(admin_box.GetStaticBox(), label="Preferred repo:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
-        self.admin_pref_repo_txt = wx.TextCtrl(admin_box.GetStaticBox(), value=cfg.get('updates', 'preferred_repo', fallback='Raywonder/ThriveMessenger'))
+        self.admin_pref_repo_txt = wx.TextCtrl(admin_box.GetStaticBox(), value=cfg.get('updates', 'preferred_repo', fallback='G4p-Studios/ThriveMessenger'))
         pref_row.Add(self.admin_pref_repo_txt, 1, wx.EXPAND)
         fallback_row = wx.BoxSizer(wx.HORIZONTAL)
         fallback_row.Add(wx.StaticText(admin_box.GetStaticBox(), label="Fallback repos:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
-        self.admin_fallback_txt = wx.TextCtrl(admin_box.GetStaticBox(), value=cfg.get('updates', 'fallback_repos', fallback='G4p-Studios/ThriveMessenger'))
+        self.admin_fallback_txt = wx.TextCtrl(admin_box.GetStaticBox(), value=cfg.get('updates', 'fallback_repos', fallback='Raywonder/ThriveMessenger'))
         fallback_row.Add(self.admin_fallback_txt, 1, wx.EXPAND)
         self.restart_after_save_cb = wx.CheckBox(admin_box.GetStaticBox(), label="Restart server after saving admin settings")
         self.restart_after_save_cb.SetValue(False)
@@ -3773,7 +3773,7 @@ class MainFrame(wx.Frame):
                 asset_url = UPDATE_CONTEXT.get("installer_url") if use_installer else (UPDATE_CONTEXT.get("win_zip_url") or UPDATE_CONTEXT.get("zip_url"))
 
         if not asset_url:
-            repo = UPDATE_CONTEXT.get("repo") if UPDATE_CONTEXT.get("repo") else "Raywonder/ThriveMessenger"
+            repo = UPDATE_CONTEXT.get("repo") if UPDATE_CONTEXT.get("repo") else "G4p-Studios/ThriveMessenger"
             api_url = f"https://api.github.com/repos/{repo}/releases/tags/{tag}"
             try:
                 req = urllib.request.Request(api_url, headers={"Accept": "application/vnd.github+json", "User-Agent": "ThriveMessenger/" + VERSION_TAG})
