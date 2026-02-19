@@ -11,6 +11,7 @@ lock = threading.Lock()
 smtp_config = {}
 flexpbx_config = {}
 file_config = {}
+bot_runtime_config = {}
 shutdown_timeout = 5
 max_status_length = 50
 pending_transfers = {}
@@ -52,21 +53,23 @@ def _status_for_user(username):
 def _maybe_send_bot_reply(sender_sock, sender_user, to_user, text):
     if to_user not in bot_usernames:
         return False
-    lower = (text or "").strip().lower()
-    if not lower:
-        reply = "I'm online and ready. Ask me for help, commands, or server status."
-    elif any(w in lower for w in ("hi", "hello", "hey")):
-        reply = f"Hi {sender_user}. I'm {to_user}. How can I help?"
-    elif "help" in lower:
-        reply = "You can ask me about status, contacts, file transfers, or admin features."
-    elif "status" in lower:
-        reply = "I can report server presence and room/user status where available."
-    elif "file" in lower:
-        reply = "File transfers are available from chat and user menus. Check File Transfers for history."
-    elif "admin" in lower:
-        reply = "Admin actions are available from Server Side Commands and admin menus, based on your role."
-    else:
-        reply = "Message received. Ask 'help' to see what I can do."
+    reply = _ollama_bot_reply(sender_user, to_user, text)
+    if not reply:
+        lower = (text or "").strip().lower()
+        if not lower:
+            reply = "I'm online and ready. Ask me for help, commands, or server status."
+        elif any(w in lower for w in ("hi", "hello", "hey")):
+            reply = f"Hi {sender_user}. I'm {to_user}. How can I help?"
+        elif "help" in lower:
+            reply = "You can ask me about status, contacts, file transfers, or admin features."
+        elif "status" in lower:
+            reply = "I can report server presence and room/user status where available."
+        elif "file" in lower:
+            reply = "File transfers are available from chat and user menus. Check File Transfers for history."
+        elif "admin" in lower:
+            reply = "Admin actions are available from Server Side Commands and admin menus, based on your role."
+        else:
+            reply = "I couldn't reach the model right now. Ask again in a moment."
     payload = {
         "action": "msg",
         "from": to_user,
@@ -79,6 +82,57 @@ def _maybe_send_bot_reply(sender_sock, sender_user, to_user, text):
     except Exception:
         pass
     return True
+
+def _ollama_bot_reply(sender_user, bot_name, text):
+    if not bot_runtime_config.get('ollama_enabled', False):
+        return None
+    base_url = str(bot_runtime_config.get('ollama_url', 'http://127.0.0.1:11434')).rstrip('/')
+    model = str(bot_runtime_config.get('ollama_model', 'llama3.2')).strip() or 'llama3.2'
+    timeout = int(bot_runtime_config.get('ollama_timeout', 20) or 20)
+    purpose = bot_purpose_map.get(bot_name, "").strip()
+    system_prompt = str(bot_runtime_config.get('ollama_system_prompt', '') or '').strip()
+    if not system_prompt:
+        system_prompt = (
+            "You are the Thrive Messenger assistant bot. "
+            "You help users with any app-related task and you know the Thrive Messenger client and server features. "
+            "Give practical step-by-step instructions for chat, contacts, file transfer, server manager, settings, "
+            "admin tools, and troubleshooting. Be concise, clear, and action-oriented. "
+            "You can also handle normal friendly chat, but prioritize helping users use the app when they ask app questions. "
+            "Avoid repeating the user's message. If a feature is unsupported, say that clearly and suggest alternatives."
+        )
+    if purpose:
+        system_prompt += f" Your role on this server: {purpose}."
+    user_text = (text or "").strip()
+    if not user_text:
+        user_text = "Introduce yourself and explain how you can help in one short message."
+
+    payload = {
+        "model": model,
+        "stream": False,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"User '{sender_user}' says: {user_text}"}
+        ]
+    }
+    req = urllib.request.Request(
+        f"{base_url}/api/chat",
+        data=json.dumps(payload).encode('utf-8'),
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode('utf-8', errors='replace')
+        data = json.loads(raw)
+        message = data.get("message", {}) if isinstance(data, dict) else {}
+        content = message.get("content", "") if isinstance(message, dict) else ""
+        content = str(content or "").strip()
+        if not content:
+            return None
+        return content[:700]
+    except Exception as e:
+        print(f"Ollama bot reply failed for {bot_name}: {e}")
+        return None
 
 class EmailManager:
     @staticmethod
@@ -224,6 +278,14 @@ def load_config():
     bot_status_map = _parse_bot_map(config.get('bots', 'status_map', fallback=''))
     global bot_purpose_map
     bot_purpose_map = _parse_bot_map(config.get('bots', 'purpose_map', fallback=''))
+    global bot_runtime_config
+    bot_runtime_config = {
+        'ollama_enabled': config.getboolean('bots', 'ollama_enabled', fallback=True),
+        'ollama_url': config.get('bots', 'ollama_url', fallback='http://127.0.0.1:11434'),
+        'ollama_model': config.get('bots', 'ollama_model', fallback='llama3.2'),
+        'ollama_timeout': config.getint('bots', 'ollama_timeout', fallback=20),
+        'ollama_system_prompt': config.get('bots', 'ollama_system_prompt', fallback=''),
+    }
     return {
         'port': config.getint('server', 'port', fallback=5005),
         'certfile': config.get('server', 'certfile', fallback='server.crt'),

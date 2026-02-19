@@ -3396,7 +3396,8 @@ class ChatDialog(wx.Dialog):
         self.typing_lbl = wx.StaticText(self, label="")
         self.typing_lbl.SetForegroundColour(wx.Colour(120, 180, 255))
         box_msg = wx.StaticBoxSizer(wx.VERTICAL, self, "Type &message")
-        self.input_ctrl = wx.TextCtrl(box_msg.GetStaticBox(), style=wx.TE_MULTILINE)
+        self.input_ctrl = wx.TextCtrl(box_msg.GetStaticBox(), style=wx.TE_MULTILINE | wx.TE_PROCESS_ENTER)
+        self._consume_next_text_enter = False
         btn = wx.Button(self, label="&Send")
         btn_file = wx.Button(self, label="Send &File")
 
@@ -3412,6 +3413,7 @@ class ChatDialog(wx.Dialog):
         s.Add(self.typing_lbl, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
         self.input_ctrl.Bind(wx.EVT_KEY_DOWN, self.on_input_key)
         self.input_ctrl.Bind(wx.EVT_CHAR_HOOK, self.on_input_key)
+        self.input_ctrl.Bind(wx.EVT_TEXT_ENTER, self.on_text_enter)
         self.input_ctrl.Bind(wx.EVT_TEXT, self.on_input_text)
         box_msg.Add(self.input_ctrl, 1, wx.EXPAND|wx.ALL, 5)
         s.Add(box_msg, 1, wx.EXPAND|wx.ALL, 5)
@@ -3447,20 +3449,25 @@ class ChatDialog(wx.Dialog):
     def on_input_key(self, event):
         keycode = event.GetKeyCode()
         if keycode in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
+            self._consume_next_text_enter = True
             if event.ControlDown():
                 self.on_send_file(None)
                 return
-            elif event.CmdDown():
+            elif event.CmdDown() or event.ShiftDown():
                 self.input_ctrl.WriteText('\n')
                 return
             else:
-                enter_action = wx.GetApp().user_config.get('enter_key_action', 'send')
-                if enter_action == 'newline':
-                    self.input_ctrl.WriteText('\n')
-                else:
-                    self.on_send(None)
+                # Keep chat input deterministic on macOS and Windows:
+                # Enter sends, Cmd/Shift+Enter inserts newline, Ctrl+Enter sends file.
+                self.on_send(None)
                 return
         event.Skip()
+
+    def on_text_enter(self, event):
+        if self._consume_next_text_enter:
+            self._consume_next_text_enter = False
+            return
+        self.on_send(None)
     def on_input_text(self, event):
         app = wx.GetApp()
         if app.user_config.get('typing_indicators', True):
