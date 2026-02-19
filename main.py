@@ -14,7 +14,7 @@ def speak(text):
         try: _ao2.speak(text, interrupt=True)
         except Exception: pass
 
-VERSION_TAG = "v2026-alpha15.2"
+VERSION_TAG = "v2026-alpha15.3"
 if sys.platform == 'win32':
     from winotify import Notification as _WinNotification
 else:
@@ -1473,16 +1473,21 @@ class MainFrame(wx.Frame):
                 # like VMware Workstation report as disabled when the VM has
                 # input capture, but can still legitimately receive foreground.
                 our_pid = ctypes.windll.kernel32.GetCurrentProcessId()
+                _found = ctypes.c_void_p(0)
                 EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
                 def _find_other(hwnd, _):
                     if not ctypes.windll.user32.IsWindowVisible(hwnd): return True
                     pid = ctypes.c_ulong(0)
                     ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-                    if pid.value != our_pid:
-                        ctypes.windll.user32.SetForegroundWindow(hwnd)
-                        return False
+                    if pid.value != our_pid: _found.value = hwnd; return False
                     return True
                 ctypes.windll.user32.EnumWindows(EnumWindowsProc(_find_other), None)
+                # Call SetForegroundWindow *after* EnumWindows returns — calling it
+                # inside the callback deadlocks NVDA (EnumWindows holds a window-list
+                # lock; SetForegroundWindow fires NVDA's WinEvent hooks which try to
+                # enumerate windows, causing a ~6 s watchdog-recovered freeze).
+                if _found.value:
+                    ctypes.windll.user32.SetForegroundWindow(_found.value)
             for child in self.GetChildren():
                 if isinstance(child, ChatDialog) and child.IsShown():
                     child._restore_from_tray = True; child.Hide()
