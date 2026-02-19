@@ -1,4 +1,4 @@
-import sqlite3, threading, socket, json, datetime, sys, configparser, ssl, os, uuid, base64, time
+import sqlite3, threading, socket, json, datetime, sys, configparser, ssl, os, uuid, base64, time, subprocess, tempfile
 import smtplib, secrets
 import urllib.request, urllib.parse
 from email.mime.text import MIMEText
@@ -23,6 +23,8 @@ bot_usernames = set()
 bot_status_map = {}
 bot_purpose_map = {}
 bot_service_map = {}
+bot_voice_map = {}
+docs_cache = {}
 restart_lock = threading.Lock()
 restart_scheduled_for = None
 
@@ -41,6 +43,58 @@ def _parse_bot_map(raw):
         if name and value:
             out[name] = value
     return out
+
+def _load_docs_text():
+    key = "docs_text"
+    if key in docs_cache:
+        return docs_cache[key]
+    roots = [
+        os.path.abspath(os.path.join(os.path.dirname(__file__), "..")),
+        os.getcwd(),
+    ]
+    candidates = []
+    for root in roots:
+        candidates.extend([
+            os.path.join(root, "README.md"),
+            os.path.join(root, "F1_HELP.md"),
+            os.path.join(root, "HELP.md"),
+            os.path.join(root, "docs", "README.md"),
+        ])
+    chunks = []
+    for path in candidates:
+        if os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    chunks.append(f"# Source: {os.path.basename(path)}\n{f.read()}")
+            except Exception:
+                pass
+    docs_text = "\n\n".join(chunks)
+    docs_cache[key] = docs_text
+    return docs_text
+
+def _documentation_context_for_query(query, max_chars=2500):
+    docs_text = _load_docs_text()
+    if not docs_text:
+        return ""
+    q = str(query or "").lower()
+    words = [w for w in q.replace("\n", " ").split(" ") if len(w) >= 4]
+    words = words[:8]
+    if not words:
+        return docs_text[:max_chars]
+    lines = docs_text.splitlines()
+    matched = []
+    for i, line in enumerate(lines):
+        ll = line.lower()
+        if any(w in ll for w in words):
+            start = max(0, i - 1)
+            end = min(len(lines), i + 2)
+            matched.extend(lines[start:end])
+            if len("\n".join(matched)) >= max_chars:
+                break
+    snippet = "\n".join(matched).strip()
+    if not snippet:
+        snippet = docs_text[:max_chars]
+    return snippet[:max_chars]
 
 def _active_usernames():
     with lock:
@@ -81,6 +135,7 @@ def _maybe_send_bot_reply(sender_sock, sender_user, to_user, text):
             reply = "Admin actions are available from Server Side Commands and admin menus, based on your role."
         else:
             reply = "I couldn't reach the model right now. Ask again in a moment."
+    tts_payload = _build_bot_tts_payload(to_user, reply, text)
     payload = {
         "action": "msg",
         "from": to_user,
@@ -88,6 +143,8 @@ def _maybe_send_bot_reply(sender_sock, sender_user, to_user, text):
         "time": datetime.datetime.now().isoformat(),
         "msg": reply,
     }
+    if tts_payload:
+        payload.update(tts_payload)
     try:
         sender_sock.sendall((json.dumps(payload) + "\n").encode())
     except Exception:
@@ -127,12 +184,19 @@ def _ollama_bot_reply(sender_user, bot_name, text):
     user_text = (text or "").strip()
     if not user_text:
         user_text = "Introduce yourself and explain how you can help in one short message."
+    docs_context = _documentation_context_for_query(user_text)
+    if docs_context:
+        system_prompt += (
+            " Always verify feature and usage answers against the documentation context provided. "
+            "If docs do not confirm a detail, say it is not documented/uncertain instead of guessing."
+        )
 
     payload = {
         "model": model,
         "stream": False,
         "messages": [
             {"role": "system", "content": system_prompt},
+            {"role": "system", "content": f"Documentation context:\n{docs_context}" if docs_context else "Documentation context unavailable."},
             {"role": "user", "content": f"User '{sender_user}' says: {user_text}"}
         ]
     }
@@ -155,6 +219,80 @@ def _ollama_bot_reply(sender_user, bot_name, text):
     except Exception as e:
         print(f"Ollama bot reply failed for {bot_name}: {e}")
         return None
+
+def _build_bot_tts_payload(bot_name, reply_text, request_text):
+    if not bot_runtime_config.get('piper_enabled', False):
+        return None
+    reply = str(reply_text or "").strip()
+    if not reply:
+        return None
+    # If users ask how they sound, provide a clear voice-preview response.
+    asked_preview = any(
+        k in str(request_text or "").lower()
+        for k in ("how i sound", "how do i sound", "hear my voice", "my voice")
+    )
+    if asked_preview:
+        reply += " I can preview my configured voice. To hear your own real voice, send a recording and I can play it back."
+    audio = _synthesize_bot_tts(bot_name, reply)
+    if not audio:
+        return None
+    return {
+        "tts_audio_b64": audio,
+        "tts_mime": "audio/wav",
+        "tts_voice": _bot_voice_name(bot_name),
+        "tts_engine": "piper",
+    }
+
+def _bot_voice_name(bot_name):
+    voice = str(bot_voice_map.get(bot_name, "") or "").strip()
+    if not voice:
+        voice = str(bot_runtime_config.get('piper_default_voice', '') or '').strip()
+    return voice or "default"
+
+def _resolve_piper_model(bot_name):
+    voice_model = _bot_voice_name(bot_name)
+    models_dir = str(bot_runtime_config.get('piper_models_dir', './voices') or './voices').strip()
+    if voice_model.endswith(".onnx"):
+        if os.path.isabs(voice_model):
+            return voice_model
+        return os.path.join(models_dir, voice_model)
+    if os.path.isabs(voice_model):
+        return voice_model
+    return os.path.join(models_dir, f"{voice_model}.onnx")
+
+def _synthesize_bot_tts(bot_name, text):
+    piper_bin = str(bot_runtime_config.get('piper_bin', '/usr/local/bin/piper') or '/usr/local/bin/piper').strip()
+    model_path = _resolve_piper_model(bot_name)
+    if not os.path.isfile(model_path):
+        print(f"Piper model missing for {bot_name}: {model_path}")
+        return None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+            out_path = tmp.name
+        cmd = [piper_bin, "--model", model_path, "--output_file", out_path]
+        proc = subprocess.run(
+            cmd,
+            input=str(text).encode("utf-8"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=max(3, int(bot_runtime_config.get('piper_timeout', 12) or 12)),
+            check=False,
+        )
+        if proc.returncode != 0:
+            print(f"Piper synthesis failed for {bot_name}: {proc.stderr.decode('utf-8', errors='ignore')[:300]}")
+            return None
+        with open(out_path, "rb") as f:
+            audio = base64.b64encode(f.read()).decode("ascii")
+        return audio
+    except Exception as e:
+        print(f"Piper synthesis error for {bot_name}: {e}")
+        return None
+    finally:
+        try:
+            if 'out_path' in locals() and os.path.exists(out_path):
+                os.remove(out_path)
+        except Exception:
+            pass
 
 def _schedule_restart(delay_seconds, requested_by="admin"):
     global restart_scheduled_for
@@ -337,6 +475,8 @@ def load_config():
     bot_purpose_map = _parse_bot_map(config.get('bots', 'purpose_map', fallback=''))
     global bot_service_map
     bot_service_map = _parse_bot_map(config.get('bots', 'service_map', fallback=''))
+    global bot_voice_map
+    bot_voice_map = _parse_bot_map(config.get('bots', 'voice_map', fallback=''))
     global bot_runtime_config
     bot_runtime_config = {
         'ollama_enabled': config.getboolean('bots', 'ollama_enabled', fallback=True),
@@ -344,6 +484,11 @@ def load_config():
         'ollama_model': config.get('bots', 'ollama_model', fallback='llama3.2'),
         'ollama_timeout': config.getint('bots', 'ollama_timeout', fallback=20),
         'ollama_system_prompt': config.get('bots', 'ollama_system_prompt', fallback=''),
+        'piper_enabled': config.getboolean('bots', 'piper_enabled', fallback=False),
+        'piper_bin': config.get('bots', 'piper_bin', fallback='/usr/local/bin/piper'),
+        'piper_models_dir': config.get('bots', 'piper_models_dir', fallback='./voices'),
+        'piper_default_voice': config.get('bots', 'piper_default_voice', fallback='en_US-lessac-medium'),
+        'piper_timeout': config.getint('bots', 'piper_timeout', fallback=12),
     }
     return {
         'port': config.getint('server', 'port', fallback=5005),

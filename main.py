@@ -616,6 +616,34 @@ def speak_text(text):
     except Exception as e:
         print(f"TTS speak failed: {e}")
 
+def play_tts_audio_from_message(msg):
+    try:
+        b64 = str(msg.get("tts_audio_b64", "") or "").strip()
+        if not b64:
+            return False
+        audio = base64.b64decode(b64)
+        if not audio:
+            return False
+        tts_dir = os.path.join(get_config_dir(), "tts_cache")
+        os.makedirs(tts_dir, exist_ok=True)
+        voice_name = str(msg.get("tts_voice", "bot")).strip().replace("/", "_")
+        path = os.path.join(tts_dir, f"{voice_name}-{uuid.uuid4().hex}.wav")
+        with open(path, "wb") as f:
+            f.write(audio)
+        sound = wx.adv.Sound(path)
+        if sound.IsOk():
+            sound.Play(wx.adv.SOUND_ASYNC)
+            threading.Timer(25.0, lambda: os.path.exists(path) and os.remove(path)).start()
+            return True
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+        return False
+    except Exception as e:
+        print(f"Bot TTS playback failed: {e}")
+        return False
+
 def open_help_docs_for_context(context, parent):
     docs = ensure_help_docs()
     target = docs.get(context) or docs.get("general")
@@ -3582,6 +3610,9 @@ class MainFrame(wx.Frame):
         current = is_chat_logging_enabled(app.user_config, c)
         app.user_config['chat_logging'][c] = not current
         save_user_config(app.user_config)
+        chat = self.get_chat(c)
+        if chat:
+            chat.logging_enabled = bool(app.user_config['chat_logging'].get(c, not current))
         state = "enabled" if not current else "disabled"
         show_notification("Chat history", f"Chat history {state} for {c}.", timeout=5)
     def on_search(self, event):
@@ -3708,7 +3739,8 @@ class MainFrame(wx.Frame):
             dlg = ChatDialog(self, msg["from"], self.sock, self.user, is_logging_enabled, is_contact=is_contact)
         dlg.Show()
         dlg.append(msg["msg"], msg["from"], msg["time"])
-        if app.user_config.get('read_messages_aloud', False):
+        played_bot_tts = play_tts_audio_from_message(msg)
+        if app.user_config.get('read_messages_aloud', False) and not played_bot_tts:
             speak_text(f"{msg['from']}: {msg['msg']}")
     def on_typing_event(self, msg):
         from_user = msg.get("from")
@@ -3843,6 +3875,12 @@ class ChatDialog(wx.Dialog):
         s.Add(btn_sizer, 0, wx.EXPAND|wx.ALL, 5)
         self.SetSizer(s)
         self._focus_input()
+    def _is_logging_enabled_now(self):
+        app = wx.GetApp()
+        try:
+            return is_chat_logging_enabled(app.user_config, self.contact)
+        except Exception:
+            return bool(self.logging_enabled)
     def _focus_input(self):
         wx.CallAfter(self.input_ctrl.SetFocus)
         wx.CallLater(120, self.input_ctrl.SetFocus)
@@ -4007,7 +4045,7 @@ class ChatDialog(wx.Dialog):
         app = wx.GetApp()
         if sender not in (self.user, "System") and app.user_config.get('read_messages_aloud', False):
             speak_text(f"{sender} says {text}")
-        if self.logging_enabled:
+        if self._is_logging_enabled_now():
             log_line = f"[{formatted_time}] {sender}: {text}\n"
             self._save_message_to_log(log_line)
     def append_error(self, reason):
