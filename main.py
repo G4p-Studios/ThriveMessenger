@@ -12,6 +12,23 @@ URL_REGEX = re.compile(r'(https?://[^\s<>()]+)')
 KEYRING_SERVICE = "ThriveMessenger"
 DEFAULT_SOUNDPACK_BASE_URL = "https://im.tappedin.fm/thrive/sounds"
 DEFAULT_LOG_SUBMIT_URL = "https://im.tappedin.fm/thrive/logs"
+DEMO_VIDEOS = {
+    "onboarding": {
+        "filename": "promo-onboarding.mp4",
+        "title": "Onboarding Demo",
+        "description": "Shows the first-run experience: launching the app, signing in, and landing on the contact list."
+    },
+    "chat_files": {
+        "filename": "promo-chat-files.mp4",
+        "title": "Chat and File Demo",
+        "description": "Shows selecting a contact, sending a message, and sending files with transfer confirmation."
+    },
+    "admin_tools": {
+        "filename": "promo-admin-tools.mp4",
+        "title": "Admin Tools Demo",
+        "description": "Shows opening Server Manager, reviewing multiple servers, and updating primary server settings."
+    },
+}
 _KEYRING_WRITE_CACHE = {}
 _SOUND_DOWNLOAD_NOTICE_CACHE = set()
 _SOUND_DOWNLOAD_FAILURE_CACHE = set()
@@ -2584,7 +2601,13 @@ class MainFrame(wx.Frame):
 
         help_menu = wx.Menu()
         self.mi_help = help_menu.Append(wx.ID_ANY, "Help\tF1")
-        self.mi_demo_videos = help_menu.Append(wx.ID_ANY, "Open Demo Videos Folder")
+        demo_menu = wx.Menu()
+        self.mi_demo_onboarding = demo_menu.Append(wx.ID_ANY, "Watch Onboarding Demo")
+        self.mi_demo_chat_files = demo_menu.Append(wx.ID_ANY, "Watch Chat and File Demo")
+        self.mi_demo_admin_tools = demo_menu.Append(wx.ID_ANY, "Watch Admin Tools Demo")
+        demo_menu.AppendSeparator()
+        self.mi_demo_videos = demo_menu.Append(wx.ID_ANY, "Open Demo Videos Folder")
+        help_menu.AppendSubMenu(demo_menu, "Watch Demo Videos")
         self.mi_submit_logs = help_menu.Append(wx.ID_ANY, "Submit Diagnostic Logs")
 
         menubar.Append(file_menu, "&File")
@@ -2619,6 +2642,9 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, lambda e: self._set_sort_mode("name_desc"), self.mi_sort_name_desc)
         self.Bind(wx.EVT_MENU, lambda e: self._set_sort_mode("status"), self.mi_sort_status)
         self.Bind(wx.EVT_MENU, lambda e: open_help_docs_for_context("main", self), self.mi_help)
+        self.Bind(wx.EVT_MENU, lambda e: self.on_watch_demo_video("onboarding"), self.mi_demo_onboarding)
+        self.Bind(wx.EVT_MENU, lambda e: self.on_watch_demo_video("chat_files"), self.mi_demo_chat_files)
+        self.Bind(wx.EVT_MENU, lambda e: self.on_watch_demo_video("admin_tools"), self.mi_demo_admin_tools)
         self.Bind(wx.EVT_MENU, self.on_open_demo_videos, self.mi_demo_videos)
         self.Bind(wx.EVT_MENU, self.on_submit_logs, self.mi_submit_logs)
 
@@ -2671,6 +2697,32 @@ class MainFrame(wx.Frame):
 
     def on_open_demo_videos(self, _):
         open_path_or_url(get_demo_videos_dir())
+
+    def on_watch_demo_video(self, key):
+        meta = DEMO_VIDEOS.get(key)
+        if not meta:
+            return
+        demo_dir = get_demo_videos_dir()
+        clip_path = os.path.join(demo_dir, meta["filename"])
+        description = meta["description"]
+        if wx.GetApp().user_config.get('read_messages_aloud', False):
+            speak_text(f"{meta['title']}. {description}")
+        if not os.path.isfile(clip_path):
+            wx.MessageBox(
+                f"{meta['title']} is not available yet.\n\nExpected file:\n{clip_path}\n\nDescription:\n{description}",
+                "Demo Video Missing",
+                wx.OK | wx.ICON_INFORMATION,
+                self,
+            )
+            return
+        choice = wx.MessageBox(
+            f"{meta['title']}\n\nDescription:\n{description}\n\nOpen this video now?",
+            "Watch Demo Video",
+            wx.YES_NO | wx.ICON_QUESTION,
+            self,
+        )
+        if choice == wx.YES:
+            open_path_or_url(clip_path)
     def on_settings(self, event):
         app = wx.GetApp()
         with SettingsDialog(self, app.user_config) as dlg:
