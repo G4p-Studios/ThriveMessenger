@@ -1830,6 +1830,10 @@ class ClientApp(wx.App):
             except Exception: pass
         wx.CallLater(250, self.play_startup_sound)
         threading.Thread(target=self.listen_loop, daemon=True).start()
+        try:
+            self.sock.sendall((json.dumps({"action": "get_feature_caps"}) + "\n").encode())
+        except Exception:
+            pass
         self.frame.on_check_updates(silent=True)
 
     def _resolved_sound_pack(self):
@@ -1916,6 +1920,7 @@ class ClientApp(wx.App):
                 elif act == "group_call_result": wx.CallAfter(self.frame.on_group_call_result, msg)
                 elif act == "group_call_signal": wx.CallAfter(self.frame.on_group_call_signal, msg)
                 elif act == "group_call_signal_result": wx.CallAfter(self.frame.on_group_call_signal_result, msg)
+                elif act == "feature_caps": wx.CallAfter(self.frame.set_feature_caps, msg.get("caps", {}))
                 elif act == "banned_kick": wx.CallAfter(self.on_banned); handled = True; break
         except (IOError, json.JSONDecodeError, ValueError):
             print("Disconnected from server.")
@@ -3083,6 +3088,7 @@ class MainFrame(wx.Frame):
         super().__init__(None, title="", size=(400,380)); self.user, self.sock = user, sock; self.task_bar_icon = None; self.is_exiting = False; self._directory_dlg = None; self._bot_rules_dlg = None; self._group_policy_dlg = None; self._group_call_dlg = None
         self.refresh_connection_title(connected=True)
         self.current_status = wx.GetApp().user_config.get('status', 'online')
+        self.feature_caps = {}
         self._empty_prompt_shown = False
         self._sort_mode = "name_asc"
         self._unread_counts = {}
@@ -3150,6 +3156,55 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_CHAR_HOOK, self.on_key)
         self.apply_action_button_layout()
         self.update_button_states()
+        self.apply_feature_visibility()
+
+    def _feature(self, key):
+        return self.feature_caps.get(key, {})
+
+    def _feature_can_use(self, key):
+        cap = self._feature(key)
+        if not cap:
+            return True
+        return bool(cap.get("enabled", False) and cap.get("can_use", False))
+
+    def _feature_ui_visible(self, key):
+        cap = self._feature(key)
+        if not cap:
+            return True
+        return bool(cap.get("enabled", False) and cap.get("ui_visible", True))
+
+    def set_feature_caps(self, caps):
+        if not isinstance(caps, dict):
+            return
+        self.feature_caps = caps
+        self.apply_feature_visibility()
+
+    def apply_feature_visibility(self):
+        group_calls_visible = self._feature_ui_visible("group_call")
+        group_calls_enabled = self._feature_can_use("group_call")
+        self.mi_group_calls.Enable(group_calls_enabled)
+        self.mi_group_calls.SetItemLabel("Group Calls" if group_calls_visible else "Group Calls (Hidden by server policy)")
+
+        server_mgr_visible = self._feature_ui_visible("server_manager")
+        server_mgr_enabled = self._feature_can_use("server_manager")
+        self.mi_server_manager.Enable(server_mgr_enabled and server_mgr_visible)
+
+        bot_rules_visible = self._feature_ui_visible("bot_rules")
+        bot_rules_enabled = self._feature_can_use("bot_rules")
+        self.mi_bot_rules.Enable(bot_rules_enabled and bot_rules_visible)
+
+        group_policy_visible = self._feature_ui_visible("group_policy")
+        group_policy_enabled = self._feature_can_use("group_policy")
+        self.mi_group_policy.Enable(group_policy_enabled and group_policy_visible)
+
+        admin_visible = self._feature_ui_visible("admin_console")
+        admin_enabled = self._feature_can_use("admin_console")
+        self.mi_admin_visible = admin_visible
+        self.btn_admin.Show(admin_visible)
+        self.btn_admin.Enable(admin_enabled and admin_visible)
+        if hasattr(self, "btn_settings"):
+            self.btn_settings.Refresh()
+        self.Layout()
 
     def apply_action_button_layout(self):
         show_actions = bool(wx.GetApp().user_config.get('show_main_action_buttons', True))
@@ -3157,7 +3212,7 @@ class MainFrame(wx.Frame):
             btn.Show(show_actions)
         # Keep add contact and admin visible for keyboard/tab workflow.
         self.btn_add.Show(True)
-        self.btn_admin.Show(True)
+        self.btn_admin.Show(bool(getattr(self, "mi_admin_visible", True)))
         if self._root_sizer:
             self._root_sizer.Layout()
 
@@ -3388,6 +3443,8 @@ class MainFrame(wx.Frame):
         app = wx.GetApp()
         current_server_name = getattr(app, "active_server_entry", {}).get("name", "Current Server")
         users = msg.get("users", [])
+        if not self._feature_can_use("bots"):
+            users = [u for u in users if not bool(u.get("is_bot"))]
         for u in users:
             u["server"] = u.get("server", current_server_name)
         dlg = UserDirectoryDialog(self, users, self.user, self.contact_states)
@@ -3409,6 +3466,9 @@ class MainFrame(wx.Frame):
         self.sock.sendall(json.dumps({"action": "server_info"}).encode() + b"\n")
 
     def on_server_manager(self, _):
+        if not self._feature_can_use("server_manager"):
+            wx.MessageBox("Server Manager is disabled for your account on this server.", "Feature Disabled", wx.OK | wx.ICON_INFORMATION)
+            return
         app = wx.GetApp()
         entries = dedupe_server_entries(app.user_config.get('server_entries', []))
         if not entries:
@@ -3439,6 +3499,9 @@ class MainFrame(wx.Frame):
                 names.add(uname)
         return sorted(names, key=lambda x: x.lower())
     def on_manage_bot_rules(self, _):
+        if not self._feature_can_use("bot_rules"):
+            wx.MessageBox("Bot rules are disabled for your account on this server.", "Feature Disabled", wx.OK | wx.ICON_INFORMATION)
+            return
         dlg = self._bot_rules_dlg
         if dlg and dlg.IsShown():
             dlg.Raise()
@@ -3447,6 +3510,9 @@ class MainFrame(wx.Frame):
         self._bot_rules_dlg = BotRulesDialog(self, self.sock, self._known_bot_names())
         self._bot_rules_dlg.Show()
     def on_manage_group_policy(self, _):
+        if not self._feature_can_use("group_policy"):
+            wx.MessageBox("Group policy management is disabled for your account on this server.", "Feature Disabled", wx.OK | wx.ICON_INFORMATION)
+            return
         dlg = self._group_policy_dlg
         if dlg and dlg.IsShown():
             dlg.Raise()
@@ -3800,6 +3866,9 @@ class MainFrame(wx.Frame):
         with FileTransfersDialog(self, wx.GetApp().transfer_history) as dlg:
             dlg.ShowModal()
     def on_group_calls(self, _):
+        if not self._feature_can_use("group_call"):
+            wx.MessageBox("Group calls are disabled for your account on this server.", "Feature Disabled", wx.OK | wx.ICON_INFORMATION)
+            return
         dlg = self._group_call_dlg
         if dlg and dlg.IsShown():
             dlg.Raise()
@@ -3943,7 +4012,13 @@ class MainFrame(wx.Frame):
                 base_status = c["status"].replace(" (Admin)", "")
                 c["status"] = base_status + " (Admin)" if is_admin else base_status; break
         self._apply_search_filter()
-    def on_admin(self, _): dlg = self.get_admin_dialog() or AdminDialog(self, self.sock); dlg.Show(); dlg.input_ctrl.SetFocus()
+    def on_admin(self, _):
+        if not self._feature_can_use("admin_console"):
+            wx.MessageBox("Admin console is disabled for your account on this server.", "Feature Disabled", wx.OK | wx.ICON_INFORMATION)
+            return
+        dlg = self.get_admin_dialog() or AdminDialog(self, self.sock)
+        dlg.Show()
+        dlg.input_ctrl.SetFocus()
     def get_admin_dialog(self):
         for child in self.GetChildren():
             if isinstance(child, AdminDialog): return child

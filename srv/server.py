@@ -33,6 +33,15 @@ restart_lock = threading.Lock()
 restart_scheduled_for = None
 group_call_sessions = {}
 group_call_lock = threading.Lock()
+FEATURE_DEFAULTS = {
+    "bots": {"enabled": True, "ui_visible": True, "scope": "all", "description": "Bot contacts and bot chat features."},
+    "bot_rules": {"enabled": True, "ui_visible": True, "scope": "admin", "description": "Bot rules management features."},
+    "group_chat": {"enabled": True, "ui_visible": True, "scope": "all", "description": "Group chat create/join/send features."},
+    "group_call": {"enabled": True, "ui_visible": True, "scope": "all", "description": "Group call session and signaling features."},
+    "group_policy": {"enabled": True, "ui_visible": True, "scope": "admin", "description": "Group policy management features."},
+    "admin_console": {"enabled": True, "ui_visible": True, "scope": "admin", "description": "Server side admin command console."},
+    "server_manager": {"enabled": True, "ui_visible": True, "scope": "all", "description": "Server manager and server tools UI."},
+}
 
 GROUP_POLICY_SCHEMA = {
     "allow_group_text": ("bool", True, "Allow users to send text messages in groups."),
@@ -162,6 +171,126 @@ def _group_call_snapshot(group_name):
         participants = sorted(list(data.get("participants", set())))
         mode = data.get("mode", "voice")
     return {"group": group_name, "mode": mode, "participants": participants, "count": len(participants)}
+
+def _is_valid_feature_scope(scope):
+    return str(scope or "").strip().lower() in ("all", "admin", "allowlist")
+
+def _seed_feature_defaults():
+    con = sqlite3.connect(DB)
+    for key, meta in FEATURE_DEFAULTS.items():
+        row = con.execute("SELECT 1 FROM feature_policies WHERE feature_key=?", (key,)).fetchone()
+        if row:
+            continue
+        con.execute(
+            """
+            INSERT INTO feature_policies(feature_key, enabled, ui_visible, scope, description, updated_by, updated_at)
+            VALUES(?,?,?,?,?,?,?)
+            """,
+            (
+                key,
+                1 if meta.get("enabled", True) else 0,
+                1 if meta.get("ui_visible", True) else 0,
+                str(meta.get("scope", "all")),
+                str(meta.get("description", "")),
+                "system",
+                datetime.datetime.utcnow().isoformat(),
+            ),
+        )
+    con.commit()
+    con.close()
+
+def _feature_policy_row(feature_key):
+    fk = str(feature_key or "").strip()
+    if fk not in FEATURE_DEFAULTS:
+        return None
+    con = sqlite3.connect(DB)
+    row = con.execute(
+        "SELECT enabled, ui_visible, scope, description FROM feature_policies WHERE feature_key=?",
+        (fk,),
+    ).fetchone()
+    con.close()
+    if not row:
+        meta = FEATURE_DEFAULTS[fk]
+        return {
+            "feature_key": fk,
+            "enabled": bool(meta.get("enabled", True)),
+            "ui_visible": bool(meta.get("ui_visible", True)),
+            "scope": str(meta.get("scope", "all")),
+            "description": str(meta.get("description", "")),
+        }
+    return {
+        "feature_key": fk,
+        "enabled": bool(int(row[0] or 0)),
+        "ui_visible": bool(int(row[1] or 0)),
+        "scope": str(row[2] or "all"),
+        "description": str(row[3] or ""),
+    }
+
+def _feature_user_allowed(feature_key, username):
+    con = sqlite3.connect(DB)
+    row = con.execute(
+        "SELECT 1 FROM feature_allow_users WHERE feature_key=? AND username=?",
+        (feature_key, username),
+    ).fetchone()
+    con.close()
+    return bool(row)
+
+def _feature_group_allowed(feature_key, username):
+    con = sqlite3.connect(DB)
+    groups = [r[0] for r in con.execute("SELECT group_name FROM user_access_groups WHERE username=?", (username,)).fetchall()]
+    if not groups:
+        con.close()
+        return False
+    placeholders = ",".join(["?"] * len(groups))
+    params = [feature_key] + groups
+    row = con.execute(
+        f"SELECT 1 FROM feature_allow_groups WHERE feature_key=? AND group_name IN ({placeholders}) LIMIT 1",
+        params,
+    ).fetchone()
+    con.close()
+    return bool(row)
+
+def _can_user_use_feature(username, feature_key):
+    policy = _feature_policy_row(feature_key)
+    if not policy:
+        return False
+    if not policy.get("enabled", False):
+        return False
+    scope = str(policy.get("scope", "all")).lower()
+    is_admin = username in get_admins()
+    if scope == "all":
+        return True
+    if scope == "admin":
+        return is_admin
+    if scope == "allowlist":
+        if is_admin:
+            return True
+        return _feature_user_allowed(feature_key, username) or _feature_group_allowed(feature_key, username)
+    return False
+
+def _feature_caps_for_user(username):
+    caps = {}
+    for fk in sorted(FEATURE_DEFAULTS.keys()):
+        p = _feature_policy_row(fk) or {}
+        caps[fk] = {
+            "enabled": bool(p.get("enabled", False)),
+            "ui_visible": bool(p.get("ui_visible", False)),
+            "scope": str(p.get("scope", "all")),
+            "can_use": bool(_can_user_use_feature(username, fk)),
+        }
+    return caps
+
+def _send_feature_caps(sock, username):
+    try:
+        sock.sendall((json.dumps({"action": "feature_caps", "caps": _feature_caps_for_user(username)}) + "\n").encode())
+    except Exception:
+        pass
+
+def _broadcast_feature_caps():
+    with lock:
+        targets = list(clients.items())
+    for uname, sock in targets:
+        _send_feature_caps(sock, uname)
 
 def _group_call_broadcast(group_name, payload, exclude=None):
     targets = []
@@ -853,6 +982,10 @@ def init_db():
     cur.execute('''CREATE TABLE IF NOT EXISTS bot_tokens (owner TEXT, bot TEXT, token TEXT, created_at TEXT, PRIMARY KEY(owner, bot))''')
     cur.execute('''CREATE TABLE IF NOT EXISTS bot_rule_overrides (owner TEXT, bot TEXT, rules TEXT, updated_at TEXT, PRIMARY KEY(owner, bot))''')
     cur.execute('''CREATE TABLE IF NOT EXISTS group_policies (scope TEXT, group_name TEXT, policy_json TEXT, updated_by TEXT, updated_at TEXT, PRIMARY KEY(scope, group_name))''')
+    cur.execute('''CREATE TABLE IF NOT EXISTS feature_policies (feature_key TEXT PRIMARY KEY, enabled INTEGER DEFAULT 1, ui_visible INTEGER DEFAULT 1, scope TEXT DEFAULT 'all', description TEXT, updated_by TEXT, updated_at TEXT)''')
+    cur.execute('''CREATE TABLE IF NOT EXISTS feature_allow_users (feature_key TEXT, username TEXT, PRIMARY KEY(feature_key, username))''')
+    cur.execute('''CREATE TABLE IF NOT EXISTS user_access_groups (group_name TEXT, username TEXT, PRIMARY KEY(group_name, username))''')
+    cur.execute('''CREATE TABLE IF NOT EXISTS feature_allow_groups (feature_key TEXT, group_name TEXT, PRIMARY KEY(feature_key, group_name))''')
     cur.execute('''CREATE TABLE IF NOT EXISTS file_bans (username TEXT, file_type TEXT, until_date TEXT, reason TEXT, PRIMARY KEY(username, file_type))''')
     # Add file_type column if table was created with an older schema
     fb_cols = [row[1] for row in cur.execute("PRAGMA table_info(file_bans)")]
@@ -860,6 +993,7 @@ def init_db():
     if 'until_date' not in fb_cols: cur.execute("ALTER TABLE file_bans ADD COLUMN until_date TEXT")
     if 'reason' not in fb_cols: cur.execute("ALTER TABLE file_bans ADD COLUMN reason TEXT")
     conn.commit()
+    _seed_feature_defaults()
     conn.close()
 
 def broadcast_contact_status(user, online):
@@ -1069,6 +1203,7 @@ def handle_client(cs, addr):
         rows = db.execute("SELECT contact,blocked FROM contacts WHERE owner=?", (user,)).fetchall()
         contacts = [{"user":c, "blocked":b, "online": _is_online_user(c), "is_admin": (c in admins), "status_text": _status_for_user(c)} for c,b in rows]
         sock.sendall((json.dumps({"action":"contact_list","contacts":contacts})+"\n").encode())
+        _send_feature_caps(sock, user)
         db.close()
         
         broadcast_contact_status(user, True)
@@ -1076,8 +1211,176 @@ def handle_client(cs, addr):
         for line in f:
             msg = json.loads(line)
             action = msg.get("action")
+            def _deny_feature(feature_key, action_name=None):
+                try:
+                    sock.sendall((json.dumps({
+                        "action": action_name or "feature_denied",
+                        "ok": False,
+                        "reason": f"Feature '{feature_key}' is not enabled for your account.",
+                        "feature": feature_key
+                    }) + "\n").encode())
+                except Exception:
+                    pass
             
-            if action == "add_contact":
+            if action == "get_feature_caps":
+                _send_feature_caps(sock, user)
+
+            elif action == "get_feature_policies":
+                if not _is_admin(user):
+                    _deny_feature("admin_console", "feature_policy_result")
+                    continue
+                rows = []
+                for fk in sorted(FEATURE_DEFAULTS.keys()):
+                    p = _feature_policy_row(fk) or {}
+                    rows.append(p)
+                try:
+                    sock.sendall((json.dumps({"action": "feature_policies", "ok": True, "policies": rows}) + "\n").encode())
+                except Exception:
+                    pass
+
+            elif action == "set_feature_policy":
+                if not _is_admin(user):
+                    _deny_feature("admin_console", "feature_policy_result")
+                    continue
+                fk = str(msg.get("feature_key", "")).strip()
+                if fk not in FEATURE_DEFAULTS:
+                    try:
+                        sock.sendall((json.dumps({"action": "feature_policy_result", "ok": False, "reason": "Unknown feature key."}) + "\n").encode())
+                    except Exception:
+                        pass
+                    continue
+                enabled = 1 if bool(msg.get("enabled", True)) else 0
+                ui_visible = 1 if bool(msg.get("ui_visible", True)) else 0
+                scope = str(msg.get("scope", "all") or "all").strip().lower()
+                if not _is_valid_feature_scope(scope):
+                    scope = "all"
+                desc = str(msg.get("description", FEATURE_DEFAULTS[fk].get("description", "")) or "").strip()
+                con = sqlite3.connect(DB)
+                con.execute(
+                    """
+                    INSERT OR REPLACE INTO feature_policies(feature_key, enabled, ui_visible, scope, description, updated_by, updated_at)
+                    VALUES(?,?,?,?,?,?,?)
+                    """,
+                    (fk, enabled, ui_visible, scope, desc, user, datetime.datetime.utcnow().isoformat()),
+                )
+                con.commit()
+                con.close()
+                _broadcast_feature_caps()
+                try:
+                    sock.sendall((json.dumps({"action": "feature_policy_result", "ok": True, "policy": _feature_policy_row(fk)}) + "\n").encode())
+                except Exception:
+                    pass
+
+            elif action == "feature_allow_user_add":
+                if not _is_admin(user):
+                    _deny_feature("admin_console", "feature_allow_result")
+                    continue
+                fk = str(msg.get("feature_key", "")).strip()
+                target_user = str(msg.get("username", "")).strip()
+                if fk not in FEATURE_DEFAULTS or not target_user:
+                    sock.sendall((json.dumps({"action": "feature_allow_result", "ok": False, "reason": "feature_key and username are required."}) + "\n").encode())
+                    continue
+                con = sqlite3.connect(DB)
+                con.execute("INSERT OR IGNORE INTO feature_allow_users(feature_key, username) VALUES(?,?)", (fk, target_user))
+                con.commit()
+                con.close()
+                _broadcast_feature_caps()
+                sock.sendall((json.dumps({"action": "feature_allow_result", "ok": True, "feature_key": fk, "username": target_user}) + "\n").encode())
+
+            elif action == "feature_allow_user_remove":
+                if not _is_admin(user):
+                    _deny_feature("admin_console", "feature_allow_result")
+                    continue
+                fk = str(msg.get("feature_key", "")).strip()
+                target_user = str(msg.get("username", "")).strip()
+                if fk not in FEATURE_DEFAULTS or not target_user:
+                    sock.sendall((json.dumps({"action": "feature_allow_result", "ok": False, "reason": "feature_key and username are required."}) + "\n").encode())
+                    continue
+                con = sqlite3.connect(DB)
+                con.execute("DELETE FROM feature_allow_users WHERE feature_key=? AND username=?", (fk, target_user))
+                con.commit()
+                con.close()
+                _broadcast_feature_caps()
+                sock.sendall((json.dumps({"action": "feature_allow_result", "ok": True, "feature_key": fk, "username": target_user}) + "\n").encode())
+
+            elif action == "feature_access_group_add":
+                if not _is_admin(user):
+                    _deny_feature("admin_console", "feature_group_result")
+                    continue
+                gname = str(msg.get("group_name", "")).strip()
+                target_user = str(msg.get("username", "")).strip()
+                if not gname or not target_user:
+                    sock.sendall((json.dumps({"action": "feature_group_result", "ok": False, "reason": "group_name and username are required."}) + "\n").encode())
+                    continue
+                con = sqlite3.connect(DB)
+                con.execute("INSERT OR IGNORE INTO user_access_groups(group_name, username) VALUES(?,?)", (gname, target_user))
+                con.commit()
+                con.close()
+                _broadcast_feature_caps()
+                sock.sendall((json.dumps({"action": "feature_group_result", "ok": True, "group_name": gname, "username": target_user}) + "\n").encode())
+
+            elif action == "feature_access_group_remove":
+                if not _is_admin(user):
+                    _deny_feature("admin_console", "feature_group_result")
+                    continue
+                gname = str(msg.get("group_name", "")).strip()
+                target_user = str(msg.get("username", "")).strip()
+                if not gname or not target_user:
+                    sock.sendall((json.dumps({"action": "feature_group_result", "ok": False, "reason": "group_name and username are required."}) + "\n").encode())
+                    continue
+                con = sqlite3.connect(DB)
+                con.execute("DELETE FROM user_access_groups WHERE group_name=? AND username=?", (gname, target_user))
+                con.commit()
+                con.close()
+                _broadcast_feature_caps()
+                sock.sendall((json.dumps({"action": "feature_group_result", "ok": True, "group_name": gname, "username": target_user}) + "\n").encode())
+
+            elif action == "feature_allow_group_add":
+                if not _is_admin(user):
+                    _deny_feature("admin_console", "feature_allow_group_result")
+                    continue
+                fk = str(msg.get("feature_key", "")).strip()
+                gname = str(msg.get("group_name", "")).strip()
+                if fk not in FEATURE_DEFAULTS or not gname:
+                    sock.sendall((json.dumps({"action": "feature_allow_group_result", "ok": False, "reason": "feature_key and group_name are required."}) + "\n").encode())
+                    continue
+                con = sqlite3.connect(DB)
+                con.execute("INSERT OR IGNORE INTO feature_allow_groups(feature_key, group_name) VALUES(?,?)", (fk, gname))
+                con.commit()
+                con.close()
+                _broadcast_feature_caps()
+                sock.sendall((json.dumps({"action": "feature_allow_group_result", "ok": True, "feature_key": fk, "group_name": gname}) + "\n").encode())
+
+            elif action == "feature_allow_group_remove":
+                if not _is_admin(user):
+                    _deny_feature("admin_console", "feature_allow_group_result")
+                    continue
+                fk = str(msg.get("feature_key", "")).strip()
+                gname = str(msg.get("group_name", "")).strip()
+                if fk not in FEATURE_DEFAULTS or not gname:
+                    sock.sendall((json.dumps({"action": "feature_allow_group_result", "ok": False, "reason": "feature_key and group_name are required."}) + "\n").encode())
+                    continue
+                con = sqlite3.connect(DB)
+                con.execute("DELETE FROM feature_allow_groups WHERE feature_key=? AND group_name=?", (fk, gname))
+                con.commit()
+                con.close()
+                _broadcast_feature_caps()
+                sock.sendall((json.dumps({"action": "feature_allow_group_result", "ok": True, "feature_key": fk, "group_name": gname}) + "\n").encode())
+
+            elif action == "feature_access_groups_list":
+                if not _is_admin(user):
+                    _deny_feature("admin_console", "feature_group_list")
+                    continue
+                target_user = str(msg.get("username", "")).strip()
+                if not target_user:
+                    sock.sendall((json.dumps({"action": "feature_group_list", "ok": False, "reason": "username is required."}) + "\n").encode())
+                    continue
+                con = sqlite3.connect(DB)
+                groups = [r[0] for r in con.execute("SELECT group_name FROM user_access_groups WHERE username=? ORDER BY group_name", (target_user,)).fetchall()]
+                con.close()
+                sock.sendall((json.dumps({"action": "feature_group_list", "ok": True, "username": target_user, "groups": groups}) + "\n").encode())
+
+            elif action == "add_contact":
                 contact_to_add = msg["to"]
                 if contact_to_add == user: 
                     reason = "You cannot add yourself as a contact."
@@ -1086,6 +1389,11 @@ def handle_client(cs, addr):
                 con = sqlite3.connect(DB)
                 exists = con.execute("SELECT 1 FROM users WHERE username=?", (contact_to_add,)).fetchone()
                 is_bot = _is_registered_bot(contact_to_add)
+                if is_bot and not _can_user_use_feature(user, "bots"):
+                    reason = "Bot contacts are disabled for your account."
+                    sock.sendall((json.dumps({"action": "add_contact_failed", "reason": reason}) + "\n").encode())
+                    con.close()
+                    continue
                 if not exists and not is_bot:
                     reason = f"User '{contact_to_add}' does not exist."
                     sock.sendall((json.dumps({
@@ -1183,7 +1491,9 @@ def handle_client(cs, addr):
                         pass
                 
             elif action == "admin_cmd":
-                if user not in get_admins(): 
+                if not _can_user_use_feature(user, "admin_console"):
+                    response = "Error: Admin console is disabled for your account."
+                elif user not in get_admins(): 
                     response = "Error: You are not authorized to use admin commands."
                 else:
                     cmd_parts = msg.get("cmd", "").split()
@@ -1277,6 +1587,12 @@ def handle_client(cs, addr):
                 except: pass
 
             elif action == "schedule_restart":
+                if not _can_user_use_feature(user, "admin_console"):
+                    try:
+                        sock.sendall((json.dumps({"action": "admin_response", "response": "Error: Admin console is disabled for your account."}) + "\n").encode())
+                    except Exception:
+                        pass
+                    continue
                 if user not in get_admins():
                     try:
                         sock.sendall((json.dumps({"action": "admin_response", "response": "Error: You are not authorized to schedule restarts."}) + "\n").encode())
@@ -1323,8 +1639,12 @@ def handle_client(cs, addr):
                 con.close()
                 admins = get_admins()
                 directory = []
+                include_bots = _can_user_use_feature(user, "bots")
                 known = {uname for (uname,) in all_users}
-                for uname in sorted(known | bot_usernames | bot_external_usernames):
+                extra = set()
+                if include_bots:
+                    extra = set(bot_usernames) | set(bot_external_usernames)
+                for uname in sorted(known | extra):
                     directory.append({
                         "user": uname,
                         "online": _is_online_user(uname),
@@ -1340,6 +1660,12 @@ def handle_client(cs, addr):
                 except: pass
 
             elif action == "get_bot_rules":
+                if not _can_user_use_feature(user, "bot_rules"):
+                    try:
+                        sock.sendall((json.dumps({"action": "bot_rules", "ok": False, "reason": "Bot rules are disabled for your account."}) + "\n").encode())
+                    except Exception:
+                        pass
+                    continue
                 bot_name = str(msg.get("bot", "")).strip()
                 if not bot_name or not _is_registered_bot(bot_name):
                     try:
@@ -1364,6 +1690,12 @@ def handle_client(cs, addr):
                     pass
 
             elif action == "get_group_policy":
+                if not _can_user_use_feature(user, "group_policy"):
+                    try:
+                        sock.sendall((json.dumps({"action": "group_policy", "ok": False, "reason": "Group policy is disabled for your account."}) + "\n").encode())
+                    except Exception:
+                        pass
+                    continue
                 group_name = str(msg.get("group", "") or "").strip()
                 scope = "group" if group_name else "global"
                 policy = _fetch_group_policy(scope=scope, group_name=group_name or "__global__")
@@ -1382,6 +1714,12 @@ def handle_client(cs, addr):
                     pass
 
             elif action == "set_group_policy":
+                if not _can_user_use_feature(user, "group_policy"):
+                    try:
+                        sock.sendall((json.dumps({"action": "group_policy_update", "ok": False, "reason": "Group policy is disabled for your account."}) + "\n").encode())
+                    except Exception:
+                        pass
+                    continue
                 if user not in get_admins():
                     try:
                         sock.sendall((json.dumps({"action": "group_policy_update", "ok": False, "reason": "Admin only."}) + "\n").encode())
@@ -1413,6 +1751,12 @@ def handle_client(cs, addr):
                         pass
 
             elif action == "reset_group_policy":
+                if not _can_user_use_feature(user, "group_policy"):
+                    try:
+                        sock.sendall((json.dumps({"action": "group_policy_update", "ok": False, "reason": "Group policy is disabled for your account."}) + "\n").encode())
+                    except Exception:
+                        pass
+                    continue
                 if user not in get_admins():
                     try:
                         sock.sendall((json.dumps({"action": "group_policy_update", "ok": False, "reason": "Admin only."}) + "\n").encode())
@@ -1435,6 +1779,12 @@ def handle_client(cs, addr):
                     pass
 
             elif action == "set_bot_rules":
+                if not _can_user_use_feature(user, "bot_rules"):
+                    try:
+                        sock.sendall((json.dumps({"action": "bot_rules_update", "ok": False, "reason": "Bot rules are disabled for your account."}) + "\n").encode())
+                    except Exception:
+                        pass
+                    continue
                 if not _is_admin(user):
                     try:
                         sock.sendall((json.dumps({"action": "bot_rules_update", "ok": False, "reason": "Admin only."}) + "\n").encode())
@@ -1464,6 +1814,12 @@ def handle_client(cs, addr):
                     pass
 
             elif action == "reset_bot_rules":
+                if not _can_user_use_feature(user, "bot_rules"):
+                    try:
+                        sock.sendall((json.dumps({"action": "bot_rules_update", "ok": False, "reason": "Bot rules are disabled for your account."}) + "\n").encode())
+                    except Exception:
+                        pass
+                    continue
                 if not _is_admin(user):
                     try:
                         sock.sendall((json.dumps({"action": "bot_rules_update", "ok": False, "reason": "Admin only."}) + "\n").encode())
@@ -1491,6 +1847,9 @@ def handle_client(cs, addr):
                     pass
 
             elif action == "group_call_list":
+                if not _can_user_use_feature(user, "group_call"):
+                    _deny_feature("group_call", "group_call_list_response")
+                    continue
                 rows = []
                 with group_call_lock:
                     for g in sorted(group_call_sessions.keys()):
@@ -1502,6 +1861,9 @@ def handle_client(cs, addr):
                     pass
 
             elif action == "group_call_join":
+                if not _can_user_use_feature(user, "group_call"):
+                    _deny_feature("group_call", "group_call_result")
+                    continue
                 group = str(msg.get("group", "")).strip()
                 mode = str(msg.get("mode", "voice") or "voice").strip().lower()
                 if mode not in ("voice", "video"):
@@ -1539,6 +1901,9 @@ def handle_client(cs, addr):
                     pass
 
             elif action == "group_call_leave":
+                if not _can_user_use_feature(user, "group_call"):
+                    _deny_feature("group_call", "group_call_result")
+                    continue
                 group = str(msg.get("group", "")).strip()
                 if not group:
                     continue
@@ -1559,6 +1924,9 @@ def handle_client(cs, addr):
                     pass
 
             elif action == "group_call_signal":
+                if not _can_user_use_feature(user, "group_call"):
+                    _deny_feature("group_call", "group_call_signal_result")
+                    continue
                 group = str(msg.get("group", "")).strip()
                 target = str(msg.get("to", "")).strip()
                 signal_type = str(msg.get("signal_type", "")).strip()
@@ -1593,6 +1961,9 @@ def handle_client(cs, addr):
 
             elif action == "msg":
                 to, frm = msg["to"], msg["from"]
+                if _is_registered_bot(to) and not _can_user_use_feature(user, "bots"):
+                    sock.sendall(json.dumps({"action": "msg_failed", "to": to, "reason": "Bot messaging is disabled for your account."}).encode() + b"\n")
+                    continue
                 con = sqlite3.connect(DB)
                 recipient_has_blocked = con.execute("SELECT blocked FROM contacts WHERE owner=? AND contact=?", (to, frm)).fetchone()
                 sender_has_blocked = con.execute("SELECT blocked FROM contacts WHERE owner=? AND contact=?", (frm, to)).fetchone()
