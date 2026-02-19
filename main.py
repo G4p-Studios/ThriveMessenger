@@ -7,7 +7,7 @@ try:
 except Exception:
     wxhtml2 = None
 
-VERSION_TAG = "v2026-alpha14"
+VERSION_TAG = "v2026-alpha15.1"
 URL_REGEX = re.compile(r'(https?://[^\s<>()]+)')
 KEYRING_SERVICE = "ThriveMessenger"
 DEFAULT_SOUNDPACK_BASE_URL = "https://im.tappedin.fm/thrive/sounds"
