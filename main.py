@@ -3057,14 +3057,28 @@ class UserDirectoryDialog(wx.Dialog):
     def _populate_all_tabs(self):
         query = self.search_box.GetValue().strip().lower()
         filter_mode = self.filter_choice.GetSelection() if hasattr(self, "filter_choice") else 0
+        previous_selection_by_tab = {}
+        for tab_name, lv in self.tabs.items():
+            sel = lv.GetSelection()
+            mapping = self.tab_display_map.get(tab_name, [])
+            if sel != wx.NOT_FOUND and 0 <= sel < len(mapping):
+                previous_selection_by_tab[tab_name] = str(mapping[sel].get("user", "")).strip()
+
+        def _is_online(entry):
+            status_text = str(entry.get("status_text", "") or "").strip().lower()
+            if status_text.startswith("offline"):
+                return False
+            return bool(entry.get("online", False))
+
         for tab_name, lv in self.tabs.items():
             lv.Clear()
             self.tab_display_map[tab_name] = []
             tab_users = []
             for u in self._all_users:
                 if query and query not in u["user"].lower(): continue
-                if tab_name == "Online" and not u["online"]: continue
-                if tab_name == "Offline" and u["online"]: continue
+                online_now = _is_online(u)
+                if tab_name == "Online" and not online_now: continue
+                if tab_name == "Offline" and online_now: continue
                 if tab_name == "Admins" and not u["is_admin"]: continue
                 if filter_mode == 1 and not u.get("is_contact", False): continue
                 if filter_mode == 2 and u.get("is_contact", False): continue
@@ -3073,7 +3087,7 @@ class UserDirectoryDialog(wx.Dialog):
             if mode == 1:
                 tab_users = sorted(tab_users, key=lambda u: u["user"].lower(), reverse=True)
             elif mode == 2:
-                tab_users = sorted(tab_users, key=lambda u: (not u.get("online", False), u["user"].lower()))
+                tab_users = sorted(tab_users, key=lambda u: (not _is_online(u), u["user"].lower()))
             else:
                 tab_users = sorted(tab_users, key=lambda u: u["user"].lower())
             for u in tab_users:
@@ -3088,6 +3102,21 @@ class UserDirectoryDialog(wx.Dialog):
                     display += f"  |  {info_text}"
                 lv.Append(display)
                 self.tab_display_map[tab_name].append(u)
+            preferred_user = previous_selection_by_tab.get(tab_name, "")
+            selected_index = wx.NOT_FOUND
+            if preferred_user:
+                for i, entry in enumerate(self.tab_display_map[tab_name]):
+                    if str(entry.get("user", "")).strip() == preferred_user:
+                        selected_index = i
+                        break
+            if selected_index == wx.NOT_FOUND and lv.GetCount() > 0:
+                selected_index = 0
+            if selected_index != wx.NOT_FOUND:
+                lv.SetSelection(selected_index)
+                try:
+                    lv.EnsureVisible(selected_index)
+                except Exception:
+                    pass
         self.update_button_states()
     def on_sort_changed(self, _):
         self._populate_all_tabs()
@@ -3122,7 +3151,17 @@ class UserDirectoryDialog(wx.Dialog):
         else:
             self.btn_block.SetLabel("&Block")
     def on_search(self, event): self._populate_all_tabs()
-    def on_tab_changed(self, event): self._selected_user = None; self.update_button_states(); event.Skip()
+    def on_tab_changed(self, event):
+        self._selected_user = None
+        lv = self._get_active_list()
+        if lv and lv.GetCount() > 0 and lv.GetSelection() == wx.NOT_FOUND:
+            lv.SetSelection(0)
+            try:
+                lv.EnsureVisible(0)
+            except Exception:
+                pass
+        self.update_button_states()
+        event.Skip()
     def on_selection_changed(self, event): self.update_button_states(); event.Skip()
     def on_item_activated(self, event):
         self.on_selection_changed(event)
