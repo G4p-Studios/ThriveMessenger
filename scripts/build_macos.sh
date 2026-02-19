@@ -31,6 +31,7 @@ pyinstaller \
   --name "${APP_NAME}" \
   --osx-bundle-identifier "fm.tappedin.thrivemessenger" \
   --add-data "client.conf:." \
+  --add-data "assets/videos:assets/videos" \
   --add-data "sounds:sounds" \
   main.py
 

@@ -650,6 +650,19 @@ def get_downloaded_sounds_dir():
     os.makedirs(sounds_dir, exist_ok=True)
     return sounds_dir
 
+def get_demo_videos_dir():
+    resources_dir = get_bundle_resources_dir()
+    if resources_dir:
+        bundled = os.path.join(resources_dir, 'assets', 'videos')
+        if os.path.isdir(bundled):
+            return bundled
+    local_videos = os.path.join(get_program_dir(), 'assets', 'videos')
+    if os.path.isdir(local_videos):
+        return local_videos
+    fallback = os.path.join(os.getcwd(), 'assets', 'videos')
+    os.makedirs(fallback, exist_ok=True)
+    return fallback
+
 def get_soundpack_base_url(config_dict):
     base = str(config_dict.get('soundpack_base_url', DEFAULT_SOUNDPACK_BASE_URL) or DEFAULT_SOUNDPACK_BASE_URL).strip()
     return base.rstrip('/')
@@ -2571,6 +2584,7 @@ class MainFrame(wx.Frame):
 
         help_menu = wx.Menu()
         self.mi_help = help_menu.Append(wx.ID_ANY, "Help\tF1")
+        self.mi_demo_videos = help_menu.Append(wx.ID_ANY, "Open Demo Videos Folder")
         self.mi_submit_logs = help_menu.Append(wx.ID_ANY, "Submit Diagnostic Logs")
 
         menubar.Append(file_menu, "&File")
@@ -2605,6 +2619,7 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, lambda e: self._set_sort_mode("name_desc"), self.mi_sort_name_desc)
         self.Bind(wx.EVT_MENU, lambda e: self._set_sort_mode("status"), self.mi_sort_status)
         self.Bind(wx.EVT_MENU, lambda e: open_help_docs_for_context("main", self), self.mi_help)
+        self.Bind(wx.EVT_MENU, self.on_open_demo_videos, self.mi_demo_videos)
         self.Bind(wx.EVT_MENU, self.on_submit_logs, self.mi_submit_logs)
 
     def _apply_voiceover_hints(self, search_label):
@@ -2653,6 +2668,9 @@ class MainFrame(wx.Frame):
         else:
             wx.MessageBox(f"Could not submit logs:\n{err}", "Log Submit Failed", wx.OK | wx.ICON_ERROR)
             log_event("error", "logs_submit_failed", {"error": str(err)})
+
+    def on_open_demo_videos(self, _):
+        open_path_or_url(get_demo_videos_dir())
     def on_settings(self, event):
         app = wx.GetApp()
         with SettingsDialog(self, app.user_config) as dlg:
