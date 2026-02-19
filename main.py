@@ -8,7 +8,11 @@ except Exception:
     wxhtml2 = None
 
 VERSION_TAG = "v2026-alpha15.3"
-URL_REGEX = re.compile(r'(https?://[^\s<>()]+)')
+URL_REGEX = re.compile(r'((?:https?|ipfs|ipns|web3)://[^\s<>()]+)', re.IGNORECASE)
+BARE_DOMAIN_REGEX = re.compile(
+    r'\b((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}(?::\d{1,5})?(?:/[^\s<>()]*)?)\b',
+    re.IGNORECASE,
+)
 KEYRING_SERVICE = "ThriveMessenger"
 PASSKEY_KEYRING_SERVICE = "ThriveMessengerPasskey"
 DEFAULT_SOUNDPACK_BASE_URL = "https://im.tappedin.fm/thrive/sounds"
@@ -672,9 +676,42 @@ def fetch_invite_validation(server_entry, invite_token):
 def extract_urls(text):
     if not text:
         return []
-    return URL_REGEX.findall(text)
+    out = []
+    seen = set()
+    for raw in URL_REGEX.findall(text):
+        candidate = str(raw or "").strip().rstrip(".,;:!?")
+        if candidate and candidate.lower() not in seen:
+            seen.add(candidate.lower())
+            out.append(candidate)
+    for raw in BARE_DOMAIN_REGEX.findall(text):
+        candidate = str(raw or "").strip().rstrip(".,;:!?")
+        if not candidate:
+            continue
+        if candidate.lower().startswith(("http://", "https://", "ipfs://", "ipns://", "web3://")):
+            continue
+        normalized = f"https://{candidate}"
+        if normalized.lower() in seen:
+            continue
+        seen.add(normalized.lower())
+        out.append(normalized)
+    return out
+
+def _normalize_url_target(target):
+    t = str(target or "").strip()
+    if not t:
+        return t
+    # Keep file paths as-is.
+    if os.path.exists(t):
+        return t
+    if re.match(r'^[a-zA-Z][a-zA-Z0-9+.-]*://', t):
+        return t
+    # Bare domains (including Web3 DNS names like *.eth, *.crypto, *.nft, Freename-managed names, etc.).
+    if BARE_DOMAIN_REGEX.fullmatch(t):
+        return f"https://{t}"
+    return t
 
 def open_path_or_url(target):
+    target = _normalize_url_target(target)
     try:
         if sys.platform == 'win32':
             os.startfile(target)
