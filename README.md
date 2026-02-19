@@ -114,6 +114,19 @@ Logging into your Thrive Messenger account is as simple as logging into your com
 3.  Optionally, check the boxes to remember your credentials and log in automatically.
 4.  Click Login or Press Alt + L to log into Thrive Messenger. A sound will play to tell you that you're logged in.
 
+### Web3 Domain Support
+
+Server owners can use Web3 DNS domains for server hostnames. In Server Manager or `client.conf`, set the server host to your domain as normal.
+
+Examples:
+
+* `myserver.eth`
+* `voice.crypto`
+* `chat.nft`
+* Freename-managed domains
+
+The client accepts standard hostnames and Web3-style domains for server entries, and link detection/opening in chat/status also supports Web3-style links and bare domains.
+
 ### The Thrive Messenger UI
 
 When you log into Thrive Messenger, you will land on your contact list. Of course, if your account is brand new, you won't have any contacts to chat with. This list view will show you the name of each contact, as well as their online status. You can navigate your contact list with the up and down arrow keys. Using the Tab key will allow you to navigate the rest of the UI.
@@ -253,6 +266,8 @@ With the Thrive Messenger client open and logged in, follow these steps to chang
 The client.conf file controls what server and port the Thrive Messenger client connects to. If you have your own Thrive Messenger server up, or you have one that you like to use, you can simply open client.conf in your text editor of choice, such as Notepad++, and modify the server hostname and port to point to your desired server.
 
 The default server is msg.thecubed.cc, running on port 2005.
+
+If your server is published on a Web3 DNS name, set `host` to that domain directly (for example `myserver.eth`).
 
 You can also control update sources in `client.conf`:
 
