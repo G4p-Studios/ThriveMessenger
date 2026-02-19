@@ -3239,6 +3239,9 @@ class UserDirectoryDialog(wx.Dialog):
         if event.GetKeyCode() == wx.WXK_F1:
             open_help_docs_for_context("directory", self)
             return
+        if event.GetKeyCode() in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
+            self.on_start_chat(None)
+            return
         if event.GetKeyCode() == wx.WXK_TAB:
             if event.ShiftDown():
                 self.notebook.SetFocus()
@@ -3253,6 +3256,12 @@ class UserDirectoryDialog(wx.Dialog):
         if event.GetKeyCode() == wx.WXK_F1:
             open_help_docs_for_context("directory", self)
             return
+        if event.GetKeyCode() in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
+            focused = wx.Window.FindFocus()
+            if isinstance(focused, wx.Button):
+                click_evt = wx.CommandEvent(wx.EVT_BUTTON.typeId, focused.GetId())
+                focused.GetEventHandler().ProcessEvent(click_evt)
+                return
         event.Skip()
 
     def merge_external_users(self, users):
@@ -4493,7 +4502,17 @@ class MainFrame(wx.Frame):
             elif action == 'minimize':
                 self.minimize_to_tray()
             return
-        elif evt.GetKeyCode() == wx.WXK_RETURN: self.on_send(None)
+        elif evt.GetKeyCode() in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
+            focused = wx.Window.FindFocus()
+            if focused is self.lv:
+                self.on_contact_activated(None)
+                return
+            if isinstance(focused, wx.Button):
+                click_evt = wx.CommandEvent(wx.EVT_BUTTON.typeId, focused.GetId())
+                focused.GetEventHandler().ProcessEvent(click_evt)
+                return
+            self.on_send(None)
+            return
         elif evt.GetKeyCode() == wx.WXK_DELETE: self.on_delete(None)
         else: evt.Skip()
     def on_block_toggle(self, _):
