@@ -124,6 +124,7 @@ When you log into Thrive Messenger, you will land on your contact list. Of cours
 * Alt + F will allow you to send a file to the focused contact.
 *   You can delete the focused contact with the Delete button or Alt + D.
 *   The Use Server Side Commands (Alt + V) button will allow you to perform various server side commands; more on these later.
+*   Bot Rules Manager is available from File menu, Settings > Administration, and Server Side Commands. Admins can load, edit, and reset bot rules without editing files manually.
 *   The logout (Alt + O) and exit (Alt + X) buttons are self explanatory.
 * The server info button (Alt + I) will show information about the server you're currently logged into.
 * Alt + U will allow you to set an online status that your contacts will see. You can choose from a list of preset statuses, such as online, offline and busy, or you can choose a custom one and type a personal message. Server owners can customize the character limit for custom statuses via max_status_length, so check that you have enough characters before you start setting System of a Down lyrics as your status.
@@ -157,6 +158,18 @@ Each server side command must start with a forward slash (/). The following serv
 *   /exit: Shuts down the Thrive Messenger server.
 
 Shift Tabbing once from the command input field will show a list of outputs for the commands you've run.
+
+### Bot rules and agent rulesets
+
+Thrive bots can follow a shared agent ruleset loaded from an agent ZIP (for example `/home/devinecr/downloads/*.zip`), and server admins can override rules per bot for their own admin account/server workflow.
+
+Key behavior:
+
+* Global fallback rules are loaded from the configured agent ZIP/file.
+* Admin-specific bot rules are seeded from global rules on first use.
+* Admins can edit and save their own bot rule override from the client UI.
+* Non-admin users can view active bot rules, but cannot edit them.
+* Reset action restores a bot back to global seeded rules for that admin scope.
 
 Those of you familiar with IRC will know that this feature was very much inspired by the concept of server and channel operator commands.
 
