@@ -405,15 +405,39 @@ def handle_client(cs, addr):
 
         db = sqlite3.connect(DB)
         cur = db.cursor()
-        cur.execute("SELECT password,banned_until,ban_reason,is_verified FROM users WHERE username=?", (req["user"],))
-        row = cur.fetchone()
-        
-        if not row or row[0] != req["pass"]: 
+
+        input_user = str(req.get("user", "")).strip()
+        if not input_user:
             sock.sendall(b'{"status":"error","reason":"Invalid credentials"}\n')
             db.close()
             return
-            
-        bi, br, verified = row[1], row[2], row[3]
+
+        # Case-insensitive username login with canonical identity from DB.
+        # If multiple usernames differ only by case, reject to avoid ambiguous auth.
+        cur.execute(
+            """
+            SELECT username, password, banned_until, ban_reason, is_verified
+            FROM users
+            WHERE username = ? COLLATE NOCASE
+            ORDER BY CASE WHEN username = ? THEN 0 ELSE 1 END, username
+            LIMIT 2
+            """,
+            (input_user, input_user),
+        )
+        rows = cur.fetchall()
+        if len(rows) > 1:
+            sock.sendall(b'{"status":"error","reason":"Ambiguous username. Contact admin."}\n')
+            db.close()
+            return
+        row = rows[0] if rows else None
+
+        if not row or row[1] != req["pass"]:
+            sock.sendall(b'{"status":"error","reason":"Invalid credentials"}\n')
+            db.close()
+            return
+
+        user = row[0]
+        bi, br, verified = row[2], row[3], row[4]
         
         if smtp_config['enabled'] and verified == 0:
             sock.sendall(b'{"status":"error","reason":"Account not verified. Please recreate account to verify."}\n')
@@ -428,7 +452,6 @@ def handle_client(cs, addr):
                 return
 
         sock.sendall(b'{"status":"ok"}\n')
-        user = req["user"]
         with lock:
             clients[user] = sock
             client_statuses[user] = "online"
