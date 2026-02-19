@@ -24,6 +24,8 @@ bot_status_map = {}
 bot_purpose_map = {}
 bot_service_map = {}
 bot_voice_map = {}
+bot_external_usernames = set()
+allow_external_bot_contacts = True
 docs_cache = {}
 restart_lock = threading.Lock()
 restart_scheduled_for = None
@@ -31,6 +33,18 @@ restart_scheduled_for = None
 def _is_virtual_bot(username):
     uname = str(username or "").strip()
     return uname in bot_usernames or uname.lower() == "openclaw-bot"
+
+def _is_registered_bot(username):
+    uname = str(username or "").strip()
+    if not uname:
+        return False
+    if _is_virtual_bot(uname):
+        return True
+    if uname in bot_external_usernames:
+        return True
+    if allow_external_bot_contacts and uname.lower().endswith("-bot"):
+        return True
+    return False
 
 def _parse_bot_map(raw):
     out = {}
@@ -99,13 +113,13 @@ def _documentation_context_for_query(query, max_chars=2500):
 def _active_usernames():
     with lock:
         extra_bots = {"openclaw-bot"}
-        return set(clients.keys()) | set(bot_usernames) | extra_bots
+        return set(clients.keys()) | set(bot_usernames) | set(bot_external_usernames) | extra_bots
 
 def _is_online_user(username):
     return username in _active_usernames()
 
 def _status_for_user(username):
-    if _is_virtual_bot(username):
+    if _is_registered_bot(username):
         status = bot_status_map.get(username, "online")
         if str(username).lower() == "openclaw-bot" and username not in bot_purpose_map:
             purpose = "automation and assistant bot"
@@ -478,6 +492,11 @@ def load_config():
     bot_purpose_map = _parse_bot_map(config.get('bots', 'purpose_map', fallback=''))
     global bot_service_map
     bot_service_map = _parse_bot_map(config.get('bots', 'service_map', fallback=''))
+    global bot_external_usernames
+    raw_external = config.get('bots', 'external_names', fallback='')
+    bot_external_usernames = {name.strip() for name in raw_external.split(',') if name.strip()}
+    global allow_external_bot_contacts
+    allow_external_bot_contacts = config.getboolean('bots', 'allow_external_bot_contacts', fallback=True)
     global bot_voice_map
     bot_voice_map = _parse_bot_map(config.get('bots', 'voice_map', fallback=''))
     global bot_runtime_config
@@ -746,7 +765,7 @@ def handle_client(cs, addr):
                     continue
                 con = sqlite3.connect(DB)
                 exists = con.execute("SELECT 1 FROM users WHERE username=?", (contact_to_add,)).fetchone()
-                is_bot = _is_virtual_bot(contact_to_add)
+                is_bot = _is_registered_bot(contact_to_add)
                 if not exists and not is_bot:
                     reason = f"User '{contact_to_add}' does not exist."
                     sock.sendall((json.dumps({
@@ -763,8 +782,16 @@ def handle_client(cs, addr):
                     is_online = _is_online_user(contact_to_add)
                     contact_status_text = _status_for_user(contact_to_add)
                     admins = get_admins()
-                    contact_data = {"user": contact_to_add, "blocked": 0, "online": is_online, "is_admin": contact_to_add in admins, "status_text": contact_status_text}
-                    if is_bot and str(contact_to_add).lower() == "openclaw-bot":
+                    contact_data = {
+                        "user": contact_to_add,
+                        "blocked": 0,
+                        "online": is_online,
+                        "is_admin": contact_to_add in admins,
+                        "status_text": contact_status_text,
+                        "is_bot": bool(is_bot),
+                        "bot_origin": "local" if _is_virtual_bot(contact_to_add) else ("external" if is_bot else "user")
+                    }
+                    if _is_virtual_bot(contact_to_add) and str(contact_to_add).lower() == "openclaw-bot":
                         token = _upsert_bot_token(user, contact_to_add)
                         contact_data["bot_auth_token"] = token
                         contact_data["bot_auth_type"] = "openclaw"
@@ -941,7 +968,7 @@ def handle_client(cs, addr):
                 admins = get_admins()
                 directory = []
                 known = {uname for (uname,) in all_users}
-                for uname in sorted(known | bot_usernames):
+                for uname in sorted(known | bot_usernames | bot_external_usernames):
                     directory.append({
                         "user": uname,
                         "online": _is_online_user(uname),
@@ -949,7 +976,9 @@ def handle_client(cs, addr):
                         "is_admin": uname in admins,
                         "is_contact": uname in user_contacts,
                         "is_blocked": user_contacts.get(uname, 0) == 1,
-                        "server": server_identity
+                        "server": server_identity,
+                        "is_bot": _is_registered_bot(uname),
+                        "bot_origin": "local" if _is_virtual_bot(uname) else ("external" if _is_registered_bot(uname) else "user")
                     })
                 try: sock.sendall((json.dumps({"action": "user_directory_response", "users": directory}) + "\n").encode())
                 except: pass
