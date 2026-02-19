@@ -1672,9 +1672,14 @@ class CreateAccountDialog(wx.Dialog):
         self.EndModal(wx.ID_OK)
 
 class ServerManagerDialog(wx.Dialog):
-    def __init__(self, parent, server_entries):
+    def __init__(self, parent, server_entries, primary_server_name=""):
         super().__init__(parent, title="Server Manager", size=(520, 360))
         self.entries = [normalize_server_entry(e) for e in server_entries]
+        entry_names = [e.get('name', '') for e in self.entries]
+        if primary_server_name in entry_names:
+            self.primary_server_name = primary_server_name
+        else:
+            self.primary_server_name = self.entries[0]['name'] if self.entries else ""
 
         panel = wx.Panel(self)
         s = wx.BoxSizer(wx.VERTICAL)
@@ -1703,12 +1708,15 @@ class ServerManagerDialog(wx.Dialog):
         btn_row = wx.BoxSizer(wx.HORIZONTAL)
         add_btn = wx.Button(panel, label="Add / Update")
         del_btn = wx.Button(panel, label="Delete")
+        primary_btn = wx.Button(panel, label="Set Primary")
         close_btn = wx.Button(panel, wx.ID_OK, label="Done")
         add_btn.Bind(wx.EVT_BUTTON, self.on_add_or_update)
         del_btn.Bind(wx.EVT_BUTTON, self.on_delete)
+        primary_btn.Bind(wx.EVT_BUTTON, self.on_set_primary)
         self.list.Bind(wx.EVT_LISTBOX, self.on_select)
         btn_row.Add(add_btn, 0, wx.RIGHT, 6)
         btn_row.Add(del_btn, 0, wx.RIGHT, 6)
+        btn_row.Add(primary_btn, 0, wx.RIGHT, 6)
         btn_row.AddStretchSpacer()
         btn_row.Add(close_btn, 0)
         s.Add(btn_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
@@ -1718,7 +1726,8 @@ class ServerManagerDialog(wx.Dialog):
     def _refresh_list(self):
         self.list.Clear()
         for entry in self.entries:
-            self.list.Append(f"{entry['name']}  |  {entry['host']}:{entry['port']}")
+            suffix = " [Primary]" if entry.get('name') == self.primary_server_name else ""
+            self.list.Append(f"{entry['name']}{suffix}  |  {entry['host']}:{entry['port']}")
 
     def on_select(self, event):
         index = event.GetSelection()
@@ -1759,11 +1768,27 @@ class ServerManagerDialog(wx.Dialog):
         if idx == wx.NOT_FOUND:
             return
         if idx < len(self.entries):
+            deleted_name = self.entries[idx].get('name', '')
             del self.entries[idx]
+            if deleted_name == self.primary_server_name:
+                self.primary_server_name = self.entries[0]['name'] if self.entries else ""
             self._refresh_list()
+
+    def on_set_primary(self, _):
+        idx = self.list.GetSelection()
+        if idx == wx.NOT_FOUND or idx >= len(self.entries):
+            return
+        self.primary_server_name = self.entries[idx]['name']
+        self._refresh_list()
 
     def get_entries(self):
         return dedupe_server_entries(self.entries)
+
+    def get_primary_server_name(self):
+        names = [e.get('name', '') for e in self.entries]
+        if self.primary_server_name in names:
+            return self.primary_server_name
+        return self.entries[0]['name'] if self.entries else ""
 
 class LoginDialog(wx.Dialog):
     def __init__(self, parent, user_config):
@@ -1861,7 +1886,7 @@ class LoginDialog(wx.Dialog):
             self.refresh_welcome_preview()
 
     def on_manage_servers(self, _):
-        with ServerManagerDialog(self, self.server_entries) as dlg:
+        with ServerManagerDialog(self, self.server_entries, self.primary_server_name) as dlg:
             if dlg.ShowModal() == wx.ID_OK:
                 entries = dlg.get_entries()
                 if not entries:
@@ -1869,6 +1894,9 @@ class LoginDialog(wx.Dialog):
                     return
                 self.server_entries = entries
                 self.user_config['server_entries'] = self.server_entries
+                updated_primary = dlg.get_primary_server_name()
+                if updated_primary:
+                    self.primary_server_name = updated_primary
                 if self.primary_server_name not in [e['name'] for e in self.server_entries]:
                     self.primary_server_name = self.server_entries[0]['name']
                 # Keep selection stable where possible
@@ -2516,6 +2544,7 @@ class MainFrame(wx.Frame):
         file_menu.AppendSeparator()
         self.mi_user_directory = file_menu.Append(wx.ID_ANY, "User Directory\tAlt+Y")
         self.mi_server_info = file_menu.Append(wx.ID_ANY, "Server Info\tAlt+I")
+        self.mi_server_manager = file_menu.Append(wx.ID_ANY, "Server Manager")
         self.mi_settings = file_menu.Append(wx.ID_ANY, "Settings\tAlt+T")
         file_menu.AppendSeparator()
         self.mi_logout = file_menu.Append(wx.ID_ANY, "Logout\tAlt+O")
@@ -2558,6 +2587,7 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.on_file_transfers, self.mi_file_transfers)
         self.Bind(wx.EVT_MENU, self.on_user_directory, self.mi_user_directory)
         self.Bind(wx.EVT_MENU, self.on_server_info, self.mi_server_info)
+        self.Bind(wx.EVT_MENU, self.on_server_manager, self.mi_server_manager)
         self.Bind(wx.EVT_MENU, self.on_settings, self.mi_settings)
         self.Bind(wx.EVT_MENU, self.on_logout, self.mi_logout)
         self.Bind(wx.EVT_MENU, self.on_exit, self.mi_exit)
@@ -2679,6 +2709,28 @@ class MainFrame(wx.Frame):
             threading.Thread(target=merge_later, daemon=True).start()
     def on_server_info(self, _):
         self.sock.sendall(json.dumps({"action": "server_info"}).encode() + b"\n")
+
+    def on_server_manager(self, _):
+        app = wx.GetApp()
+        entries = dedupe_server_entries(app.user_config.get('server_entries', []))
+        if not entries:
+            entries = [normalize_server_entry(getattr(app, "active_server_entry", SERVER_CONFIG))]
+        primary_name = app.user_config.get('primary_server_name', '')
+        with ServerManagerDialog(self, entries, primary_name) as dlg:
+            if dlg.ShowModal() != wx.ID_OK:
+                return
+            updated_entries = dlg.get_entries()
+            if not updated_entries:
+                wx.MessageBox("At least one server entry is required.", "Server Manager", wx.OK | wx.ICON_INFORMATION)
+                return
+            app.user_config['server_entries'] = updated_entries
+            selected_primary = dlg.get_primary_server_name()
+            if selected_primary:
+                app.user_config['primary_server_name'] = selected_primary
+            if app.user_config.get('last_server_name') not in [e.get('name') for e in updated_entries]:
+                app.user_config['last_server_name'] = app.user_config.get('primary_server_name') or updated_entries[0].get('name', '')
+            save_user_config(app.user_config)
+            wx.MessageBox("Server list updated. Changes apply on next login.", "Server Manager", wx.OK | wx.ICON_INFORMATION)
     def on_server_info_response(self, msg):
         encrypted = isinstance(self.sock, ssl.SSLSocket)
         app = wx.GetApp()
