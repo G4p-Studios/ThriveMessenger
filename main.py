@@ -265,7 +265,9 @@ def load_user_config():
         'announce_typing': True,
         'enter_key_action': 'send',
         'escape_main_action': 'none',
-        'save_chat_history_default': False
+        'save_chat_history_default': False,
+        'message_edit_window_seconds': 300,
+        'message_undo_window_seconds': 15,
     }
 
     # 1. Load non-sensitive preferences from JSON
@@ -292,6 +294,14 @@ def load_user_config():
     enter_action = str(settings.get('enter_key_action', 'send') or 'send')
     if enter_action not in ('send', 'place_call', 'none'):
         settings['enter_key_action'] = 'send'
+    try:
+        settings['message_edit_window_seconds'] = max(0, int(settings.get('message_edit_window_seconds', 300)))
+    except Exception:
+        settings['message_edit_window_seconds'] = 300
+    try:
+        settings['message_undo_window_seconds'] = max(0, int(settings.get('message_undo_window_seconds', 15)))
+    except Exception:
+        settings['message_undo_window_seconds'] = 15
 
     # 3. Load password from Keyring if "Remember me" is active
     if settings.get('username') and settings.get('remember'):
@@ -1101,6 +1111,14 @@ class SettingsDialog(wx.Dialog):
         restart_row.Add(self.restart_delay_txt, 1, wx.EXPAND)
         self.btn_open_admin_console = wx.Button(admin_box.GetStaticBox(), label="Open Server Command Console")
         self.btn_open_admin_console.Bind(wx.EVT_BUTTON, self.on_open_admin_console)
+        edit_window_row = wx.BoxSizer(wx.HORIZONTAL)
+        edit_window_row.Add(wx.StaticText(admin_box.GetStaticBox(), label="Edit window (seconds):"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        self.message_edit_window_txt = wx.TextCtrl(admin_box.GetStaticBox(), value=str(self.config.get('message_edit_window_seconds', 300)))
+        edit_window_row.Add(self.message_edit_window_txt, 1, wx.EXPAND)
+        undo_window_row = wx.BoxSizer(wx.HORIZONTAL)
+        undo_window_row.Add(wx.StaticText(admin_box.GetStaticBox(), label="Undo delete window (seconds):"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        self.message_undo_window_txt = wx.TextCtrl(admin_box.GetStaticBox(), value=str(self.config.get('message_undo_window_seconds', 15)))
+        undo_window_row.Add(self.message_undo_window_txt, 1, wx.EXPAND)
         sound_box.Add(self.choice, 0, wx.EXPAND | wx.ALL, 5)
         sound_box.Add(self.default_soundpack_label, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         sound_box.Add(self.set_selected_default_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
@@ -1139,6 +1157,8 @@ class SettingsDialog(wx.Dialog):
         admin_box.Add(fallback_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         admin_box.Add(self.restart_after_save_cb, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         admin_box.Add(restart_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        admin_box.Add(edit_window_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        admin_box.Add(undo_window_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         admin_box.Add(self.btn_open_admin_console, 0, wx.EXPAND | wx.ALL, 5)
         admin_sizer = wx.BoxSizer(wx.VERTICAL)
         admin_sizer.Add(admin_box, 1, wx.EXPAND | wx.ALL, 8)
@@ -1159,7 +1179,7 @@ class SettingsDialog(wx.Dialog):
             for cb in [self.auto_open_files_cb, self.read_aloud_cb, self.global_chat_logging_cb, self.show_main_actions_cb, self.typing_indicator_cb, self.announce_typing_cb]:
                 cb.SetForegroundColour(light_text_color)
             self.restart_after_save_cb.SetForegroundColour(light_text_color)
-            for ctrl in [self.admin_host_txt, self.admin_port_txt, self.admin_cafile_txt, self.admin_feed_txt, self.admin_pref_repo_txt, self.admin_fallback_txt]:
+            for ctrl in [self.admin_host_txt, self.admin_port_txt, self.admin_cafile_txt, self.admin_feed_txt, self.admin_pref_repo_txt, self.admin_fallback_txt, self.message_edit_window_txt, self.message_undo_window_txt]:
                 ctrl.SetBackgroundColour(dark_color); ctrl.SetForegroundColour(light_text_color)
             self.restart_delay_txt.SetBackgroundColour(dark_color); self.restart_delay_txt.SetForegroundColour(light_text_color)
             self.enter_action_choice.SetBackgroundColour(dark_color); self.enter_action_choice.SetForegroundColour(light_text_color)
@@ -1221,6 +1241,16 @@ class SettingsDialog(wx.Dialog):
         except Exception:
             delay = 10
         return True, max(1, delay)
+    def message_policy(self):
+        try:
+            edit_window = max(0, int(self.message_edit_window_txt.GetValue().strip() or "300"))
+        except Exception:
+            edit_window = 300
+        try:
+            undo_window = max(0, int(self.message_undo_window_txt.GetValue().strip() or "15"))
+        except Exception:
+            undo_window = 15
+        return edit_window, undo_window
 
 class ReconnectDialog(wx.Dialog):
     def __init__(self):
@@ -3065,6 +3095,9 @@ class MainFrame(wx.Frame):
                 enter_map = {0: 'send', 1: 'place_call', 2: 'none'}
                 app.user_config['enter_key_action'] = enter_map.get(dlg.enter_action_choice.GetSelection(), 'send')
                 app.user_config['escape_main_action'] = ('none' if dlg.escape_action_choice.GetSelection() == 0 else ('minimize' if dlg.escape_action_choice.GetSelection() == 1 else 'quit'))
+                edit_window, undo_window = dlg.message_policy()
+                app.user_config['message_edit_window_seconds'] = edit_window
+                app.user_config['message_undo_window_seconds'] = undo_window
                 ok_admin, admin_err = dlg.apply_admin_config()
                 save_user_config(app.user_config)
                 self.apply_action_button_layout()
@@ -3747,6 +3780,7 @@ class ChatDialog(wx.Dialog):
         self.contact, self.sock, self.user = contact, sock, user
         self.is_contact = bool(is_contact)
         self._pending_message_after_add = None
+        self._last_deleted_message = None
         self.Bind(wx.EVT_CHAR_HOOK, self.on_key)
         self.Bind(wx.EVT_CLOSE, self.on_close)
         self.Bind(wx.EVT_SHOW, self.on_show_dialog)
@@ -3985,18 +4019,44 @@ class ChatDialog(wx.Dialog):
         if idx == wx.NOT_FOUND or idx < 0 or idx >= len(self._history_rows):
             return None
         return idx
+    def _timestamp_to_epoch(self, ts):
+        try:
+            if isinstance(ts, (int, float)):
+                return float(ts)
+            return datetime.datetime.fromisoformat(str(ts)).timestamp()
+        except Exception:
+            return time.time()
+    def _is_row_editable(self, row):
+        if row.get("sender") != self.user or row.get("error", False):
+            return False
+        window = int(wx.GetApp().user_config.get('message_edit_window_seconds', 300) or 300)
+        if window <= 0:
+            return False
+        age = max(0.0, time.time() - self._timestamp_to_epoch(row.get("time")))
+        return age <= float(window)
+    def _can_undo_delete(self):
+        if not self._last_deleted_message:
+            return False
+        undo_window = int(wx.GetApp().user_config.get('message_undo_window_seconds', 15) or 15)
+        if undo_window <= 0:
+            return False
+        deleted_at = float(self._last_deleted_message.get("deleted_at", 0.0))
+        return (time.time() - deleted_at) <= float(undo_window)
     def on_history_context_menu(self, event):
         idx = self._selected_history_index()
         if idx is None:
             return
         row = self._history_rows[idx]
-        own_message = row.get("sender") == self.user and not row.get("error", False)
+        own_message = self._is_row_editable(row)
         menu = wx.Menu()
         mi_edit = menu.Append(wx.ID_ANY, "Edit Message")
         mi_remove = menu.Append(wx.ID_ANY, "Remove Message")
+        mi_undo = menu.Append(wx.ID_ANY, "Undo Delete")
         mi_edit.Enable(own_message)
+        mi_undo.Enable(self._can_undo_delete())
         self.Bind(wx.EVT_MENU, self.on_edit_selected_message, mi_edit)
         self.Bind(wx.EVT_MENU, self.on_remove_selected_message, mi_remove)
+        self.Bind(wx.EVT_MENU, self.on_undo_last_deleted_message, mi_undo)
         self.PopupMenu(menu)
         menu.Destroy()
     def on_edit_selected_message(self, _):
@@ -4004,7 +4064,7 @@ class ChatDialog(wx.Dialog):
         if idx is None:
             return
         row = self._history_rows[idx]
-        if row.get("sender") != self.user or row.get("error", False):
+        if not self._is_row_editable(row):
             return
         self.input_ctrl.SetValue(str(row.get("text", "")))
         self.input_ctrl.SetFocus()
@@ -4013,10 +4073,27 @@ class ChatDialog(wx.Dialog):
         idx = self._selected_history_index()
         if idx is None:
             return
-        self._history_rows.pop(idx)
+        row = self._history_rows.pop(idx)
+        self._last_deleted_message = {"row": row, "index": idx, "deleted_at": time.time()}
         self.hist.Delete(idx)
         if self.hist.GetCount() > 0:
             self.hist.SetSelection(max(0, idx - 1))
+    def on_undo_last_deleted_message(self, _):
+        if not self._can_undo_delete():
+            return
+        payload = self._last_deleted_message or {}
+        row = payload.get("row")
+        idx = int(payload.get("index", self.hist.GetCount()))
+        if not isinstance(row, dict):
+            return
+        idx = max(0, min(idx, self.hist.GetCount()))
+        self._history_rows.insert(idx, row)
+        formatted_time = format_timestamp(row.get("time", time.time()))
+        prefix = "Error" if row.get("error", False) else row.get("sender", "System")
+        display = f"[{formatted_time}] {prefix}: {row.get('text', '')}"
+        self.hist.Insert(display, idx)
+        self.hist.SetSelection(idx)
+        self._last_deleted_message = None
 
     def on_history_item_activated(self, event):
         idx = self.hist.GetSelection()
