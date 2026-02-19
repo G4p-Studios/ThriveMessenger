@@ -29,6 +29,18 @@ DEMO_VIDEOS = {
         "description": "Shows opening Server Manager, reviewing multiple servers, and updating primary server settings."
     },
 }
+
+# Legacy-safe fallback when a server does not implement feature capability APIs.
+# Core chat/login remains available; advanced controls stay disabled by default.
+LEGACY_SAFE_FEATURE_CAPS = {
+    "bots": {"enabled": False, "ui_visible": False, "scope": "all", "can_use": False},
+    "bot_rules": {"enabled": False, "ui_visible": False, "scope": "admin", "can_use": False},
+    "group_chat": {"enabled": False, "ui_visible": False, "scope": "all", "can_use": False},
+    "group_call": {"enabled": False, "ui_visible": False, "scope": "all", "can_use": False},
+    "group_policy": {"enabled": False, "ui_visible": False, "scope": "admin", "can_use": False},
+    "admin_console": {"enabled": True, "ui_visible": True, "scope": "admin", "can_use": True},
+    "server_manager": {"enabled": True, "ui_visible": True, "scope": "all", "can_use": True},
+}
 _KEYRING_WRITE_CACHE = {}
 _SOUND_DOWNLOAD_NOTICE_CACHE = set()
 _SOUND_DOWNLOAD_FAILURE_CACHE = set()
@@ -3089,6 +3101,7 @@ class MainFrame(wx.Frame):
         self.refresh_connection_title(connected=True)
         self.current_status = wx.GetApp().user_config.get('status', 'online')
         self.feature_caps = {}
+        self.feature_caps_supported = False
         self._empty_prompt_shown = False
         self._sort_mode = "name_asc"
         self._unread_counts = {}
@@ -3159,7 +3172,9 @@ class MainFrame(wx.Frame):
         self.apply_feature_visibility()
 
     def _feature(self, key):
-        return self.feature_caps.get(key, {})
+        if self.feature_caps_supported:
+            return self.feature_caps.get(key, {})
+        return LEGACY_SAFE_FEATURE_CAPS.get(key, {"enabled": False, "ui_visible": False, "scope": "all", "can_use": False})
 
     def _feature_can_use(self, key):
         cap = self._feature(key)
@@ -3177,13 +3192,18 @@ class MainFrame(wx.Frame):
         if not isinstance(caps, dict):
             return
         self.feature_caps = caps
+        self.feature_caps_supported = bool(caps)
         self.apply_feature_visibility()
 
     def apply_feature_visibility(self):
         group_calls_visible = self._feature_ui_visible("group_call")
         group_calls_enabled = self._feature_can_use("group_call")
         self.mi_group_calls.Enable(group_calls_enabled)
-        self.mi_group_calls.SetItemLabel("Group Calls" if group_calls_visible else "Group Calls (Hidden by server policy)")
+        if group_calls_visible:
+            self.mi_group_calls.SetItemLabel("Group Calls")
+        else:
+            hidden_reason = "server policy" if self.feature_caps_supported else "server compatibility mode"
+            self.mi_group_calls.SetItemLabel(f"Group Calls (Hidden by {hidden_reason})")
 
         server_mgr_visible = self._feature_ui_visible("server_manager")
         server_mgr_enabled = self._feature_can_use("server_manager")
@@ -3838,7 +3858,15 @@ class MainFrame(wx.Frame):
         c = contact_data; self.contact_states[c["user"]] = c["blocked"]
         status = c.get("status_text", "online") if c["online"] and not c["blocked"] else "offline"
         if c.get("is_admin"): status += " (Admin)"
-        self._all_contacts.append({"user": c["user"], "status": status, "blocked": c["blocked"]})
+        updated = False
+        for row in self._all_contacts:
+            if row.get("user") == c["user"]:
+                row["status"] = status
+                row["blocked"] = c["blocked"]
+                updated = True
+                break
+        if not updated:
+            self._all_contacts.append({"user": c["user"], "status": status, "blocked": c["blocked"]})
         bot_token = str(c.get("bot_auth_token", "") or "").strip()
         if bot_token:
             show_notification("Bot Token Issued", f"{c['user']} token created for this client session.", timeout=8)
@@ -3907,6 +3935,10 @@ class MainFrame(wx.Frame):
                 if c == self.user: wx.MessageBox("You cannot add yourself as a contact.", "Input Error", wx.ICON_ERROR); return
                 self.sock.sendall(json.dumps({"action":"add_contact","to":c}).encode()+b"\n")
     def load_contacts(self, contacts):
+        deduped = {}
+        for c in contacts:
+            deduped[c["user"]] = c
+        contacts = list(deduped.values())
         self.contact_states = {c["user"]: c["blocked"] for c in contacts}
         self._all_contacts = []
         for c in contacts:
