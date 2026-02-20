@@ -5,6 +5,8 @@ This repo now includes:
 - `srv/scripts/deploy_and_restart.sh`
 - `srv/scripts/deploy_hook_api.py`
 - `.github/workflows/deploy-server.yml`
+- `.github/workflows/stage-server-shared.yml`
+- `srv/scripts/make_server_bundle.sh`
 
 ## 1) One-time server setup
 
@@ -73,3 +75,28 @@ curl -sS -X POST http://127.0.0.1:18777/deploy \
 ```
 
 Recommended: expose only behind reverse proxy + auth (Authelia) or keep localhost-only.
+
+## 5) Shared handoff mode (`/home/wharper/shared/*`)
+
+If the deploy account cannot restart PM2 directly (for example, runtime owned by another user), use the staging workflow:
+
+- Workflow: `Stage Server Bundle To Shared`
+- It uploads a bundle into:
+  - `/home/wharper/shared/thrive/incoming/*.tar.gz`
+  - plus `latest.tar.gz` symlink in `/home/wharper/shared/thrive/`
+
+### Required secrets for staging workflow
+
+- `DEPLOY_SSH_KEY`
+- `DEPLOY_HOST`
+- `DEPLOY_PORT` (optional)
+- `DEPLOY_USER` (for example `wharper`)
+- `DEPLOY_SHARED_DIR` (optional; default `/home/wharper/shared/thrive`)
+
+### Apply from the runtime owner account (example)
+
+```bash
+cd /path/to/runtime/repo
+tar -xzf /home/wharper/shared/thrive/latest.tar.gz -C .
+pm2 restart thrive-server --update-env
+```

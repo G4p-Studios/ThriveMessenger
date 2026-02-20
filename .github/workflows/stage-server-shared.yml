@@ -1,0 +1,82 @@
+name: Stage Server Bundle To Shared
+
+on:
+  workflow_dispatch:
+    inputs:
+      bundle_label:
+        description: "Optional bundle label suffix"
+        required: false
+        default: ""
+  push:
+    branches: [main]
+    paths:
+      - "srv/**"
+      - "main.py"
+      - "client.conf"
+      - "pyproject.toml"
+      - ".github/workflows/stage-server-shared.yml"
+
+jobs:
+  stage:
+    runs-on: ubuntu-latest
+    env:
+      BUNDLE_LABEL: ${{ github.event.inputs.bundle_label || '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build server bundle
+        id: bundle
+        run: |
+          chmod +x srv/scripts/make_server_bundle.sh
+          SHA="$(git rev-parse --short HEAD)"
+          TS="$(date -u +%Y%m%d-%H%M%SZ)"
+          NAME="thrive-server-${TS}-${SHA}"
+          if [ -n "${BUNDLE_LABEL}" ]; then
+            NAME="${NAME}-${BUNDLE_LABEL}"
+          fi
+          OUT="/tmp/${NAME}.tar.gz"
+          srv/scripts/make_server_bundle.sh "${OUT}"
+          MANIFEST="/tmp/${NAME}.manifest.txt"
+          {
+            echo "bundle_name=${NAME}"
+            echo "head_sha=$(git rev-parse HEAD)"
+            echo "created_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "workflow_run=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } > "${MANIFEST}"
+          echo "bundle_name=${NAME}" >> "${GITHUB_OUTPUT}"
+          echo "bundle_path=${OUT}" >> "${GITHUB_OUTPUT}"
+          echo "manifest_path=${MANIFEST}" >> "${GITHUB_OUTPUT}"
+
+      - name: Prepare SSH key
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          if [ -n "${{ secrets.DEPLOY_KNOWN_HOSTS }}" ]; then
+            printf '%s\n' "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          else
+            ssh-keyscan -H "${{ secrets.DEPLOY_HOST }}" >> ~/.ssh/known_hosts
+          fi
+
+      - name: Upload bundle to /home/wharper/shared
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SHARED_DIR: ${{ secrets.DEPLOY_SHARED_DIR }}
+        run: |
+          : "${DEPLOY_HOST:?missing DEPLOY_HOST secret}"
+          : "${DEPLOY_USER:?missing DEPLOY_USER secret}"
+          SHARED_DIR="${DEPLOY_SHARED_DIR:-/home/wharper/shared/thrive}"
+          TARGET_DIR="${SHARED_DIR}/incoming"
+          SCP_PORT_ARG=""
+          SSH_PORT_ARG=""
+          if [ -n "${DEPLOY_PORT}" ]; then
+            SCP_PORT_ARG="-P ${DEPLOY_PORT}"
+            SSH_PORT_ARG="-p ${DEPLOY_PORT}"
+          fi
+          ssh ${SSH_PORT_ARG} "${DEPLOY_USER}@${DEPLOY_HOST}" "mkdir -p '${TARGET_DIR}'"
+          scp ${SCP_PORT_ARG} "${{ steps.bundle.outputs.bundle_path }}" "${DEPLOY_USER}@${DEPLOY_HOST}:${TARGET_DIR}/${{ steps.bundle.outputs.bundle_name }}.tar.gz"
+          scp ${SCP_PORT_ARG} "${{ steps.bundle.outputs.manifest_path }}" "${DEPLOY_USER}@${DEPLOY_HOST}:${TARGET_DIR}/${{ steps.bundle.outputs.bundle_name }}.manifest.txt"
+          ssh ${SSH_PORT_ARG} "${DEPLOY_USER}@${DEPLOY_HOST}" "ln -sfn '${TARGET_DIR}/${{ steps.bundle.outputs.bundle_name }}.tar.gz' '${SHARED_DIR}/latest.tar.gz'; ln -sfn '${TARGET_DIR}/${{ steps.bundle.outputs.bundle_name }}.manifest.txt' '${SHARED_DIR}/latest.manifest.txt'"

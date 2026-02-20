@@ -100,6 +100,7 @@ This repo includes an optional server deploy flow that can pull latest code and 
 - GitHub Actions workflow: `.github/workflows/deploy-server.yml`
 - Deploy script: `srv/scripts/deploy_and_restart.sh`
 - Optional deploy API endpoint: `srv/scripts/deploy_hook_api.py`
+- Shared handoff workflow: `.github/workflows/stage-server-shared.yml`
 
 Setup details are documented in:
 
