@@ -43,7 +43,8 @@ LEGACY_SAFE_FEATURE_CAPS = {
     "group_chat": {"enabled": False, "ui_visible": False, "scope": "all", "can_use": False},
     "group_call": {"enabled": False, "ui_visible": False, "scope": "all", "can_use": False},
     "group_policy": {"enabled": False, "ui_visible": False, "scope": "admin", "can_use": False},
-    "admin_console": {"enabled": True, "ui_visible": True, "scope": "admin", "can_use": True},
+    "admin_console": {"enabled": False, "ui_visible": False, "scope": "admin", "can_use": False},
+    "voice_call": {"enabled": False, "ui_visible": False, "scope": "all", "can_use": False},
     "server_manager": {"enabled": True, "ui_visible": True, "scope": "all", "can_use": True},
 }
 _KEYRING_WRITE_CACHE = {}
@@ -1316,8 +1317,9 @@ class ThriveTaskBarIcon(wx.adv.TaskBarIcon):
     def on_exit(self, event): self.frame.on_exit(None)
 
 class SettingsDialog(wx.Dialog):
-    def __init__(self, parent, current_config):
+    def __init__(self, parent, current_config, can_admin=False):
         super().__init__(parent, title="Settings", size=(560, 650)); self.config = current_config
+        self._can_admin = bool(can_admin)
         self.Bind(wx.EVT_CHAR_HOOK, self.on_key)
         panel = wx.Panel(self); main_sizer = wx.BoxSizer(wx.VERTICAL)
         notebook = wx.Notebook(panel)
@@ -1326,7 +1328,8 @@ class SettingsDialog(wx.Dialog):
         tab_admin = wx.Panel(notebook)
         notebook.AddPage(tab_general, "General")
         notebook.AddPage(tab_audio, "Audio")
-        notebook.AddPage(tab_admin, "Administration")
+        if self._can_admin:
+            notebook.AddPage(tab_admin, "Administration")
         sound_box = wx.StaticBoxSizer(wx.VERTICAL, tab_audio, "&Sound Pack")
         call_audio_box = wx.StaticBoxSizer(wx.VERTICAL, tab_audio, "Call Audio Levels")
         accessibility_box = wx.StaticBoxSizer(wx.VERTICAL, tab_general, "&Chat Behavior")
@@ -3506,10 +3509,21 @@ class UserDirectoryDialog(wx.Dialog):
                 is_contact=True,
                 remote_server_entry=target_server_entry,
                 remote_target_user=user,
+                can_call=False,
+                show_call=False,
             )
         else:
             is_contact = user in self.contact_states
-            dlg = self.parent_frame.get_chat(user) or ChatDialog(self.parent_frame, user, self.parent_frame.sock, self.parent_frame.user, is_logging_enabled, is_contact=is_contact)
+            dlg = self.parent_frame.get_chat(user) or ChatDialog(
+                self.parent_frame,
+                user,
+                self.parent_frame.sock,
+                self.parent_frame.user,
+                is_logging_enabled,
+                is_contact=is_contact,
+                can_call=self.parent_frame.can_use_voice_call(),
+                show_call=self.parent_frame.is_voice_call_visible(),
+            )
         dlg.Show(); wx.CallAfter(dlg.input_ctrl.SetFocus)
     def on_send_file(self, _):
         self._selected_user = self._get_selected_user()
@@ -3867,6 +3881,13 @@ class MainFrame(wx.Frame):
             return self.feature_caps.get(key, {})
         return LEGACY_SAFE_FEATURE_CAPS.get(key, {"enabled": False, "ui_visible": False, "scope": "all", "can_use": False})
 
+    def _feature_any(self, keys):
+        for key in keys:
+            cap = self._feature(key)
+            if cap:
+                return cap
+        return {}
+
     def _feature_can_use(self, key):
         cap = self._feature(key)
         if not cap:
@@ -3879,17 +3900,31 @@ class MainFrame(wx.Frame):
             return True
         return bool(cap.get("enabled", False) and cap.get("ui_visible", True))
 
+    def can_use_voice_call(self):
+        # Support capability naming variants while enforcing role/capability gating.
+        cap = self._feature_any(("voice_call", "call", "calls"))
+        if not cap:
+            return False
+        return bool(cap.get("enabled", False) and cap.get("can_use", False))
+
+    def is_voice_call_visible(self):
+        cap = self._feature_any(("voice_call", "call", "calls"))
+        if not cap:
+            return False
+        return bool(cap.get("enabled", False) and cap.get("ui_visible", True))
+
     def set_feature_caps(self, caps):
         if not isinstance(caps, dict):
             return
         self.feature_caps = caps
         self.feature_caps_supported = bool(caps)
         self.apply_feature_visibility()
+        self._refresh_open_chat_permissions()
 
     def apply_feature_visibility(self):
         group_calls_visible = self._feature_ui_visible("group_call")
         group_calls_enabled = self._feature_can_use("group_call")
-        self.mi_group_calls.Enable(group_calls_enabled)
+        self.mi_group_calls.Enable(group_calls_enabled and group_calls_visible)
         if group_calls_visible:
             self.mi_group_calls.SetItemLabel("Group Calls")
         else:
@@ -3917,13 +3952,21 @@ class MainFrame(wx.Frame):
             self.btn_settings.Refresh()
         self.Layout()
 
+    def _refresh_open_chat_permissions(self):
+        can_call = self.can_use_voice_call()
+        show_call = self.is_voice_call_visible()
+        for child in self.GetChildren():
+            if isinstance(child, ChatDialog):
+                child.apply_call_permissions(can_call, show_call)
+
     def apply_action_button_layout(self):
         show_actions = bool(wx.GetApp().user_config.get('show_main_action_buttons', True))
         for btn in [self.btn_block, self.btn_send, self.btn_send_file, self.btn_delete, self.btn_info, self.btn_status, self.btn_directory, self.btn_settings, self.btn_update, self.btn_logout, self.btn_exit]:
             btn.Show(show_actions)
-        # Keep add contact and admin visible for keyboard/tab workflow.
+        # Keep add contact visible for keyboard/tab workflow.
         self.btn_add.Show(True)
-        self.btn_admin.Show(bool(getattr(self, "mi_admin_visible", True)))
+        self.btn_admin.Show(bool(show_actions and getattr(self, "mi_admin_visible", False)))
+        self.btn_admin.Enable(bool(getattr(self, "mi_admin_visible", False) and self._feature_can_use("admin_console")))
         if self._root_sizer:
             self._root_sizer.Layout()
 
@@ -4231,7 +4274,8 @@ class MainFrame(wx.Frame):
 
     def on_settings(self, event):
         app = wx.GetApp()
-        with SettingsDialog(self, app.user_config) as dlg:
+        can_admin_settings = self._feature_can_use("admin_console") and self._feature_ui_visible("admin_console")
+        with SettingsDialog(self, app.user_config, can_admin=can_admin_settings) as dlg:
             if dlg.ShowModal() == wx.ID_OK:
                 selected_pack = dlg.choice.GetStringSelection()
                 app.user_config['soundpack'] = selected_pack
@@ -4264,7 +4308,9 @@ class MainFrame(wx.Frame):
                 app.user_config['message_edit_window_seconds'] = edit_window
                 app.user_config['message_undo_window_seconds'] = undo_window
                 app.user_config['allow_cross_server_directory_message'] = dlg.allow_cross_server_dm_cb.IsChecked()
-                ok_admin, admin_err = dlg.apply_admin_config()
+                ok_admin, admin_err = (True, None)
+                if can_admin_settings:
+                    ok_admin, admin_err = dlg.apply_admin_config()
                 save_user_config(app.user_config)
                 self.apply_action_button_layout()
                 self._apply_search_filter()
@@ -5054,7 +5100,15 @@ class MainFrame(wx.Frame):
                 self._show_add_contact_prompt()
             return
         app = wx.GetApp(); is_logging_enabled = is_chat_logging_enabled(app.user_config, c)
-        dlg = self.get_chat(c) or ChatDialog(self, c, self.sock, self.user, is_logging_enabled)
+        dlg = self.get_chat(c) or ChatDialog(
+            self,
+            c,
+            self.sock,
+            self.user,
+            is_logging_enabled,
+            can_call=self.can_use_voice_call(),
+            show_call=self.is_voice_call_visible(),
+        )
         dlg.Show(); wx.CallAfter(dlg.input_ctrl.SetFocus)
         self._clear_unread(c)
     def on_send_file(self, _):
@@ -5082,7 +5136,16 @@ class MainFrame(wx.Frame):
         is_contact = sender in self.contact_states
         dlg = self.get_chat(sender)
         if not dlg:
-            dlg = ChatDialog(self, sender, self.sock, self.user, is_logging_enabled, is_contact=is_contact)
+            dlg = ChatDialog(
+                self,
+                sender,
+                self.sock,
+                self.user,
+                is_logging_enabled,
+                is_contact=is_contact,
+                can_call=self.can_use_voice_call(),
+                show_call=self.is_voice_call_visible(),
+            )
         incoming_behavior = str(app.user_config.get('incoming_message_behavior', 'silent_count') or 'silent_count').strip().lower()
         if incoming_behavior == 'popup':
             dlg.Show()
@@ -5669,7 +5732,7 @@ class GroupCallDialog(wx.Dialog):
             self._append_log(f"Signal failed: {msg.get('reason', 'unknown error')}")
 
 class ChatDialog(wx.Dialog):
-    def __init__(self, parent, contact, sock, user, logging_enabled=False, is_contact=True, remote_server_entry=None, remote_target_user=None):
+    def __init__(self, parent, contact, sock, user, logging_enabled=False, is_contact=True, remote_server_entry=None, remote_target_user=None, can_call=False, show_call=False):
         title_contact = contact
         try:
             if parent and hasattr(parent, "format_user_label"):
@@ -5682,6 +5745,8 @@ class ChatDialog(wx.Dialog):
         self.remote_server_entry = remote_server_entry
         self.remote_target_user = str(remote_target_user or contact)
         self.is_remote_directory_chat = self.remote_server_entry is not None
+        self._can_call = bool(can_call)
+        self._show_call = bool(show_call)
         self._pending_message_after_add = None
         self._last_deleted_message = None
         self._last_escape_ts = 0.0
@@ -5719,11 +5784,11 @@ class ChatDialog(wx.Dialog):
         self._consume_next_text_enter = False
         btn = wx.Button(self, label="&Send")
         btn_file = wx.Button(self, label="Send &File")
-        btn_call = wx.Button(self, label="Place &Call")
+        self.btn_call = wx.Button(self, label="Place &Call")
         btn_saved = wx.Button(self, label="Saved &Messages")
         apply_voiceover_hint(btn, "Send the typed message.")
         apply_voiceover_hint(btn_file, "Send a file to this chat contact.")
-        apply_voiceover_hint(btn_call, "Place a voice call to this contact.")
+        apply_voiceover_hint(self.btn_call, "Place a voice call to this contact.")
         apply_voiceover_hint(btn_saved, "Show saved messages grouped by date.")
         apply_voiceover_hint(self.btn_add_contact, "Add this person to your contacts.")
         apply_voiceover_hint(self.input_ctrl, "Message input. Enter sends, Command+Enter inserts a new line, Control+Enter sends file.")
@@ -5735,7 +5800,7 @@ class ChatDialog(wx.Dialog):
             self.input_ctrl.SetBackgroundColour(dark_color); self.input_ctrl.SetForegroundColour(light_text_color)
             btn.SetBackgroundColour(dark_color); btn.SetForegroundColour(light_text_color)
             btn_file.SetBackgroundColour(dark_color); btn_file.SetForegroundColour(light_text_color)
-            btn_call.SetBackgroundColour(dark_color); btn_call.SetForegroundColour(light_text_color)
+            self.btn_call.SetBackgroundColour(dark_color); self.btn_call.SetForegroundColour(light_text_color)
             btn_saved.SetBackgroundColour(dark_color); btn_saved.SetForegroundColour(light_text_color)
 
         s.Add(self.hist, 1, wx.EXPAND|wx.ALL, 5)
@@ -5748,16 +5813,27 @@ class ChatDialog(wx.Dialog):
 
         btn.Bind(wx.EVT_BUTTON, self.on_send)
         btn_file.Bind(wx.EVT_BUTTON, self.on_send_file)
-        btn_call.Bind(wx.EVT_BUTTON, self.on_place_call)
+        self.btn_call.Bind(wx.EVT_BUTTON, self.on_place_call)
         btn_saved.Bind(wx.EVT_BUTTON, self.on_show_saved_messages)
         btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
         btn_sizer.Add(btn, 1, wx.EXPAND | wx.ALL, 5)
         btn_sizer.Add(btn_file, 1, wx.EXPAND | wx.ALL, 5)
-        btn_sizer.Add(btn_call, 1, wx.EXPAND | wx.ALL, 5)
+        btn_sizer.Add(self.btn_call, 1, wx.EXPAND | wx.ALL, 5)
         btn_sizer.Add(btn_saved, 1, wx.EXPAND | wx.ALL, 5)
         s.Add(btn_sizer, 0, wx.EXPAND|wx.ALL, 5)
         self.SetSizer(s)
+        self.apply_call_permissions(self._can_call, self._show_call)
         self._focus_input()
+    def apply_call_permissions(self, can_call, show_call):
+        self._can_call = bool(can_call)
+        self._show_call = bool(show_call)
+        if self.is_remote_directory_chat:
+            self._can_call = False
+            self._show_call = False
+        if hasattr(self, "btn_call") and self.btn_call:
+            self.btn_call.Show(self._show_call)
+            self.btn_call.Enable(self._can_call and self._show_call)
+            self.GetSizer().Layout()
     def _is_logging_enabled_now(self):
         app = wx.GetApp()
         try:
@@ -5990,6 +6066,9 @@ class ChatDialog(wx.Dialog):
             return
         wx.GetApp().send_file_to(self.contact)
     def on_place_call(self, _):
+        if not self._can_call:
+            wx.MessageBox("Calling is disabled for your account on this server.", "Feature Disabled", wx.OK | wx.ICON_INFORMATION)
+            return
         if self.is_remote_directory_chat:
             wx.MessageBox("Cross-server calling is not supported in directory direct message mode.", "Feature Not Supported", wx.OK | wx.ICON_INFORMATION)
             return
