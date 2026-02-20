@@ -810,11 +810,8 @@ class EmailManager:
             return False
 
     @staticmethod
-    def generate_code(length=6):
-        if length <= 6:
-            # Preserve a short user-facing code option while using CSPRNG.
-            return ''.join(secrets.choice('0123456789') for _ in range(length))
-        return secrets.token_hex(max(1, length // 2))
+    def generate_code():
+        return secrets.token_hex(16)  # 32-char hex, 128-bit entropy
 
 class FlexPBXManager:
     @staticmethod
@@ -888,17 +885,38 @@ def broadcast_alert(message):
             try: sock.sendall(msg.encode())
             except: pass
 
+def _parse_duration(s):
+    """Parse a duration string like '5m', '1h', '30m' into (seconds, human_readable).
+    Clamps to max 24h. Defaults to 5m on bad input."""
+    import re
+    m = re.fullmatch(r'(\d+)\s*([mh])', (s or '').strip().lower())
+    if not m:
+        return 300, "5 minutes"
+    val, unit = int(m.group(1)), m.group(2)
+    secs = val * 3600 if unit == 'h' else val * 60
+    secs = min(secs, 86400)  # cap at 24h
+    if unit == 'h':
+        val = secs // 3600
+        human = f"{val} hour{'s' if val != 1 else ''}"
+    else:
+        val = secs // 60
+        human = f"{val} minute{'s' if val != 1 else ''}"
+    return secs, human
+
 def load_config():
     # Fix: interpolation=None prevents % characters in password from breaking the parser
     config = configparser.ConfigParser(interpolation=None)
     config.read('srv.conf')
     global smtp_config
+    _code_secs, _code_human = _parse_duration(config.get('smtp', 'code_expires', fallback='5m'))
     smtp_config = {
         'enabled': config.getboolean('smtp', 'enabled', fallback=False),
         'server': config.get('smtp', 'server', fallback=''),
         'port': config.getint('smtp', 'port', fallback=587),
         'email': config.get('smtp', 'email', fallback=''),
-        'password': config.get('smtp', 'password', fallback='')
+        'password': config.get('smtp', 'password', fallback=''),
+        'code_expires': _code_secs,
+        'code_expires_human': _code_human,
     }
     global flexpbx_config
     flexpbx_config = {
@@ -963,7 +981,7 @@ def load_config():
         'piper_timeout': config.getint('bots', 'piper_timeout', fallback=12),
     }
     return {
-        'port': config.getint('server', 'port', fallback=5005),
+        'port': config.getint('server', 'port', fallback=2005),
         'certfile': config.get('server', 'certfile', fallback='server.crt'),
         'keyfile': config.get('server', 'keyfile', fallback='server.key'),
     }
@@ -980,6 +998,8 @@ def init_db():
     if 'verification_code' not in existing_cols: cur.execute("ALTER TABLE users ADD COLUMN verification_code TEXT")
     if 'is_verified' not in existing_cols: cur.execute("ALTER TABLE users ADD COLUMN is_verified INTEGER DEFAULT 1") # Default 1 for old users
     if 'reset_code' not in existing_cols: cur.execute("ALTER TABLE users ADD COLUMN reset_code TEXT")
+    if 'verification_code_at' not in existing_cols: cur.execute("ALTER TABLE users ADD COLUMN verification_code_at TEXT")
+    if 'reset_code_at' not in existing_cols: cur.execute("ALTER TABLE users ADD COLUMN reset_code_at TEXT")
 
     cur.execute('''CREATE TABLE IF NOT EXISTS contacts (owner TEXT, contact TEXT, blocked INTEGER DEFAULT 0, PRIMARY KEY(owner, contact))''')
     cur.execute('''CREATE TABLE IF NOT EXISTS bot_tokens (owner TEXT, bot TEXT, token TEXT, created_at TEXT, PRIMARY KEY(owner, bot))''')
@@ -1066,17 +1086,19 @@ def handle_client(cs, addr):
             # Logic: If SMTP is on, set verified=0, gen code, send email. Else verified=1.
             verified = 1 if not smtp_config['enabled'] else 0
             code = EmailManager.generate_code() if not verified else None
-            
+            code_at = datetime.datetime.utcnow().isoformat() if code else None
+
             hashed_pass = _ph.hash(new_pass)
             if row: # Overwriting unverified
-                con.execute("UPDATE users SET password=?, email=?, verification_code=?, is_verified=? WHERE username=?", (hashed_pass, email, code, verified, new_user))
+                con.execute("UPDATE users SET password=?, email=?, verification_code=?, verification_code_at=?, is_verified=? WHERE username=?", (hashed_pass, email, code, code_at, verified, new_user))
             else:
-                con.execute("INSERT INTO users(username, password, email, verification_code, is_verified) VALUES(?,?,?,?,?)", (new_user, hashed_pass, email, code, verified))
+                con.execute("INSERT INTO users(username, password, email, verification_code, verification_code_at, is_verified) VALUES(?,?,?,?,?,?)", (new_user, hashed_pass, email, code, code_at, verified))
             con.commit()
             con.close()
 
             if not verified:
-                if EmailManager.send_email(email, "Thrive Messenger - Verify Account", f"Your verification code is: {code}"):
+                expire_human = smtp_config.get('code_expires_human', '5 minutes')
+                if EmailManager.send_email(email, "Thrive Messenger - Verify Account", f"Your verification code is: {code}\n\nThis code will expire in {expire_human}."):
                     sock.sendall((json.dumps({"action": "verify_pending"}) + "\n").encode())
                 else:
                     # Fallback if email fails? For now just say success but maybe log it.
@@ -1097,9 +1119,17 @@ def handle_client(cs, addr):
             u_ver = req.get("user")
             code_ver = req.get("code")
             con = sqlite3.connect(DB)
-            row = con.execute("SELECT verification_code FROM users WHERE username=?", (u_ver,)).fetchone()
+            row = con.execute("SELECT verification_code, verification_code_at FROM users WHERE username=?", (u_ver,)).fetchone()
             if row and row[0] == code_ver:
-                con.execute("UPDATE users SET is_verified=1, verification_code=NULL WHERE username=?", (u_ver,))
+                # Check expiration
+                if row[1]:
+                    elapsed = (datetime.datetime.utcnow() - datetime.datetime.fromisoformat(row[1])).total_seconds()
+                    if elapsed > smtp_config.get('code_expires', 300):
+                        con.execute("UPDATE users SET verification_code=NULL, verification_code_at=NULL WHERE username=?", (u_ver,))
+                        con.commit(); con.close()
+                        sock.sendall(json.dumps({"status": "error", "reason": "Code has expired."}).encode() + b"\n")
+                        return
+                con.execute("UPDATE users SET is_verified=1, verification_code=NULL, verification_code_at=NULL WHERE username=?", (u_ver,))
                 con.commit(); con.close()
                 sock.sendall(json.dumps({"status": "ok"}).encode() + b"\n")
             else:
@@ -1117,9 +1147,10 @@ def handle_client(cs, addr):
                 t_user, t_email = row
                 if t_email:
                     code = EmailManager.generate_code()
-                    con.execute("UPDATE users SET reset_code=? WHERE username=?", (code, t_user))
+                    con.execute("UPDATE users SET reset_code=?, reset_code_at=? WHERE username=?", (code, datetime.datetime.utcnow().isoformat(), t_user))
                     con.commit()
-                    EmailManager.send_email(t_email, "Thrive Messenger - Password Reset", f"Your password reset code is: {code}")
+                    expire_human = smtp_config.get('code_expires_human', '5 minutes')
+                    EmailManager.send_email(t_email, "Thrive Messenger - Password Reset", f"Your password reset code is: {code}\n\nThis code will expire in {expire_human}.")
                     # Return OK even if email fails to prevent enumeration, mostly.
                     sock.sendall(json.dumps({"status": "ok", "user": t_user}).encode() + b"\n")
                 else:
@@ -1136,9 +1167,17 @@ def handle_client(cs, addr):
             t_code = req.get("code")
             new_p = req.get("new_pass")
             con = sqlite3.connect(DB)
-            row = con.execute("SELECT reset_code FROM users WHERE username=?", (t_user,)).fetchone()
+            row = con.execute("SELECT reset_code, reset_code_at FROM users WHERE username=?", (t_user,)).fetchone()
             if row and row[0] == t_code and t_code:
-                con.execute("UPDATE users SET password=?, reset_code=NULL WHERE username=?", (_ph.hash(new_p), t_user))
+                # Check expiration
+                if row[1]:
+                    elapsed = (datetime.datetime.utcnow() - datetime.datetime.fromisoformat(row[1])).total_seconds()
+                    if elapsed > smtp_config.get('code_expires', 300):
+                        con.execute("UPDATE users SET reset_code=NULL, reset_code_at=NULL WHERE username=?", (t_user,))
+                        con.commit(); con.close()
+                        sock.sendall(json.dumps({"status": "error", "reason": "Code has expired."}).encode() + b"\n")
+                        return
+                con.execute("UPDATE users SET password=?, reset_code=NULL, reset_code_at=NULL WHERE username=?", (_ph.hash(new_p), t_user))
                 con.commit(); con.close()
                 sock.sendall(json.dumps({"status": "ok"}).encode() + b"\n")
             else:
@@ -1189,6 +1228,7 @@ def handle_client(cs, addr):
             try: _ph.verify(stored, req["pass"]); ok = True; needs_rehash = _ph.check_needs_rehash(stored)
             except (VerifyMismatchError, VerificationError, InvalidHashError): pass
         else:
+            # Legacy plaintext — verify and rehash immediately
             ok = (stored == req["pass"])
             if ok: needs_rehash = True
         if ok and needs_rehash:
@@ -2127,11 +2167,8 @@ def handle_client(cs, addr):
                     stored = row[0] if row else None
                     ok = False
                     if stored:
-                        if stored.startswith("$argon2"):
-                            try: _ph.verify(stored, cur_pass); ok = True
-                            except (VerifyMismatchError, VerificationError, InvalidHashError): pass
-                        else:
-                            ok = (stored == cur_pass)
+                        try: _ph.verify(stored, cur_pass); ok = True
+                        except (VerifyMismatchError, VerificationError, InvalidHashError): pass
                     if ok:
                         con.execute("UPDATE users SET password=? WHERE username=?", (_ph.hash(new_pass), user))
                         con.commit(); con.close()
