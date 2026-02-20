@@ -378,7 +378,9 @@ def load_user_config():
         'read_messages_aloud': False,
         'typing_indicators': True,
         'announce_typing': True,
-        'enter_key_action': 'send',
+        'prefer_contact_display_names': False,
+        'contact_display_names': {},
+        'enter_key_action': 'none',
         'escape_main_action': 'none',
         'double_escape_to_close_chat': True,
         'save_chat_history_default': False,
@@ -388,6 +390,9 @@ def load_user_config():
         'directory_dm_defaults': {},
         'incoming_popup_on_message': False,
         'incoming_alert_on_message': False,
+        'incoming_message_behavior': 'silent_count',
+        'message_timestamp_mode': 'start',
+        'saved_history_date_order': 'mdy',
         'passkey_ids': {},
         'passkey_tokens': {},
     }
@@ -413,9 +418,9 @@ def load_user_config():
         settings['primary_server_name'] = primary
     if settings.get('last_server_name') not in [e['name'] for e in merged_entries]:
         settings['last_server_name'] = settings.get('primary_server_name') or merged_entries[0]['name']
-    enter_action = str(settings.get('enter_key_action', 'send') or 'send')
+    enter_action = str(settings.get('enter_key_action', 'none') or 'none')
     if enter_action not in ('send', 'place_call', 'none'):
-        settings['enter_key_action'] = 'send'
+        settings['enter_key_action'] = 'none'
     try:
         settings['message_edit_window_seconds'] = max(0, int(settings.get('message_edit_window_seconds', 300)))
     except Exception:
@@ -426,10 +431,33 @@ def load_user_config():
         settings['message_undo_window_seconds'] = 15
     settings['allow_cross_server_directory_message'] = bool(settings.get('allow_cross_server_directory_message', True))
     settings['double_escape_to_close_chat'] = bool(settings.get('double_escape_to_close_chat', True))
+    settings['prefer_contact_display_names'] = bool(settings.get('prefer_contact_display_names', False))
+    if not isinstance(settings.get('contact_display_names', {}), dict):
+        settings['contact_display_names'] = {}
     if not isinstance(settings.get('directory_dm_defaults', {}), dict):
         settings['directory_dm_defaults'] = {}
     settings['incoming_popup_on_message'] = bool(settings.get('incoming_popup_on_message', False))
     settings['incoming_alert_on_message'] = bool(settings.get('incoming_alert_on_message', False))
+    incoming_behavior = str(settings.get('incoming_message_behavior', '') or '').strip().lower()
+    valid_incoming_behaviors = ('popup', 'notify', 'do_nothing', 'play_sound', 'silent_count')
+    if incoming_behavior not in valid_incoming_behaviors:
+        if settings['incoming_popup_on_message']:
+            incoming_behavior = 'popup'
+        elif settings['incoming_alert_on_message']:
+            incoming_behavior = 'notify'
+        else:
+            incoming_behavior = 'silent_count'
+    settings['incoming_message_behavior'] = incoming_behavior
+    settings['incoming_popup_on_message'] = (incoming_behavior == 'popup')
+    settings['incoming_alert_on_message'] = incoming_behavior in ('notify', 'play_sound')
+    timestamp_mode = str(settings.get('message_timestamp_mode', 'start') or 'start').strip().lower()
+    if timestamp_mode not in ('start', 'end', 'off'):
+        timestamp_mode = 'start'
+    settings['message_timestamp_mode'] = timestamp_mode
+    date_order = str(settings.get('saved_history_date_order', 'mdy') or 'mdy').strip().lower()
+    if date_order not in ('mdy', 'dmy', 'ymd', 'ydm'):
+        date_order = 'mdy'
+    settings['saved_history_date_order'] = date_order
     if str(settings.get('autologin_mode', 'password') or 'password') not in ('password', 'passkey'):
         settings['autologin_mode'] = 'password'
     if not isinstance(settings.get('passkey_ids', {}), dict):
@@ -1351,19 +1379,53 @@ class SettingsDialog(wx.Dialog):
         self.typing_indicator_cb.SetValue(bool(self.config.get('typing_indicators', True)))
         self.announce_typing_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Announce typing start/stop")
         self.announce_typing_cb.SetValue(bool(self.config.get('announce_typing', True)))
-        self.incoming_popup_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Open chat windows automatically on incoming messages (legacy behavior)")
-        self.incoming_popup_cb.SetValue(bool(self.config.get('incoming_popup_on_message', False)))
-        self.incoming_alert_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Play sound/notification on incoming messages")
-        self.incoming_alert_cb.SetValue(bool(self.config.get('incoming_alert_on_message', False)))
+        self.prefer_display_names_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Prefer contact display names in chat and contacts")
+        self.prefer_display_names_cb.SetValue(bool(self.config.get('prefer_contact_display_names', False)))
+        incoming_row = wx.BoxSizer(wx.HORIZONTAL)
+        incoming_row.Add(wx.StaticText(accessibility_box.GetStaticBox(), label="Incoming message behavior:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        self.incoming_behavior_choice = wx.Choice(accessibility_box.GetStaticBox(), choices=[
+            "Pop up chat window automatically",
+            "Show notification with username",
+            "Do nothing",
+            "Play sound only",
+            "Stay silent and update unread count only",
+        ])
+        incoming_val = str(self.config.get('incoming_message_behavior', 'silent_count') or 'silent_count').strip().lower()
+        incoming_idx_map = {'popup': 0, 'notify': 1, 'do_nothing': 2, 'play_sound': 3, 'silent_count': 4}
+        self.incoming_behavior_choice.SetSelection(incoming_idx_map.get(incoming_val, 4))
+        incoming_row.Add(self.incoming_behavior_choice, 1, wx.EXPAND)
+        timestamp_row = wx.BoxSizer(wx.HORIZONTAL)
+        timestamp_row.Add(wx.StaticText(accessibility_box.GetStaticBox(), label="Message timestamps:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        self.timestamp_mode_choice = wx.Choice(accessibility_box.GetStaticBox(), choices=[
+            "Show at start of message",
+            "Append at end of message",
+            "Hide timestamps",
+        ])
+        ts_val = str(self.config.get('message_timestamp_mode', 'start') or 'start').strip().lower()
+        ts_idx_map = {'start': 0, 'end': 1, 'off': 2}
+        self.timestamp_mode_choice.SetSelection(ts_idx_map.get(ts_val, 0))
+        timestamp_row.Add(self.timestamp_mode_choice, 1, wx.EXPAND)
+        date_group_row = wx.BoxSizer(wx.HORIZONTAL)
+        date_group_row.Add(wx.StaticText(accessibility_box.GetStaticBox(), label="Saved message date order:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        self.saved_date_order_choice = wx.Choice(accessibility_box.GetStaticBox(), choices=[
+            "Month Day Year (MDY)",
+            "Day Month Year (DMY)",
+            "Year Month Day (YMD)",
+            "Year Day Month (YDM)",
+        ])
+        order_val = str(self.config.get('saved_history_date_order', 'mdy') or 'mdy').strip().lower()
+        order_idx_map = {'mdy': 0, 'dmy': 1, 'ymd': 2, 'ydm': 3}
+        self.saved_date_order_choice.SetSelection(order_idx_map.get(order_val, 0))
+        date_group_row.Add(self.saved_date_order_choice, 1, wx.EXPAND)
         enter_row = wx.BoxSizer(wx.HORIZONTAL)
         enter_row.Add(wx.StaticText(accessibility_box.GetStaticBox(), label="Enter key action:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
         self.enter_action_choice = wx.Choice(accessibility_box.GetStaticBox(), choices=[
-            "Send message (default)",
+            "Do nothing (default)",
+            "Send message",
             "Place call",
-            "Do nothing",
         ])
-        enter_val = str(self.config.get('enter_key_action', 'send') or 'send')
-        self.enter_action_choice.SetSelection(0 if enter_val == 'send' else (1 if enter_val == 'place_call' else 2))
+        enter_val = str(self.config.get('enter_key_action', 'none') or 'none')
+        self.enter_action_choice.SetSelection(0 if enter_val == 'none' else (1 if enter_val == 'send' else 2))
         enter_row.Add(self.enter_action_choice, 1, wx.EXPAND)
         escape_row = wx.BoxSizer(wx.HORIZONTAL)
         escape_row.Add(wx.StaticText(accessibility_box.GetStaticBox(), label="Escape in main window:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
@@ -1444,8 +1506,10 @@ class SettingsDialog(wx.Dialog):
         accessibility_box.Add(self.show_main_actions_cb, 0, wx.ALL, 5)
         accessibility_box.Add(self.typing_indicator_cb, 0, wx.ALL, 5)
         accessibility_box.Add(self.announce_typing_cb, 0, wx.ALL, 5)
-        accessibility_box.Add(self.incoming_popup_cb, 0, wx.ALL, 5)
-        accessibility_box.Add(self.incoming_alert_cb, 0, wx.ALL, 5)
+        accessibility_box.Add(self.prefer_display_names_cb, 0, wx.ALL, 5)
+        accessibility_box.Add(incoming_row, 0, wx.EXPAND | wx.ALL, 5)
+        accessibility_box.Add(timestamp_row, 0, wx.EXPAND | wx.ALL, 5)
+        accessibility_box.Add(date_group_row, 0, wx.EXPAND | wx.ALL, 5)
         accessibility_box.Add(enter_row, 0, wx.EXPAND | wx.ALL, 5)
         accessibility_box.Add(escape_row, 0, wx.EXPAND | wx.ALL, 5)
         accessibility_box.Add(self.double_escape_chat_cb, 0, wx.ALL, 5)
@@ -1492,7 +1556,7 @@ class SettingsDialog(wx.Dialog):
             self.call_in_label.SetForegroundColour(light_text_color)
             self.call_out_label.SetForegroundColour(light_text_color)
             self.admin_hint.SetForegroundColour(light_text_color)
-            for cb in [self.auto_open_files_cb, self.read_aloud_cb, self.global_chat_logging_cb, self.show_main_actions_cb, self.typing_indicator_cb, self.announce_typing_cb, self.incoming_popup_cb, self.incoming_alert_cb, self.double_escape_chat_cb]:
+            for cb in [self.auto_open_files_cb, self.read_aloud_cb, self.global_chat_logging_cb, self.show_main_actions_cb, self.typing_indicator_cb, self.announce_typing_cb, self.prefer_display_names_cb, self.double_escape_chat_cb]:
                 cb.SetForegroundColour(light_text_color)
             self.restart_after_save_cb.SetForegroundColour(light_text_color)
             self.allow_cross_server_dm_cb.SetForegroundColour(light_text_color)
@@ -1501,6 +1565,9 @@ class SettingsDialog(wx.Dialog):
             self.restart_delay_txt.SetBackgroundColour(dark_color); self.restart_delay_txt.SetForegroundColour(light_text_color)
             self.enter_action_choice.SetBackgroundColour(dark_color); self.enter_action_choice.SetForegroundColour(light_text_color)
             self.escape_action_choice.SetBackgroundColour(dark_color); self.escape_action_choice.SetForegroundColour(light_text_color)
+            self.incoming_behavior_choice.SetBackgroundColour(dark_color); self.incoming_behavior_choice.SetForegroundColour(light_text_color)
+            self.timestamp_mode_choice.SetBackgroundColour(dark_color); self.timestamp_mode_choice.SetForegroundColour(light_text_color)
+            self.saved_date_order_choice.SetBackgroundColour(dark_color); self.saved_date_order_choice.SetForegroundColour(light_text_color)
             self.btn_chpass.SetBackgroundColour(dark_color); self.btn_chpass.SetForegroundColour(light_text_color)
             self.btn_open_admin_console.SetBackgroundColour(dark_color); self.btn_open_admin_console.SetForegroundColour(light_text_color)
             self.btn_open_bot_rules.SetBackgroundColour(dark_color); self.btn_open_bot_rules.SetForegroundColour(light_text_color)
@@ -1708,13 +1775,21 @@ def create_secure_socket(server_entry=None):
     if active['cafile'] and os.path.exists(active['cafile']):
         context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=active['cafile'])
     else: context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
-    try: return context.wrap_socket(sock, server_hostname=active['host'])
+    try:
+        wrapped = context.wrap_socket(sock, server_hostname=active['host'])
+        wrapped.settimeout(None)
+        return wrapped
     except ssl.SSLCertVerificationError:
         sock.close(); sock = socket.create_connection(addr, timeout=6.0)
         context = ssl.create_default_context(); context.check_hostname = False; context.verify_mode = ssl.CERT_NONE
-        return context.wrap_socket(sock, server_hostname=active['host'])
+        wrapped = context.wrap_socket(sock, server_hostname=active['host'])
+        wrapped.settimeout(None)
+        return wrapped
     except (ssl.SSLError, OSError):
-        sock.close(); return socket.create_connection(addr, timeout=6.0)
+        sock.close()
+        plain = socket.create_connection(addr, timeout=6.0)
+        plain.settimeout(None)
+        return plain
 
 class ClientApp(wx.App):
     def _startup_window_watchdog(self):
@@ -2073,6 +2148,7 @@ class ClientApp(wx.App):
             for u in users:
                 if "server" not in u:
                     u["server"] = tag
+                u["display_name"] = pick_user_display_name(u)
                 u["server_host"] = normalized.get("host", "")
                 u["server_port"] = int(normalized.get("port", 0) or 0)
             return users
@@ -3071,6 +3147,28 @@ class FileTransfersDialog(wx.Dialog):
         if p and os.path.exists(p):
             open_path_or_url(os.path.dirname(p) if os.path.isfile(p) else p)
 
+class SavedMessagesDialog(wx.Dialog):
+    def __init__(self, parent, contact_name, grouped_entries):
+        super().__init__(parent, title=f"Saved Messages: {contact_name}", size=(760, 500))
+        self.panel = wx.Panel(self)
+        s = wx.BoxSizer(wx.VERTICAL)
+        self.view = wx.TextCtrl(self.panel, style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_RICH2)
+        self.view.SetToolTip("Saved messages grouped by day.")
+        output = []
+        for group in grouped_entries:
+            output.append(f"=== {group.get('title', 'Unknown Date')} ===")
+            for line in group.get('lines', []):
+                output.append(str(line))
+            output.append("")
+        if not output:
+            output = ["No saved messages found for this contact."]
+        self.view.SetValue("\n".join(output).strip() + "\n")
+        s.Add(self.view, 1, wx.EXPAND | wx.ALL, 8)
+        btn = wx.Button(self.panel, wx.ID_CLOSE, label="Close")
+        btn.Bind(wx.EVT_BUTTON, lambda e: self.Close())
+        s.Add(btn, 0, wx.ALIGN_CENTER | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        self.panel.SetSizer(s)
+
 class UserDirectoryDialog(wx.Dialog):
     def __init__(self, parent_frame, users, my_username, contact_states):
         super().__init__(parent_frame, title="User Directory", size=(550, 500), style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
@@ -3275,7 +3373,9 @@ class UserDirectoryDialog(wx.Dialog):
             self.tab_display_map[tab_name] = []
             tab_users = []
             for u in self._all_users:
-                if query and query not in u["user"].lower(): continue
+                user_l = u["user"].lower()
+                display_name_l = str(pick_user_display_name(u) or "").lower()
+                if query and (query not in user_l and query not in display_name_l): continue
                 online_now = _is_online(u)
                 if tab_name == "Online" and not online_now: continue
                 if tab_name == "Offline" and online_now: continue
@@ -3297,7 +3397,13 @@ class UserDirectoryDialog(wx.Dialog):
                 if u["is_contact"]: info_parts.append("Contact")
                 if u["is_blocked"]: info_parts.append("Blocked")
                 info_text = ", ".join(info_parts)
-                display = f"{u['user']}  |  {u['status_text']}  |  {u.get('server', 'Current')}"
+                display_name = pick_user_display_name(u)
+                if not display_name and self.parent_frame and hasattr(self.parent_frame, "get_contact_display_name"):
+                    display_name = self.parent_frame.get_contact_display_name(u['user'])
+                left = u['user']
+                if display_name:
+                    left = f"{u['user']} ({display_name})"
+                display = f"{left}  |  {u['status_text']}  |  {u.get('server', 'Current')}"
                 if info_text:
                     display += f"  |  {info_text}"
                 lv.Append(display)
@@ -3432,8 +3538,13 @@ class UserDirectoryDialog(wx.Dialog):
             if u["user"] == user: u["is_blocked"] = not blocked; break
         self._populate_all_tabs()
     def on_add_to_contacts(self, _):
+        entry = self._selected_entry()
         user = self._get_selected_user()
         if not user: return
+        if entry is not None:
+            pending_display_name = pick_user_display_name(entry)
+            if pending_display_name and self.parent_frame and hasattr(self.parent_frame, "_pending_display_names"):
+                self.parent_frame._pending_display_names[user] = pending_display_name
         app = wx.GetApp()
         active = normalize_server_entry(getattr(app, "active_server_entry", {}))
         me = self.parent_frame.user
@@ -3589,6 +3700,42 @@ class InviteUserDialog(wx.Dialog):
         return self.include_link.IsChecked()
 
 class MainFrame(wx.Frame):
+    def _display_name_map(self):
+        app = wx.GetApp()
+        mapping = app.user_config.get("contact_display_names", {})
+        if not isinstance(mapping, dict):
+            mapping = {}
+            app.user_config["contact_display_names"] = mapping
+        return mapping
+
+    def get_contact_display_name(self, username):
+        if not username:
+            return ""
+        return str(self._display_name_map().get(username, "") or "").strip()
+
+    def set_contact_display_name(self, username, display_name):
+        if not username:
+            return
+        mapping = self._display_name_map()
+        if display_name:
+            mapping[username] = str(display_name).strip()
+        else:
+            mapping.pop(username, None)
+        wx.GetApp().user_config["contact_display_names"] = mapping
+        save_user_config(wx.GetApp().user_config)
+
+    def format_user_label(self, username, include_username=False):
+        name = str(username or "").strip()
+        if not name:
+            return ""
+        if name == "System":
+            return "System"
+        prefer = bool(wx.GetApp().user_config.get("prefer_contact_display_names", False))
+        display_name = self.get_contact_display_name(name)
+        if display_name and prefer:
+            return f"{display_name} ({name})" if include_username else display_name
+        return name
+
     def _build_connection_title(self):
         app = wx.GetApp()
         active_server = normalize_server_entry(getattr(app, "active_server_entry", {}))
@@ -3633,10 +3780,10 @@ class MainFrame(wx.Frame):
         self._apply_search_filter()
         if online and not was_online:
             wx.GetApp().play_sound("contact_online.wav")
-            show_notification("Contact online", f"{user} has come online.")
+            show_notification("Contact online", f"{self.format_user_label(user)} has come online.")
         elif not online and was_online:
             wx.GetApp().play_sound("contact_offline.wav")
-            show_notification("Contact offline", f"{user} has gone offline.")
+            show_notification("Contact offline", f"{self.format_user_label(user)} has gone offline.")
 
     def __init__(self, user, sock):
         super().__init__(None, title="", size=(400,380)); self.user, self.sock = user, sock; self.task_bar_icon = None; self.is_exiting = False; self._directory_dlg = None; self._bot_rules_dlg = None; self._group_policy_dlg = None; self._group_call_dlg = None
@@ -3648,6 +3795,7 @@ class MainFrame(wx.Frame):
         self._empty_contacts_tip_scheduled = False
         self._sort_mode = "name_asc"
         self._unread_counts = {}
+        self._pending_display_names = {}
         self.notifications = []; self.Bind(wx.EVT_CLOSE, self.on_close_window); panel = wx.Panel(self)
 
         dark_mode_on = is_windows_dark_mode()
@@ -4098,10 +4246,18 @@ class MainFrame(wx.Frame):
                 app.user_config['show_main_action_buttons'] = dlg.show_main_actions_cb.IsChecked()
                 app.user_config['typing_indicators'] = dlg.typing_indicator_cb.IsChecked()
                 app.user_config['announce_typing'] = dlg.announce_typing_cb.IsChecked()
-                app.user_config['incoming_popup_on_message'] = dlg.incoming_popup_cb.IsChecked()
-                app.user_config['incoming_alert_on_message'] = dlg.incoming_alert_cb.IsChecked()
-                enter_map = {0: 'send', 1: 'place_call', 2: 'none'}
-                app.user_config['enter_key_action'] = enter_map.get(dlg.enter_action_choice.GetSelection(), 'send')
+                app.user_config['prefer_contact_display_names'] = dlg.prefer_display_names_cb.IsChecked()
+                incoming_behavior_map = {0: 'popup', 1: 'notify', 2: 'do_nothing', 3: 'play_sound', 4: 'silent_count'}
+                incoming_behavior = incoming_behavior_map.get(dlg.incoming_behavior_choice.GetSelection(), 'silent_count')
+                app.user_config['incoming_message_behavior'] = incoming_behavior
+                app.user_config['incoming_popup_on_message'] = (incoming_behavior == 'popup')
+                app.user_config['incoming_alert_on_message'] = incoming_behavior in ('notify', 'play_sound')
+                ts_mode_map = {0: 'start', 1: 'end', 2: 'off'}
+                app.user_config['message_timestamp_mode'] = ts_mode_map.get(dlg.timestamp_mode_choice.GetSelection(), 'start')
+                date_order_map = {0: 'mdy', 1: 'dmy', 2: 'ymd', 3: 'ydm'}
+                app.user_config['saved_history_date_order'] = date_order_map.get(dlg.saved_date_order_choice.GetSelection(), 'mdy')
+                enter_map = {0: 'none', 1: 'send', 2: 'place_call'}
+                app.user_config['enter_key_action'] = enter_map.get(dlg.enter_action_choice.GetSelection(), 'none')
                 app.user_config['escape_main_action'] = ('none' if dlg.escape_action_choice.GetSelection() == 0 else ('minimize' if dlg.escape_action_choice.GetSelection() == 1 else 'quit'))
                 app.user_config['double_escape_to_close_chat'] = dlg.double_escape_chat_cb.IsChecked()
                 edit_window, undo_window = dlg.message_policy()
@@ -4111,6 +4267,7 @@ class MainFrame(wx.Frame):
                 ok_admin, admin_err = dlg.apply_admin_config()
                 save_user_config(app.user_config)
                 self.apply_action_button_layout()
+                self._apply_search_filter()
                 restart_req, restart_delay = dlg.restart_requested()
                 if restart_req:
                     try:
@@ -4141,6 +4298,7 @@ class MainFrame(wx.Frame):
             users = [u for u in users if not bool(u.get("is_bot"))]
         for u in users:
             u["server"] = u.get("server", current_server_name)
+            u["display_name"] = pick_user_display_name(u)
             u["server_host"] = str(u.get("server_host", active.get("host", "")) or "").strip().lower()
             try:
                 u["server_port"] = int(u.get("server_port", active.get("port", 0)) or 0)
@@ -4298,10 +4456,11 @@ class MainFrame(wx.Frame):
         if hasattr(self, "mi_user_delete_contact"):
             self.mi_user_delete_contact.Enable(is_contact_selection)
         if selected_contact and is_contact_selection:
-            self.btn_send.SetLabel(f"&Start Chat with {selected_contact}")
-            self.btn_send_file.SetLabel(f"Send &File to {selected_contact}")
-            self.btn_block.SetLabel(f"{'&Unblock' if self.contact_states.get(selected_contact, 0) else '&Block'} {selected_contact}")
-            self.btn_delete.SetLabel(f"&Delete {selected_contact}")
+            shown_name = self.format_user_label(selected_contact, include_username=True)
+            self.btn_send.SetLabel(f"&Start Chat with {shown_name}")
+            self.btn_send_file.SetLabel(f"Send &File to {shown_name}")
+            self.btn_block.SetLabel(f"{'&Unblock' if self.contact_states.get(selected_contact, 0) else '&Block'} {shown_name}")
+            self.btn_delete.SetLabel(f"&Delete {shown_name}")
         else:
             self.btn_send.SetLabel("&Start Chat")
             self.btn_send_file.SetLabel("Send &File")
@@ -4538,6 +4697,11 @@ class MainFrame(wx.Frame):
             wx.MessageBox(reason or "Invite could not be sent.", "Invite Failed", wx.OK | wx.ICON_ERROR)
     def on_add_contact_success(self, contact_data):
         c = contact_data; self.contact_states[c["user"]] = c["blocked"]
+        display_name = str(c.get("display_name", "") or "").strip()
+        if not display_name:
+            display_name = str(self._pending_display_names.pop(c["user"], "") or "").strip()
+        if display_name and not self.get_contact_display_name(c["user"]):
+            self.set_contact_display_name(c["user"], display_name)
         status = c.get("status_text", "online") if c["online"] and not c["blocked"] else "offline"
         if c.get("is_admin"): status += " (Admin)"
         updated = False
@@ -4545,10 +4709,12 @@ class MainFrame(wx.Frame):
             if row.get("user") == c["user"]:
                 row["status"] = status
                 row["blocked"] = c["blocked"]
+                if display_name:
+                    row["display_name"] = display_name
                 updated = True
                 break
         if not updated:
-            self._all_contacts.append({"user": c["user"], "status": status, "blocked": c["blocked"]})
+            self._all_contacts.append({"user": c["user"], "status": status, "blocked": c["blocked"], "display_name": display_name})
         bot_token = str(c.get("bot_auth_token", "") or "").strip()
         if bot_token:
             show_notification("Bot Token Issued", f"{c['user']} token created for this client session.", timeout=8)
@@ -4629,7 +4795,10 @@ class MainFrame(wx.Frame):
         for c in contacts:
             status = c.get("status_text", "online") if c["online"] and not c["blocked"] else "offline"
             if c.get("is_admin"): status += " (Admin)"
-            self._all_contacts.append({"user": c["user"], "status": status, "blocked": c["blocked"]})
+            display_name = str(c.get("display_name", "") or "").strip()
+            if display_name and not self.get_contact_display_name(c["user"]):
+                self.set_contact_display_name(c["user"], display_name)
+            self._all_contacts.append({"user": c["user"], "status": status, "blocked": c["blocked"], "display_name": display_name})
         self._apply_search_filter()
         if not self._all_contacts and not self._empty_prompt_shown:
             self._empty_prompt_shown = True
@@ -4648,10 +4817,13 @@ class MainFrame(wx.Frame):
         else:
             contacts = sorted(contacts, key=lambda c: c["user"].lower())
         for c in contacts:
-            if query and query not in c["user"].lower(): continue
+            display_name = str(c.get("display_name", "") or self.get_contact_display_name(c["user"]) or "").strip()
+            if query and query not in c["user"].lower() and query not in display_name.lower():
+                continue
             unread = int(self._unread_counts.get(c["user"], 0) or 0)
-            unread_text = f"  |  {c['user']} has {unread} new message{'s' if unread != 1 else ''}" if unread > 0 else ""
-            display = f"{c['user']}  |  {c['status']}{unread_text}"
+            user_label = self.format_user_label(c["user"], include_username=True)
+            unread_text = f"  |  {user_label} has {unread} new message{'s' if unread != 1 else ''}" if unread > 0 else ""
+            display = f"{user_label}  |  {c['status']}{unread_text}"
             self.lv.Append(display)
             idx = self.lv.GetCount() - 1
             self._contact_display_map.append(c["user"])
@@ -4687,6 +4859,7 @@ class MainFrame(wx.Frame):
         mi_add = menu.Append(wx.ID_ANY, "Add Contact")
         mi_file = menu.Append(wx.ID_ANY, "Send File")
         mi_log = menu.Append(wx.ID_ANY, "Toggle Chat History")
+        mi_display_name = menu.Append(wx.ID_ANY, "Set Display Name")
         mi_block = menu.Append(wx.ID_ANY, "Block/Unblock")
         mi_delete = menu.Append(wx.ID_ANY, "Delete Contact")
         menu.AppendSeparator()
@@ -4695,12 +4868,14 @@ class MainFrame(wx.Frame):
         mi_add.Enable(True)
         mi_file.Enable(bool(selected))
         mi_log.Enable(bool(selected))
+        mi_display_name.Enable(has_contact)
         mi_block.Enable(has_contact)
         mi_delete.Enable(has_contact)
         self.Bind(wx.EVT_MENU, self.on_send, id=mi_chat.GetId())
         self.Bind(wx.EVT_MENU, self.on_add, id=mi_add.GetId())
         self.Bind(wx.EVT_MENU, self.on_send_file, id=mi_file.GetId())
         self.Bind(wx.EVT_MENU, self.on_toggle_selected_chat_logging, id=mi_log.GetId())
+        self.Bind(wx.EVT_MENU, self.on_set_contact_display_name, id=mi_display_name.GetId())
         self.Bind(wx.EVT_MENU, self.on_block_toggle, id=mi_block.GetId())
         self.Bind(wx.EVT_MENU, self.on_delete, id=mi_delete.GetId())
         self.Bind(wx.EVT_MENU, self.on_user_directory, id=mi_dir.GetId())
@@ -4721,6 +4896,26 @@ class MainFrame(wx.Frame):
             chat.logging_enabled = bool(app.user_config['chat_logging'].get(c, not current))
         state = "enabled" if not current else "disabled"
         show_notification("Chat history", f"Chat history {state} for {c}.", timeout=5)
+    def on_set_contact_display_name(self, _):
+        c = self._selected_contact_name()
+        if not c or c not in self.contact_states:
+            return
+        current = self.get_contact_display_name(c)
+        with wx.TextEntryDialog(
+            self,
+            f"Set display name for {c} (leave blank to clear):",
+            "Contact Display Name",
+            value=current,
+        ) as dlg:
+            if dlg.ShowModal() != wx.ID_OK:
+                return
+            chosen = dlg.GetValue().strip()
+        self.set_contact_display_name(c, chosen)
+        for entry in self._all_contacts:
+            if entry.get("user") == c:
+                entry["display_name"] = chosen
+                break
+        self._apply_search_filter()
     def on_search(self, event):
         self._apply_search_filter()
     def on_admin_status_change(self, user, is_admin):
@@ -4849,6 +5044,7 @@ class MainFrame(wx.Frame):
             wx.MessageBox(f"Could not delete contact {c}:\n{e}", "Connection Error", wx.OK | wx.ICON_ERROR)
             return
         self.contact_states.pop(c, None)
+        self.set_contact_display_name(c, "")
         self._all_contacts = [entry for entry in self._all_contacts if entry["user"] != c]
         self._apply_search_filter()
     def on_send(self, _):
@@ -4887,22 +5083,23 @@ class MainFrame(wx.Frame):
         dlg = self.get_chat(sender)
         if not dlg:
             dlg = ChatDialog(self, sender, self.sock, self.user, is_logging_enabled, is_contact=is_contact)
-        popup_on_message = bool(app.user_config.get('incoming_popup_on_message', False))
-        alert_on_message = bool(app.user_config.get('incoming_alert_on_message', False))
-        if popup_on_message:
+        incoming_behavior = str(app.user_config.get('incoming_message_behavior', 'silent_count') or 'silent_count').strip().lower()
+        if incoming_behavior == 'popup':
             dlg.Show()
         dlg.append(msg["msg"], msg["from"], msg["time"])
         is_focused_chat = bool(dlg.IsShown() and wx.GetActiveWindow() is dlg)
         if not is_focused_chat:
             self._mark_unread(sender)
-            if alert_on_message:
+            if incoming_behavior == 'notify':
+                show_notification("New message", f"New message from {sender}.", timeout=5)
+            elif incoming_behavior == 'play_sound':
                 app.play_sound("receive.wav")
-                show_notification("New message", f"{sender} has a new message.", timeout=5)
         else:
             self._clear_unread(sender)
         played_bot_tts = play_tts_audio_from_message(msg)
         if app.user_config.get('read_messages_aloud', False) and not played_bot_tts and is_focused_chat:
-            speak_text(f"{msg['from']}: {msg['msg']}")
+            sender_label = self.format_user_label(msg['from'])
+            speak_text(f"{sender_label}: {msg['msg']}")
     def on_typing_event(self, msg):
         from_user = msg.get("from")
         is_typing = bool(msg.get("typing", False))
@@ -4916,19 +5113,48 @@ class MainFrame(wx.Frame):
         return None
 
 def get_day_with_suffix(d): return str(d) + "th" if 11 <= d <= 13 else str(d) + {1: "st", 2: "nd", 3: "rd"}.get(d % 10, "th")
-def format_timestamp(ts):
+def parse_timestamp_value(ts):
     try:
         if isinstance(ts, (int, float)):
-            dt = datetime.datetime.fromtimestamp(ts)
-        else:
-            try:
-                dt = datetime.datetime.fromtimestamp(float(ts))
-            except (ValueError, TypeError):
-                dt = datetime.datetime.fromisoformat(ts)  # backward compat with old ISO strings on disk
+            return datetime.datetime.fromtimestamp(ts)
+        try:
+            return datetime.datetime.fromtimestamp(float(ts))
+        except (ValueError, TypeError):
+            return datetime.datetime.fromisoformat(str(ts))
+    except (ValueError, TypeError, OSError):
+        return None
+
+def format_timestamp(ts):
+    try:
+        dt = parse_timestamp_value(ts)
+        if dt is None:
+            return str(ts)
         day_with_suffix = get_day_with_suffix(dt.day)
         formatted_hour = dt.strftime('%I:%M %p').lstrip('0')
         return dt.strftime(f'%A, %B {day_with_suffix}, %Y at {formatted_hour}')
     except (ValueError, TypeError, OSError): return str(ts)
+
+def format_saved_group_date(date_obj, order='mdy'):
+    if not isinstance(date_obj, (datetime.date, datetime.datetime)):
+        return "Unknown Date"
+    d = date_obj.date() if isinstance(date_obj, datetime.datetime) else date_obj
+    month = d.strftime("%B")
+    if order == 'dmy':
+        return f"{d.day} {month} {d.year}"
+    if order == 'ymd':
+        return f"{d.year} {month} {d.day}"
+    if order == 'ydm':
+        return f"{d.year} {d.day} {month}"
+    return f"{month} {d.day} {d.year}"
+
+def pick_user_display_name(entry):
+    if not isinstance(entry, dict):
+        return ""
+    for key in ("display_name", "full_name", "name", "nickname"):
+        val = str(entry.get(key, "") or "").strip()
+        if val:
+            return val
+    return ""
 
 class AdminDialog(wx.Dialog):
     def __init__(self, parent, sock):
@@ -5444,7 +5670,13 @@ class GroupCallDialog(wx.Dialog):
 
 class ChatDialog(wx.Dialog):
     def __init__(self, parent, contact, sock, user, logging_enabled=False, is_contact=True, remote_server_entry=None, remote_target_user=None):
-        super().__init__(parent, title=f"Chat with {contact}", size=(450, 450))
+        title_contact = contact
+        try:
+            if parent and hasattr(parent, "format_user_label"):
+                title_contact = parent.format_user_label(contact, include_username=True)
+        except Exception:
+            title_contact = contact
+        super().__init__(parent, title=f"Chat with {title_contact}", size=(450, 450))
         self.contact, self.sock, self.user = contact, sock, user
         self.is_contact = bool(is_contact)
         self.remote_server_entry = remote_server_entry
@@ -5488,9 +5720,11 @@ class ChatDialog(wx.Dialog):
         btn = wx.Button(self, label="&Send")
         btn_file = wx.Button(self, label="Send &File")
         btn_call = wx.Button(self, label="Place &Call")
+        btn_saved = wx.Button(self, label="Saved &Messages")
         apply_voiceover_hint(btn, "Send the typed message.")
         apply_voiceover_hint(btn_file, "Send a file to this chat contact.")
         apply_voiceover_hint(btn_call, "Place a voice call to this contact.")
+        apply_voiceover_hint(btn_saved, "Show saved messages grouped by date.")
         apply_voiceover_hint(self.btn_add_contact, "Add this person to your contacts.")
         apply_voiceover_hint(self.input_ctrl, "Message input. Enter sends, Command+Enter inserts a new line, Control+Enter sends file.")
 
@@ -5502,6 +5736,7 @@ class ChatDialog(wx.Dialog):
             btn.SetBackgroundColour(dark_color); btn.SetForegroundColour(light_text_color)
             btn_file.SetBackgroundColour(dark_color); btn_file.SetForegroundColour(light_text_color)
             btn_call.SetBackgroundColour(dark_color); btn_call.SetForegroundColour(light_text_color)
+            btn_saved.SetBackgroundColour(dark_color); btn_saved.SetForegroundColour(light_text_color)
 
         s.Add(self.hist, 1, wx.EXPAND|wx.ALL, 5)
         s.Add(self.typing_lbl, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
@@ -5514,10 +5749,12 @@ class ChatDialog(wx.Dialog):
         btn.Bind(wx.EVT_BUTTON, self.on_send)
         btn_file.Bind(wx.EVT_BUTTON, self.on_send_file)
         btn_call.Bind(wx.EVT_BUTTON, self.on_place_call)
+        btn_saved.Bind(wx.EVT_BUTTON, self.on_show_saved_messages)
         btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
         btn_sizer.Add(btn, 1, wx.EXPAND | wx.ALL, 5)
         btn_sizer.Add(btn_file, 1, wx.EXPAND | wx.ALL, 5)
         btn_sizer.Add(btn_call, 1, wx.EXPAND | wx.ALL, 5)
+        btn_sizer.Add(btn_saved, 1, wx.EXPAND | wx.ALL, 5)
         s.Add(btn_sizer, 0, wx.EXPAND|wx.ALL, 5)
         self.SetSizer(s)
         self._focus_input()
@@ -5553,6 +5790,64 @@ class ChatDialog(wx.Dialog):
             log_path = os.path.join(log_dir, log_file)
             with open(log_path, 'a', encoding='utf-8') as f: f.write(formatted_log_line)
         except Exception as e: print(f"Error: Could not save chat history to '{log_path}'. Reason: {e}")
+    def _build_message_display(self, text, sender, ts, is_error=False):
+        app = wx.GetApp()
+        mode = str(app.user_config.get('message_timestamp_mode', 'start') or 'start').strip().lower()
+        stamp = format_timestamp(ts)
+        if is_error:
+            prefix = "Error"
+        elif sender == "System":
+            prefix = "System"
+        else:
+            prefix = str(sender or "")
+            parent = self.GetParent()
+            if parent and hasattr(parent, "format_user_label"):
+                try:
+                    prefix = parent.format_user_label(sender)
+                except Exception:
+                    prefix = str(sender or "")
+        if mode == 'off':
+            return f"{prefix}: {text}", stamp
+        if mode == 'end':
+            return f"{prefix}: {text} [{stamp}]", stamp
+        return f"[{stamp}] {prefix}: {text}", stamp
+    def _contact_log_dir(self):
+        docs_path = os.path.join(os.path.expanduser('~'), 'Documents')
+        return os.path.join(docs_path, 'ThriveMessenger', 'chats', self.contact)
+    def _load_saved_messages_grouped(self):
+        log_dir = self._contact_log_dir()
+        if not os.path.isdir(log_dir):
+            return []
+        order = str(wx.GetApp().user_config.get('saved_history_date_order', 'mdy') or 'mdy').strip().lower()
+        grouped = []
+        entries = []
+        for name in os.listdir(log_dir):
+            if not name.lower().endswith('.txt'):
+                continue
+            path = os.path.join(log_dir, name)
+            day = None
+            base = os.path.splitext(name)[0]
+            try:
+                day = datetime.date.fromisoformat(base)
+            except Exception:
+                day = datetime.date.fromtimestamp(os.path.getmtime(path))
+            entries.append((day, path))
+        for day, path in sorted(entries, key=lambda item: item[0], reverse=True):
+            lines = []
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    lines = [ln.rstrip('\n') for ln in f.readlines() if ln.strip()]
+            except Exception:
+                lines = [f"(Could not read {os.path.basename(path)})"]
+            grouped.append({
+                "title": format_saved_group_date(day, order=order),
+                "lines": lines,
+            })
+        return grouped
+    def on_show_saved_messages(self, _):
+        grouped_entries = self._load_saved_messages_grouped()
+        with SavedMessagesDialog(self, self.contact, grouped_entries) as dlg:
+            dlg.ShowModal()
     def on_input_key(self, event):
         keycode = event.GetKeyCode()
         if keycode in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
@@ -5705,7 +6000,7 @@ class ChatDialog(wx.Dialog):
         except Exception as e:
             wx.MessageBox(f"This server does not support voice calling yet.\n\n{e}", "Feature Not Supported", wx.OK | wx.ICON_INFORMATION)
     def _handle_enter_action(self):
-        action = str(wx.GetApp().user_config.get('enter_key_action', 'send') or 'send')
+        action = str(wx.GetApp().user_config.get('enter_key_action', 'none') or 'none')
         if action == 'place_call':
             self.on_place_call(None)
         elif action == 'none':
@@ -5732,17 +6027,19 @@ class ChatDialog(wx.Dialog):
         self.input_ctrl.SetValue(pending)
         self.on_send(None)
     def append(self, text, sender, ts, is_error=False):
-        formatted_time = format_timestamp(ts)
-        prefix = "Error" if is_error else sender
-        display = f"[{formatted_time}] {prefix}: {text}"
+        display, formatted_time = self._build_message_display(text, sender, ts, is_error=is_error)
         self.hist.Append(display)
         self._history_rows.append({"sender": sender, "text": text, "time": ts, "error": is_error})
         self.hist.SetSelection(self.hist.GetCount() - 1)
         app = wx.GetApp()
         if sender not in (self.user, "System") and app.user_config.get('read_messages_aloud', False):
-            speak_text(f"{sender} says {text}")
+            parent = self.GetParent()
+            sender_label = sender
+            if parent and hasattr(parent, "format_user_label"):
+                sender_label = parent.format_user_label(sender)
+            speak_text(f"{sender_label} says {text}")
         if self._is_logging_enabled_now():
-            log_line = f"[{formatted_time}] {sender}: {text}\n"
+            log_line = f"{display}\n"
             self._save_message_to_log(log_line)
     def append_error(self, reason):
         ts = time.time()
@@ -5822,9 +6119,7 @@ class ChatDialog(wx.Dialog):
             return
         idx = max(0, min(idx, self.hist.GetCount()))
         self._history_rows.insert(idx, row)
-        formatted_time = format_timestamp(row.get("time", time.time()))
-        prefix = "Error" if row.get("error", False) else row.get("sender", "System")
-        display = f"[{formatted_time}] {prefix}: {row.get('text', '')}"
+        display, _ = self._build_message_display(row.get("text", ""), row.get("sender", "System"), row.get("time", time.time()), is_error=row.get("error", False))
         self.hist.Insert(display, idx)
         self.hist.SetSelection(idx)
         self._last_deleted_message = None
