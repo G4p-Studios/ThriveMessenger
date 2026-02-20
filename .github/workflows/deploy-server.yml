@@ -1,0 +1,56 @@
+name: Deploy Server
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_restart:
+        description: "Force PM2 restart even when no server files changed"
+        required: false
+        default: "false"
+  push:
+    branches: [main]
+    paths:
+      - "srv/**"
+      - "client.conf"
+      - "pyproject.toml"
+      - "requirements*.txt"
+      - ".github/workflows/deploy-server.yml"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Prepare SSH key
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          if [ -n "${{ secrets.DEPLOY_KNOWN_HOSTS }}" ]; then
+            printf '%s\n' "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          else
+            ssh-keyscan -H "${{ secrets.DEPLOY_HOST }}" >> ~/.ssh/known_hosts
+          fi
+
+      - name: Deploy and restart server via PM2
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_REPO_DIR: ${{ secrets.DEPLOY_REPO_DIR }}
+          PM2_APP_NAME: ${{ secrets.DEPLOY_PM2_APP_NAME }}
+          PM2_RUN_USER: ${{ secrets.DEPLOY_PM2_RUN_USER }}
+          PM2_HOME_PATH: ${{ secrets.DEPLOY_PM2_HOME }}
+          FORCE_RESTART: ${{ github.event.inputs.force_restart == 'true' && '1' || '0' }}
+        run: |
+          : "${DEPLOY_HOST:?missing DEPLOY_HOST secret}"
+          : "${DEPLOY_USER:?missing DEPLOY_USER secret}"
+          : "${DEPLOY_REPO_DIR:?missing DEPLOY_REPO_DIR secret}"
+          : "${PM2_APP_NAME:?missing DEPLOY_PM2_APP_NAME secret}"
+
+          PORT_ARG=""
+          if [ -n "${DEPLOY_PORT}" ]; then
+            PORT_ARG="-p ${DEPLOY_PORT}"
+          fi
+
+          ssh ${PORT_ARG} "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "REPO_DIR='${DEPLOY_REPO_DIR}' PM2_APP_NAME='${PM2_APP_NAME}' PM2_RUN_USER='${PM2_RUN_USER}' PM2_HOME_PATH='${PM2_HOME_PATH}' FORCE_RESTART='${FORCE_RESTART}' bash '${DEPLOY_REPO_DIR}/srv/scripts/deploy_and_restart.sh'"

@@ -3210,7 +3210,7 @@ class UserDirectoryDialog(wx.Dialog):
         self.notebook = wx.Notebook(panel)
         self.tabs = {}
         self.tab_display_map = {}
-        for tab_name in ["Everyone", "Online", "Offline", "Admins"]:
+        for tab_name in ["Everyone", "Online", "Offline", "Admins", "Bots"]:
             lv = wx.ListBox(self.notebook, style=wx.LB_SINGLE)
             lv.Bind(wx.EVT_LISTBOX, self.on_selection_changed)
             lv.Bind(wx.EVT_LISTBOX_DCLICK, self.on_item_activated)
@@ -3245,7 +3245,7 @@ class UserDirectoryDialog(wx.Dialog):
         apply_voiceover_hint(self.search_box, "Search all users in the current directory tab.")
         apply_voiceover_hint(self.sort_choice, "Sort users by name or online status.")
         apply_voiceover_hint(self.filter_choice, "Filter directory users by contact state.")
-        apply_voiceover_hint(self.notebook, "Directory tabs for Everyone, Online, Offline, and Admins.")
+        apply_voiceover_hint(self.notebook, "Directory tabs for Everyone, Online, Offline, Admins, and Bots.")
         apply_voiceover_hint(self.btn_chat, "Start chat with selected user.")
         apply_voiceover_hint(self.btn_file, "Send a file to selected user.")
         apply_voiceover_hint(self.btn_block, "Block or unblock selected contact.")
@@ -3254,6 +3254,21 @@ class UserDirectoryDialog(wx.Dialog):
         self._populate_all_tabs(); self.update_button_states()
     def _cross_server_dm_enabled(self):
         return bool(wx.GetApp().user_config.get("allow_cross_server_directory_message", True))
+    def _is_current_server_user(self, entry):
+        app = wx.GetApp()
+        active = normalize_server_entry(getattr(app, "active_server_entry", {}))
+        active_host = str(active.get("host", "") or "").strip().lower()
+        active_port = int(active.get("port", 0) or 0)
+        entry_host = str(entry.get("server_host", "") or "").strip().lower()
+        try:
+            entry_port = int(entry.get("server_port", 0) or 0)
+        except Exception:
+            entry_port = 0
+        if active_host and entry_host:
+            return entry_host == active_host and entry_port == active_port
+        active_name = str(active.get("name", "") or "").strip().lower()
+        entry_name = str(entry.get("server", "") or "").strip().lower()
+        return bool(active_name and entry_name and active_name == entry_name)
     def _get_active_list(self):
         page = self.notebook.GetSelection()
         return self.notebook.GetPage(page) if page != wx.NOT_FOUND else None
@@ -3383,6 +3398,11 @@ class UserDirectoryDialog(wx.Dialog):
                 if tab_name == "Online" and not online_now: continue
                 if tab_name == "Offline" and online_now: continue
                 if tab_name == "Admins" and not u["is_admin"]: continue
+                if tab_name == "Bots":
+                    if not bool(u.get("is_bot", False)):
+                        continue
+                    if not self._is_current_server_user(u):
+                        continue
                 if filter_mode == 1 and not u.get("is_contact", False): continue
                 if filter_mode == 2 and u.get("is_contact", False): continue
                 tab_users.append(u)
