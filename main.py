@@ -72,6 +72,26 @@ def show_notification(title, message, timeout=5):
     except Exception as e:
         print(f"Error showing notification: {e}")
 
+def apply_voiceover_hint(control, hint):
+    if not control or not hint:
+        return
+    try:
+        control.SetToolTip(str(hint))
+    except Exception:
+        pass
+    try:
+        control.SetHelpText(str(hint))
+    except Exception:
+        pass
+    try:
+        label = ""
+        if hasattr(control, "GetLabel"):
+            label = str(control.GetLabel() or "").strip()
+        if label and hasattr(control, "SetName"):
+            control.SetName(label)
+    except Exception:
+        pass
+
 # --- Dark Mode for MSW ---
 try:
     import ctypes
@@ -1658,7 +1678,24 @@ def create_secure_socket(server_entry=None):
         sock.close(); return socket.create_connection(addr)
 
 class ClientApp(wx.App):
+    def _startup_window_watchdog(self):
+        if getattr(self, "frame", None):
+            return
+        if getattr(self, "_startup_ui_started", False):
+            return
+        try:
+            for win in wx.GetTopLevelWindows():
+                if isinstance(win, LoginDialog) and win.IsShown():
+                    return
+        except Exception:
+            pass
+        log_event("warn", "startup_window_watchdog_retry")
+        wx.CallAfter(self._bootstrap_startup_ui)
+
     def _bootstrap_startup_ui(self):
+        if getattr(self, "_startup_ui_started", False):
+            return
+        self._startup_ui_started = True
         try:
             ok = self.show_login_dialog()
         except Exception as e:
@@ -1695,11 +1732,12 @@ class ClientApp(wx.App):
 
     def OnInit(self):
         log_event("info", "app_start")
+        self._startup_ui_started = False
         self.instance_checker = wx.SingleInstanceChecker("ThriveMessenger-%s" % wx.GetUserId())
         if self.instance_checker.IsAnotherRunning():
             # Only trust the IPC restore path. AppleScript activation can
             # succeed even when no usable UI instance is available.
-            if self._signal_existing_instance():
+            if sys.platform != 'darwin' and self._signal_existing_instance():
                 return False
             # Stale lock or crashed/background state: continue startup to recover.
             print("Detected stale single-instance state; launching a fresh visible window.")
@@ -1714,7 +1752,7 @@ class ClientApp(wx.App):
             # If IPC binding fails, first try to restore an existing instance.
             # If restore fails, continue startup without IPC to avoid being stuck unable to open.
             self._ipc_sock = None
-            if self._signal_existing_instance():
+            if sys.platform != 'darwin' and self._signal_existing_instance():
                 return False
             print("IPC port unavailable and no active instance responded; continuing without IPC listener.")
             log_event("warn", "ipc_bind_unavailable_continuing")
@@ -1750,6 +1788,7 @@ class ClientApp(wx.App):
         # running process with no visible windows. Defer startup UI until the
         # event loop is active.
         wx.CallAfter(self._bootstrap_startup_ui)
+        wx.CallLater(2000, self._startup_window_watchdog)
         return True
 
     def add_transfer_history(self, direction, user, filename, path="", status="ok"):
@@ -1990,10 +2029,13 @@ class ClientApp(wx.App):
             if directory_resp.get("action") != "user_directory_response":
                 return []
             users = directory_resp.get("users", [])
-            tag = normalize_server_entry(server_entry).get("name", "Server")
+            normalized = normalize_server_entry(server_entry)
+            tag = normalized.get("name", "Server")
             for u in users:
                 if "server" not in u:
                     u["server"] = tag
+                u["server_host"] = normalized.get("host", "")
+                u["server_port"] = int(normalized.get("port", 0) or 0)
             return users
         except Exception as e:
             print(f"Directory fetch failed for {server_entry}: {e}")
@@ -3044,15 +3086,15 @@ class UserDirectoryDialog(wx.Dialog):
         self.Bind(wx.EVT_MENU, lambda e: self.Close(), id=esc_id)
         self.SetAcceleratorTable(wx.AcceleratorTable([(wx.ACCEL_NORMAL, wx.WXK_ESCAPE, esc_id)]))
         self.Bind(wx.EVT_CLOSE, self.on_close)
-        self.search_box.SetToolTip("Search all users in the current directory tab.")
-        self.sort_choice.SetToolTip("Sort users by name or online status.")
-        self.filter_choice.SetToolTip("Filter directory users by contact state.")
-        self.notebook.SetToolTip("Directory tabs for Everyone, Online, Offline, and Admins.")
-        self.btn_chat.SetToolTip("Start chat with selected user.")
-        self.btn_file.SetToolTip("Send a file to selected user.")
-        self.btn_block.SetToolTip("Block or unblock selected contact.")
-        self.btn_add.SetToolTip("Send a contact request to selected user.")
-        self.btn_close.SetToolTip("Close directory window.")
+        apply_voiceover_hint(self.search_box, "Search all users in the current directory tab.")
+        apply_voiceover_hint(self.sort_choice, "Sort users by name or online status.")
+        apply_voiceover_hint(self.filter_choice, "Filter directory users by contact state.")
+        apply_voiceover_hint(self.notebook, "Directory tabs for Everyone, Online, Offline, and Admins.")
+        apply_voiceover_hint(self.btn_chat, "Start chat with selected user.")
+        apply_voiceover_hint(self.btn_file, "Send a file to selected user.")
+        apply_voiceover_hint(self.btn_block, "Block or unblock selected contact.")
+        apply_voiceover_hint(self.btn_add, "Send a contact request to selected user.")
+        apply_voiceover_hint(self.btn_close, "Close directory window.")
         self._populate_all_tabs(); self.update_button_states()
     def _cross_server_dm_enabled(self):
         return bool(wx.GetApp().user_config.get("allow_cross_server_directory_message", True))
@@ -3061,13 +3103,16 @@ class UserDirectoryDialog(wx.Dialog):
         return self.notebook.GetPage(page) if page != wx.NOT_FOUND else None
     def _get_selected_user(self):
         lv = self._get_active_list()
-        if not lv: return None
+        if not lv:
+            self._selected_user = None
+            return None
         sel = lv.GetSelection()
         tab_name = self.notebook.GetPageText(self.notebook.GetSelection())
         mapping = self.tab_display_map.get(tab_name, [])
         if sel != wx.NOT_FOUND and 0 <= sel < len(mapping):
             self._selected_user = mapping[sel].get("user")
             return self._selected_user
+        self._selected_user = None
         return None
     def _selected_entry(self):
         lv = self._get_active_list()
@@ -3079,12 +3124,42 @@ class UserDirectoryDialog(wx.Dialog):
         if sel != wx.NOT_FOUND and 0 <= sel < len(mapping):
             return mapping[sel]
         return None
+    def _ensure_actionable_selection(self):
+        lv = self._get_active_list()
+        if not lv:
+            return
+        tab_name = self.notebook.GetPageText(self.notebook.GetSelection())
+        mapping = self.tab_display_map.get(tab_name, [])
+        sel = lv.GetSelection()
+        if sel != wx.NOT_FOUND and 0 <= sel < len(mapping):
+            current_user = str(mapping[sel].get("user", "")).strip()
+            if current_user and current_user != self.my_username:
+                return
+        for idx, entry in enumerate(mapping):
+            candidate = str(entry.get("user", "")).strip()
+            if candidate and candidate != self.my_username:
+                lv.SetSelection(idx)
+                try:
+                    lv.EnsureVisible(idx)
+                except Exception:
+                    pass
+                return
     def _is_selected_external_server(self):
         entry = self._selected_entry()
         if not entry:
             return False
-        current_server = normalize_server_entry(getattr(wx.GetApp(), "active_server_entry", {})).get("name", "")
-        selected_server = str(entry.get("server", current_server)).strip()
+        active = normalize_server_entry(getattr(wx.GetApp(), "active_server_entry", {}))
+        active_host = str(active.get("host", "") or "").strip().lower()
+        active_port = int(active.get("port", 0) or 0)
+        entry_host = str(entry.get("server_host", "") or "").strip().lower()
+        try:
+            entry_port = int(entry.get("server_port", 0) or 0)
+        except Exception:
+            entry_port = 0
+        if active_host and entry_host:
+            return not (entry_host == active_host and entry_port == active_port)
+        current_server = str(active.get("name", "") or "").strip().lower()
+        selected_server = str(entry.get("server", current_server) or "").strip().lower()
         return bool(selected_server and current_server and selected_server != current_server)
     def _resolve_dm_target_entry(self):
         entry = self._selected_entry()
@@ -3191,6 +3266,7 @@ class UserDirectoryDialog(wx.Dialog):
     def on_sort_changed(self, _):
         self._populate_all_tabs()
     def update_button_states(self):
+        self._ensure_actionable_selection()
         user = self._get_selected_user()
         external = self._is_selected_external_server()
         allow_cross = self._cross_server_dm_enabled()
@@ -3200,21 +3276,21 @@ class UserDirectoryDialog(wx.Dialog):
         self.btn_chat.Enable((not external) or allow_cross)
         self.btn_file.Enable(not external)
         is_contact = user in self.contact_states
-        self.btn_add.Enable((not is_contact) and (not external)); self.btn_add.SetLabel("&Add to Contacts")
+        self.btn_add.Enable(not is_contact); self.btn_add.SetLabel("&Add to Contacts")
         self.btn_block.Enable(is_contact and (not external))
         if external:
             if allow_cross:
-                self.btn_chat.SetToolTip("Start chat with this user on their server.")
+                apply_voiceover_hint(self.btn_chat, "Start chat with this user on their server.")
             else:
-                self.btn_chat.SetToolTip("Cross-server direct messaging is disabled by admin settings.")
-            self.btn_file.SetToolTip("This server does not support cross-server file transfer from the current connection.")
-            self.btn_add.SetToolTip("This server does not support cross-server contacts from the current connection.")
-            self.btn_block.SetToolTip("This server does not support cross-server contact blocking from the current connection.")
+                apply_voiceover_hint(self.btn_chat, "Cross-server direct messaging is disabled by admin settings.")
+            apply_voiceover_hint(self.btn_file, "This server does not support cross-server file transfer from the current connection.")
+            apply_voiceover_hint(self.btn_add, "Add contact will use this username on your current server connection.")
+            apply_voiceover_hint(self.btn_block, "This server does not support cross-server contact blocking from the current connection.")
         else:
-            self.btn_chat.SetToolTip("Start chat with selected user.")
-            self.btn_file.SetToolTip("Send a file to selected user.")
-            self.btn_add.SetToolTip("Send a contact request to selected user.")
-            self.btn_block.SetToolTip("Block or unblock selected contact.")
+            apply_voiceover_hint(self.btn_chat, "Start chat with selected user.")
+            apply_voiceover_hint(self.btn_file, "Send a file to selected user.")
+            apply_voiceover_hint(self.btn_add, "Send a contact request to selected user.")
+            apply_voiceover_hint(self.btn_block, "Block or unblock selected contact.")
         if is_contact:
             blocked = self.contact_states.get(user, 0) == 1
             self.btn_block.SetLabel("&Unblock" if blocked else "&Block")
@@ -3230,6 +3306,7 @@ class UserDirectoryDialog(wx.Dialog):
                 lv.EnsureVisible(0)
             except Exception:
                 pass
+        self._ensure_actionable_selection()
         self.update_button_states()
         event.Skip()
     def on_selection_changed(self, event): self.update_button_states(); event.Skip()
@@ -3274,12 +3351,13 @@ class UserDirectoryDialog(wx.Dialog):
             dlg = self.parent_frame.get_chat(user) or ChatDialog(self.parent_frame, user, self.parent_frame.sock, self.parent_frame.user, is_logging_enabled, is_contact=is_contact)
         dlg.Show(); wx.CallAfter(dlg.input_ctrl.SetFocus)
     def on_send_file(self, _):
+        self._selected_user = self._get_selected_user()
         if self._is_selected_external_server():
             wx.MessageBox("This server does not support cross-server file transfer from the current connection.", "Feature Not Supported", wx.OK | wx.ICON_INFORMATION)
             return
         if self._selected_user: wx.GetApp().send_file_to(self._selected_user)
     def on_block_toggle(self, _):
-        user = self._selected_user
+        user = self._get_selected_user()
         if self._is_selected_external_server():
             wx.MessageBox("This server does not support cross-server contact blocking from the current connection.", "Feature Not Supported", wx.OK | wx.ICON_INFORMATION)
             return
@@ -3299,17 +3377,45 @@ class UserDirectoryDialog(wx.Dialog):
             if u["user"] == user: u["is_blocked"] = not blocked; break
         self._populate_all_tabs()
     def on_add_to_contacts(self, _):
-        user = self._selected_user
-        if self._is_selected_external_server():
-            wx.MessageBox("This server does not support cross-server contacts from the current connection.", "Feature Not Supported", wx.OK | wx.ICON_INFORMATION)
-            return
+        user = self._get_selected_user()
         if not user: return
-        try:
-            self.parent_frame.sock.sendall(json.dumps({"action": "add_contact", "to": user}).encode() + b"\n")
-        except Exception as e:
-            wx.MessageBox(f"Could not add contact {user}:\n{e}", "Connection Error", wx.OK | wx.ICON_ERROR)
+        app = wx.GetApp()
+        active = normalize_server_entry(getattr(app, "active_server_entry", {}))
+        me = self.parent_frame.user
+        def _send_add():
+            try:
+                self.parent_frame.sock.sendall(json.dumps({"action": "add_contact", "to": user}).encode() + b"\n")
+            except Exception as e:
+                self.btn_add.Enable()
+                self.btn_add.SetLabel("&Add to Contacts")
+                show_notification("Add contact failed", f"Could not add {user}: {e}", timeout=6)
+                return
+            self.btn_add.Disable()
+            self.btn_add.SetLabel("Adding...")
+        if getattr(app, "session_password", ""):
+            self.btn_add.Disable()
+            self.btn_add.SetLabel("Checking...")
+            def _worker():
+                try:
+                    users = app.fetch_directory_for_server(active, me, app.session_password)
+                    exists = any(str(u.get("user", "")).strip().lower() == user.lower() for u in users)
+                except Exception:
+                    exists = True
+                def _finish():
+                    if exists:
+                        _send_add()
+                    else:
+                        self.btn_add.Enable()
+                        self.btn_add.SetLabel("&Add to Contacts")
+                        show_notification(
+                            "Contact tip",
+                            f"{user} is not on the current server yet. Open Server Directory to find available users.",
+                            timeout=8,
+                        )
+                wx.CallAfter(_finish)
+            threading.Thread(target=_worker, daemon=True).start()
             return
-        self.btn_add.Disable(); self.btn_add.SetLabel("Adding...")
+        _send_add()
     def _select_user_from_context_event(self, event):
         lv = self._get_active_list()
         if not lv:
@@ -3342,7 +3448,7 @@ class UserDirectoryDialog(wx.Dialog):
         menu.AppendSeparator()
         mi_refresh = menu.Append(wx.ID_ANY, "Refresh Directory")
         mi_chat.Enable(selected and ((not external) or allow_cross))
-        mi_add.Enable(selected and (not is_contact) and not external)
+        mi_add.Enable(selected and (not is_contact))
         mi_block.Enable(selected and is_contact and not external)
         mi_file.Enable(selected and not external)
         self.Bind(wx.EVT_MENU, self.on_start_chat, id=mi_chat.GetId())
@@ -3484,6 +3590,7 @@ class MainFrame(wx.Frame):
         self.feature_caps = {}
         self.feature_caps_supported = False
         self._empty_prompt_shown = False
+        self._empty_contacts_tip_scheduled = False
         self._sort_mode = "name_asc"
         self._unread_counts = {}
         self.notifications = []; self.Bind(wx.EVT_CLOSE, self.on_close_window); panel = wx.Panel(self)
@@ -3713,21 +3820,21 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.on_submit_logs, self.mi_submit_logs)
 
     def _apply_voiceover_hints(self, search_label):
-        search_label.SetToolTip("Type a username to filter your contact list.")
-        self.search_box.SetToolTip("Search contacts. Press Return to start chat with selected contact.")
-        self.lv.SetToolTip("Contacts list. Use arrow keys to select a contact, then press Return to chat.")
-        self.btn_add.SetToolTip("Add a contact by username.")
-        self.btn_send.SetToolTip("Start chat with selected contact.")
-        self.btn_send_file.SetToolTip("Send a file to selected contact.")
-        self.btn_delete.SetToolTip("Remove selected contact.")
-        self.btn_block.SetToolTip("Block or unblock selected contact.")
-        self.btn_directory.SetToolTip("Browse all users and add contacts from the directory.")
-        self.btn_settings.SetToolTip("Open preferences and accessibility options.")
-        self.btn_admin.SetToolTip("Open server-side command console if you are an admin.")
-        self.btn_status.SetToolTip("Set your current status message.")
-        self.btn_update.SetToolTip("Check for client updates.")
-        self.btn_logout.SetToolTip("Sign out and return to login.")
-        self.btn_exit.SetToolTip("Quit the app.")
+        apply_voiceover_hint(search_label, "Type a username to filter your contact list.")
+        apply_voiceover_hint(self.search_box, "Search contacts. Press Return to start chat with selected contact.")
+        apply_voiceover_hint(self.lv, "Contacts list. Use arrow keys to select a contact, then press Return to chat.")
+        apply_voiceover_hint(self.btn_add, "Add a contact by username.")
+        apply_voiceover_hint(self.btn_send, "Start chat with selected contact.")
+        apply_voiceover_hint(self.btn_send_file, "Send a file to selected contact.")
+        apply_voiceover_hint(self.btn_delete, "Remove selected contact.")
+        apply_voiceover_hint(self.btn_block, "Block or unblock selected contact.")
+        apply_voiceover_hint(self.btn_directory, "Browse all users and add contacts from the directory.")
+        apply_voiceover_hint(self.btn_settings, "Open preferences and accessibility options.")
+        apply_voiceover_hint(self.btn_admin, "Open server-side command console if you are an admin.")
+        apply_voiceover_hint(self.btn_status, "Set your current status message.")
+        apply_voiceover_hint(self.btn_update, "Check for client updates.")
+        apply_voiceover_hint(self.btn_logout, "Sign out and return to login.")
+        apply_voiceover_hint(self.btn_exit, "Quit the app.")
 
     def _set_sort_mode(self, mode):
         self._sort_mode = mode
@@ -3742,6 +3849,19 @@ class MainFrame(wx.Frame):
         )
         if result == wx.YES:
             self.on_add(None)
+    def _schedule_empty_contacts_tip(self):
+        if self._empty_contacts_tip_scheduled:
+            return
+        self._empty_contacts_tip_scheduled = True
+        delay_ms = random.randint(5 * 60 * 1000, 10 * 60 * 1000)
+        def _tip():
+            show_notification(
+                "Contacts tip",
+                "Use Server Directory (Alt+Y) to add contacts quickly.",
+                timeout=8,
+            )
+            self._empty_contacts_tip_scheduled = False
+        wx.CallLater(delay_ms, _tip)
 
     def _selected_contact_name(self):
         sel = self.lv.GetSelection()
@@ -3959,12 +4079,18 @@ class MainFrame(wx.Frame):
         self.sock.sendall(json.dumps({"action": "user_directory"}).encode() + b"\n")
     def on_user_directory_response(self, msg):
         app = wx.GetApp()
-        current_server_name = getattr(app, "active_server_entry", {}).get("name", "Current Server")
+        active = normalize_server_entry(getattr(app, "active_server_entry", {}))
+        current_server_name = active.get("name", "Current Server")
         users = msg.get("users", [])
         if not self._feature_can_use("bots"):
             users = [u for u in users if not bool(u.get("is_bot"))]
         for u in users:
             u["server"] = u.get("server", current_server_name)
+            u["server_host"] = str(u.get("server_host", active.get("host", "")) or "").strip().lower()
+            try:
+                u["server_port"] = int(u.get("server_port", active.get("port", 0)) or 0)
+            except Exception:
+                u["server_port"] = int(active.get("port", 0) or 0)
         dlg = UserDirectoryDialog(self, users, self.user, self.contact_states)
         self._directory_dlg = dlg
         dlg.Show()
@@ -4334,21 +4460,18 @@ class MainFrame(wx.Frame):
             reason = str(payload)
             invite_methods = []
             suggest_invite = False
-        wx.MessageBox(reason, "Add Contact Failed", wx.ICON_ERROR)
+        show_notification("Add contact failed", str(reason), timeout=7)
         match = re.search(r"User '([^']+)' does not exist", str(reason))
         if not match:
             return
         missing_user = match.group(1)
         if not suggest_invite and not invite_methods:
             invite_methods = ["email", "sms"]
-        res = wx.MessageBox(
-            f"{missing_user} does not have an account on this server yet. Would you like to send an invite?",
-            "Invite User",
-            wx.YES_NO | wx.ICON_QUESTION,
-            self
+        show_notification(
+            "Invite tip",
+            f"{missing_user} is not on this server yet. Use Invite User from the menu if needed.",
+            timeout=8,
         )
-        if res == wx.YES:
-            self._prompt_invite_user(missing_user, invite_methods if invite_methods else None)
     def on_invite_result(self, msg):
         ok = bool(msg.get("ok"))
         method = msg.get("method", "invite")
@@ -4455,8 +4578,8 @@ class MainFrame(wx.Frame):
         self._apply_search_filter()
         if not self._all_contacts and not self._empty_prompt_shown:
             self._empty_prompt_shown = True
-            wx.CallAfter(self._show_add_contact_prompt)
-            wx.CallAfter(self.on_user_directory, None)
+            self._schedule_empty_contacts_tip()
+            wx.CallLater(500, self.on_user_directory, None)
     def _apply_search_filter(self):
         query = self.search_box.GetValue().strip().lower()
         self.lv.Clear()
@@ -5310,6 +5433,11 @@ class ChatDialog(wx.Dialog):
         btn = wx.Button(self, label="&Send")
         btn_file = wx.Button(self, label="Send &File")
         btn_call = wx.Button(self, label="Place &Call")
+        apply_voiceover_hint(btn, "Send the typed message.")
+        apply_voiceover_hint(btn_file, "Send a file to this chat contact.")
+        apply_voiceover_hint(btn_call, "Place a voice call to this contact.")
+        apply_voiceover_hint(self.btn_add_contact, "Add this person to your contacts.")
+        apply_voiceover_hint(self.input_ctrl, "Message input. Enter sends, Command+Enter inserts a new line, Control+Enter sends file.")
 
         if dark_mode_on:
             self.hist.SetBackgroundColour(dark_color); self.hist.SetForegroundColour(light_text_color)
