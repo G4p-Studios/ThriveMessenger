@@ -50,6 +50,11 @@ _KEYRING_WRITE_CACHE = {}
 _SOUND_DOWNLOAD_NOTICE_CACHE = set()
 _SOUND_DOWNLOAD_FAILURE_CACHE = set()
 UPDATE_CONTEXT = {}
+
+def _use_keyring_runtime():
+    # macOS Intel systems can hang during keychain calls before any UI is shown.
+    # Use the existing fallback credential storage path on macOS for responsiveness.
+    return sys.platform != "darwin"
 _WinNotification = None
 _plyer_notification = None
 if sys.platform == 'win32':
@@ -277,26 +282,51 @@ def _load_passkey_from_keyring(username, settings=None, server_entry=None):
     account = _passkey_account_for(username, settings=settings, server_entry=server_entry)
     if not account:
         return ""
+    if not _use_keyring_runtime():
+        cfg = settings or {}
+        tokens = cfg.get("passkey_tokens", {}) if isinstance(cfg, dict) else {}
+        if not isinstance(tokens, dict):
+            return ""
+        return _decode_password_fallback(tokens.get(account, ""))
     try:
         return keyring.get_password(PASSKEY_KEYRING_SERVICE, account) or ""
     except Exception as e:
         print(f"Keyring error (passkey load): {e}")
+        cfg = settings or {}
+        tokens = cfg.get("passkey_tokens", {}) if isinstance(cfg, dict) else {}
+        if isinstance(tokens, dict):
+            return _decode_password_fallback(tokens.get(account, ""))
         return ""
 
 def _save_passkey_to_keyring(username, passkey_token, settings=None, server_entry=None):
     account = _passkey_account_for(username, settings=settings, server_entry=server_entry)
     if not account:
         return False
+    cfg = settings if isinstance(settings, dict) else None
+    token_value = str(passkey_token or "")
+    if cfg is not None:
+        tokens = cfg.get("passkey_tokens")
+        if not isinstance(tokens, dict):
+            tokens = {}
+            cfg["passkey_tokens"] = tokens
+        tokens[account] = _encode_password_fallback(token_value)
+    if not _use_keyring_runtime():
+        return bool(token_value)
     try:
-        keyring.set_password(PASSKEY_KEYRING_SERVICE, account, str(passkey_token or ""))
+        keyring.set_password(PASSKEY_KEYRING_SERVICE, account, token_value)
         return True
     except Exception as e:
         print(f"Keyring error (passkey save): {e}")
-        return False
+        return bool(token_value)
 
 def _delete_passkey_from_keyring(username, settings=None, server_entry=None):
     account = _passkey_account_for(username, settings=settings, server_entry=server_entry)
     if not account:
+        return
+    cfg = settings if isinstance(settings, dict) else None
+    if cfg is not None and isinstance(cfg.get("passkey_tokens"), dict):
+        cfg["passkey_tokens"].pop(account, None)
+    if not _use_keyring_runtime():
         return
     try:
         if keyring.get_password(PASSKEY_KEYRING_SERVICE, account):
@@ -359,6 +389,7 @@ def load_user_config():
         'incoming_popup_on_message': False,
         'incoming_alert_on_message': False,
         'passkey_ids': {},
+        'passkey_tokens': {},
     }
 
     # 1. Load non-sensitive preferences from JSON
@@ -403,12 +434,17 @@ def load_user_config():
         settings['autologin_mode'] = 'password'
     if not isinstance(settings.get('passkey_ids', {}), dict):
         settings['passkey_ids'] = {}
+    if not isinstance(settings.get('passkey_tokens', {}), dict):
+        settings['passkey_tokens'] = {}
 
     # 3. Load password from Keyring if "Remember me" is active
     if settings.get('username') and settings.get('remember'):
-        stored_pass = _load_password_from_keyring(settings['username'], settings)
-        if stored_pass:
-            settings['password'] = stored_pass
+        if _use_keyring_runtime():
+            stored_pass = _load_password_from_keyring(settings['username'], settings)
+            if stored_pass:
+                settings['password'] = stored_pass
+            elif settings.get('password_fallback'):
+                settings['password'] = _decode_password_fallback(settings.get('password_fallback', ''))
         elif settings.get('password_fallback'):
             settings['password'] = _decode_password_fallback(settings.get('password_fallback', ''))
             
@@ -440,7 +476,7 @@ def save_user_config(settings):
     # 2. Manage Keyring
     if username:
         account = _keyring_account_for(username, settings)
-        if remember and password:
+        if _use_keyring_runtime() and remember and password:
             cache_key = (KEYRING_SERVICE, account)
             if _KEYRING_WRITE_CACHE.get(cache_key) != password:
                 try:
@@ -448,7 +484,7 @@ def save_user_config(settings):
                     _KEYRING_WRITE_CACHE[cache_key] = password
                 except Exception as e:
                     print(f"Keyring error (save): {e}")
-        else:
+        elif _use_keyring_runtime():
             # If remember is False, ensure we remove the credential from the OS manager
             try:
                 if keyring.get_password(KEYRING_SERVICE, account):
@@ -582,6 +618,7 @@ def resolve_default_server_entry(user_config):
 def fetch_server_welcome(server_entry):
     try:
         ssock = create_secure_socket(server_entry)
+        ssock.settimeout(6.0)
         ssock.sendall((json.dumps({"action": "get_welcome"}) + "\n").encode())
         line = ssock.makefile().readline()
         ssock.close()
@@ -629,6 +666,7 @@ def fetch_server_snapshot(server_entry):
     }
     try:
         ssock = create_secure_socket(server_entry)
+        ssock.settimeout(6.0)
         ssock.sendall((json.dumps({"action": "server_info"}) + "\n").encode())
         line = ssock.makefile().readline()
         ssock.close()
@@ -689,6 +727,7 @@ def fetch_invite_validation(server_entry, invite_token):
         return {"status": "error", "reason": "Missing invite token."}
     try:
         ssock = create_secure_socket(server_entry)
+        ssock.settimeout(6.0)
         payload = {"action": "validate_invite", "invite_token": token}
         ssock.sendall((json.dumps(payload) + "\n").encode())
         line = ssock.makefile().readline()
@@ -1665,17 +1704,17 @@ def create_secure_socket(server_entry=None):
         'cafile': normalize_server_entry(server_entry)['cafile'] or None,
     }
     addr = (active['host'], active['port'])
-    sock = socket.create_connection(addr)
+    sock = socket.create_connection(addr, timeout=6.0)
     if active['cafile'] and os.path.exists(active['cafile']):
         context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=active['cafile'])
     else: context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
     try: return context.wrap_socket(sock, server_hostname=active['host'])
     except ssl.SSLCertVerificationError:
-        sock.close(); sock = socket.create_connection(addr)
+        sock.close(); sock = socket.create_connection(addr, timeout=6.0)
         context = ssl.create_default_context(); context.check_hostname = False; context.verify_mode = ssl.CERT_NONE
         return context.wrap_socket(sock, server_hostname=active['host'])
     except (ssl.SSLError, OSError):
-        sock.close(); return socket.create_connection(addr)
+        sock.close(); return socket.create_connection(addr, timeout=6.0)
 
 class ClientApp(wx.App):
     def _startup_window_watchdog(self):
@@ -2707,8 +2746,9 @@ class LoginDialog(wx.Dialog):
             self.remember_cb.SetForegroundColour(light_text_color); self.autologin_cb.SetForegroundColour(light_text_color)
 
         self.populate_server_choice()
-        self.refresh_welcome_preview()
-        self.refresh_invite_preview()
+        self.welcome_preview.SetLabel("Welcome: loading server information...")
+        self.invite_preview.SetLabel("")
+        wx.CallAfter(self.schedule_refresh_previews)
         s.Add(server_box, 0, wx.EXPAND | wx.ALL, 5)
         s.Add(user_box, 0, wx.EXPAND | wx.ALL, 5); s.Add(pass_box, 0, wx.EXPAND | wx.ALL, 5)
         s.Add(self.remember_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10); s.Add(self.autologin_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
@@ -2742,8 +2782,7 @@ class LoginDialog(wx.Dialog):
         idx = self.server_choice.GetSelection()
         if 0 <= idx < len(self.server_entries):
             self.selected_server = self.server_entries[idx]
-            self.refresh_welcome_preview()
-            self.refresh_invite_preview()
+            self.schedule_refresh_previews()
 
     def on_manage_servers(self, _):
         with ServerManagerDialog(self, self.server_entries, self.primary_server_name) as dlg:
@@ -2763,8 +2802,7 @@ class LoginDialog(wx.Dialog):
                 current_name = self.selected_server.get('name', '')
                 self.user_config['last_server_name'] = current_name if any(e['name'] == current_name for e in self.server_entries) else self.server_entries[0]['name']
                 self.populate_server_choice()
-                self.refresh_welcome_preview()
-                self.refresh_invite_preview()
+                self.schedule_refresh_previews()
 
     def on_set_primary_server(self, _):
         if not self.selected_server:
@@ -2773,9 +2811,24 @@ class LoginDialog(wx.Dialog):
         self.populate_server_choice()
         wx.MessageBox(f"{self.primary_server_name} is now your default server.", "Primary Server Updated", wx.OK | wx.ICON_INFORMATION)
 
-    def refresh_welcome_preview(self):
-        info = fetch_server_welcome(self.selected_server)
-        snapshot = fetch_server_snapshot(self.selected_server)
+    def schedule_refresh_previews(self):
+        server_entry = normalize_server_entry(self.selected_server)
+        server_key = f"{server_entry.get('host','')}:{server_entry.get('port',0)}"
+        self.welcome_preview.SetLabel("Welcome: loading server information...")
+        self.invite_preview.SetLabel("Checking invite token..." if self.invite_context.get("invite_token") else "")
+        def _worker():
+            info = fetch_server_welcome(server_entry)
+            snapshot = fetch_server_snapshot(server_entry)
+            token = str(self.invite_context.get("invite_token", "") or "").strip()
+            validation = fetch_invite_validation(server_entry, token) if token else None
+            wx.CallAfter(self._apply_preview_payload, server_key, info, snapshot, validation)
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _apply_preview_payload(self, server_key, info, snapshot, validation):
+        current = normalize_server_entry(self.selected_server)
+        current_key = f"{current.get('host','')}:{current.get('port',0)}"
+        if server_key != current_key:
+            return
         pre = str(info.get('pre_login', '') or '').strip()
         guide = (
             "Connection help: Use Manage Servers to add more servers. "
@@ -2790,28 +2843,30 @@ class LoginDialog(wx.Dialog):
             f"Server uptime: {snapshot.get('uptime', 'Unknown')}"
         )
         self.welcome_preview.SetLabel(f"{motd}\n\n{stats}\n\n{guide}")
-        self.Layout()
-
-    def refresh_invite_preview(self):
         token = str(self.invite_context.get("invite_token", "") or "").strip()
         if not token:
             self.invite_validation = None
             self.invite_preview.SetLabel("")
-            self.Layout()
-            return
-        validation = fetch_invite_validation(self.selected_server, token)
-        if validation.get("status") == "ok":
-            self.invite_validation = validation
-            invite_user = str(validation.get("invite_user", "") or "").strip()
-            invite_email = str(validation.get("invite_email", "") or "").strip()
-            who = invite_user or "this account"
-            details = f" ({invite_email})" if invite_email else ""
-            self.invite_preview.SetLabel(f"Invite ready for {who}{details}. Use Create Account to continue.")
         else:
-            self.invite_validation = None
-            reason = str(validation.get("reason", "Unknown invite error.") or "Unknown invite error.").strip()
-            self.invite_preview.SetLabel(f"Invite link is not valid on this server: {reason}")
+            validation = validation or {"status": "error", "reason": "Invite check failed."}
+            if validation.get("status") == "ok":
+                self.invite_validation = validation
+                invite_user = str(validation.get("invite_user", "") or "").strip()
+                invite_email = str(validation.get("invite_email", "") or "").strip()
+                who = invite_user or "this account"
+                details = f" ({invite_email})" if invite_email else ""
+                self.invite_preview.SetLabel(f"Invite ready for {who}{details}. Use Create Account to continue.")
+            else:
+                self.invite_validation = None
+                reason = str(validation.get("reason", "Unknown invite error.") or "Unknown invite error.").strip()
+                self.invite_preview.SetLabel(f"Invite link is not valid on this server: {reason}")
         self.Layout()
+
+    def refresh_welcome_preview(self):
+        self.schedule_refresh_previews()
+
+    def refresh_invite_preview(self):
+        self.schedule_refresh_previews()
     
     def on_forgot(self, event):
         set_active_server_config(self.selected_server)
