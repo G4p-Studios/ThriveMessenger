@@ -1658,6 +1658,16 @@ def create_secure_socket(server_entry=None):
         sock.close(); return socket.create_connection(addr)
 
 class ClientApp(wx.App):
+    def _bootstrap_startup_ui(self):
+        try:
+            ok = self.show_login_dialog()
+        except Exception as e:
+            log_event("error", "startup_ui_exception", {"error": str(e)})
+            traceback.print_exc()
+            ok = False
+        if not ok:
+            self.ExitMainLoop()
+
     def _signal_existing_instance(self):
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1687,7 +1697,9 @@ class ClientApp(wx.App):
         log_event("info", "app_start")
         self.instance_checker = wx.SingleInstanceChecker("ThriveMessenger-%s" % wx.GetUserId())
         if self.instance_checker.IsAnotherRunning():
-            if self._signal_existing_instance() or self._activate_existing_app():
+            # Only trust the IPC restore path. AppleScript activation can
+            # succeed even when no usable UI instance is available.
+            if self._signal_existing_instance():
                 return False
             # Stale lock or crashed/background state: continue startup to recover.
             print("Detected stale single-instance state; launching a fresh visible window.")
@@ -1702,7 +1714,7 @@ class ClientApp(wx.App):
             # If IPC binding fails, first try to restore an existing instance.
             # If restore fails, continue startup without IPC to avoid being stuck unable to open.
             self._ipc_sock = None
-            if self._signal_existing_instance() or self._activate_existing_app():
+            if self._signal_existing_instance():
                 return False
             print("IPC port unavailable and no active instance responded; continuing without IPC listener.")
             log_event("warn", "ipc_bind_unavailable_continuing")
@@ -1734,7 +1746,11 @@ class ClientApp(wx.App):
                 if "invalid credentials" in str(reason).lower():
                     self.user_config['autologin'] = False
                 save_user_config(self.user_config)
-        return self.show_login_dialog()
+        # On macOS, opening modal dialogs directly in OnInit can result in a
+        # running process with no visible windows. Defer startup UI until the
+        # event loop is active.
+        wx.CallAfter(self._bootstrap_startup_ui)
+        return True
 
     def add_transfer_history(self, direction, user, filename, path="", status="ok"):
         self.transfer_history.append({
