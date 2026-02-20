@@ -50,17 +50,24 @@ _KEYRING_WRITE_CACHE = {}
 _SOUND_DOWNLOAD_NOTICE_CACHE = set()
 _SOUND_DOWNLOAD_FAILURE_CACHE = set()
 UPDATE_CONTEXT = {}
+_WinNotification = None
+_plyer_notification = None
 if sys.platform == 'win32':
-    from winotify import Notification as _WinNotification
-else:
+    try:
+        from winotify import Notification as _WinNotification
+    except Exception:
+        _WinNotification = None
+try:
     from plyer import notification as _plyer_notification
+except Exception:
+    _plyer_notification = None
 
 def show_notification(title, message, timeout=5):
     try:
-        if sys.platform == 'win32':
+        if sys.platform == 'win32' and _WinNotification is not None:
             toast = _WinNotification(app_id="Thrive Messenger", title=title, msg=message, duration="short")
             toast.show()
-        else:
+        elif _plyer_notification is not None:
             _plyer_notification.notify(title, message, timeout=timeout)
     except Exception as e:
         print(f"Error showing notification: {e}")
@@ -2112,38 +2119,48 @@ class ClientApp(wx.App):
         handled = False
         try:
             for line in self.sockfile:
-                msg = json.loads(line); act = msg.get("action")
-                if act == "contact_list": wx.CallAfter(self.frame.load_contacts, msg["contacts"])
-                elif act == "contact_status": wx.CallAfter(self.frame.update_contact_status, msg["user"], msg["online"], msg.get("status_text"))
-                elif act == "msg": wx.CallAfter(self.frame.receive_message, msg)
-                elif act == "msg_failed": wx.CallAfter(self.frame.on_message_failed, msg["to"], msg["reason"])
-                elif act == "add_contact_failed": wx.CallAfter(self.frame.on_add_contact_failed, msg)
-                elif act == "add_contact_success": wx.CallAfter(self.frame.on_add_contact_success, msg["contact"])
-                elif act == "admin_response": wx.CallAfter(self.frame.on_admin_response, msg["response"])
-                elif act == "server_info_response": wx.CallAfter(self.frame.on_server_info_response, msg)
-                elif act == "user_directory_response": wx.CallAfter(self.frame.on_user_directory_response, msg)
-                elif act == "admin_status_change": wx.CallAfter(self.frame.on_admin_status_change, msg["user"], msg["is_admin"])
-                elif act == "server_alert": wx.CallAfter(self.frame.on_server_alert, msg["message"])
-                elif act == "typing": wx.CallAfter(self.frame.on_typing_event, msg)
-                elif act == "file_offer": wx.CallAfter(self.on_file_offer, msg)
-                elif act == "file_offer_failed": wx.CallAfter(self.on_file_offer_failed, msg)
-                elif act == "file_accepted": wx.CallAfter(self.on_file_accepted, msg)
-                elif act == "file_declined": wx.CallAfter(self.on_file_declined, msg)
-                elif act == "file_data": wx.CallAfter(self.on_file_data, msg)
-                elif act == "invite_result": wx.CallAfter(self.frame.on_invite_result, msg)
-                elif act == "change_password_result": wx.CallAfter(self.frame.on_change_password_result, msg)
-                elif act == "bot_token_revoked": wx.CallAfter(self.frame.on_bot_token_revoked, msg.get("bot", "bot"))
-                elif act == "bot_rules": wx.CallAfter(self.frame.on_bot_rules, msg)
-                elif act == "bot_rules_update": wx.CallAfter(self.frame.on_bot_rules_update, msg)
-                elif act == "group_policy": wx.CallAfter(self.frame.on_group_policy, msg)
-                elif act == "group_policy_update": wx.CallAfter(self.frame.on_group_policy_update, msg)
-                elif act == "group_call_list_response": wx.CallAfter(self.frame.on_group_call_list_response, msg)
-                elif act == "group_call_event": wx.CallAfter(self.frame.on_group_call_event, msg)
-                elif act == "group_call_result": wx.CallAfter(self.frame.on_group_call_result, msg)
-                elif act == "group_call_signal": wx.CallAfter(self.frame.on_group_call_signal, msg)
-                elif act == "group_call_signal_result": wx.CallAfter(self.frame.on_group_call_signal_result, msg)
-                elif act == "feature_caps": wx.CallAfter(self.frame.set_feature_caps, msg.get("caps", {}))
-                elif act == "banned_kick": wx.CallAfter(self.on_banned); handled = True; break
+                try:
+                    msg = json.loads(line)
+                except Exception:
+                    continue
+                act = msg.get("action")
+                try:
+                    if act == "contact_list": wx.CallAfter(self.frame.load_contacts, msg.get("contacts", []))
+                    elif act == "contact_status": wx.CallAfter(self.frame.update_contact_status, msg.get("user"), msg.get("online"), msg.get("status_text"))
+                    elif act == "msg": wx.CallAfter(self.frame.receive_message, msg)
+                    elif act == "msg_failed": wx.CallAfter(self.frame.on_message_failed, msg.get("to"), msg.get("reason", "Message could not be delivered."))
+                    elif act == "add_contact_failed": wx.CallAfter(self.frame.on_add_contact_failed, msg)
+                    elif act == "add_contact_success":
+                        contact = msg.get("contact")
+                        if isinstance(contact, dict):
+                            wx.CallAfter(self.frame.on_add_contact_success, contact)
+                    elif act == "admin_response": wx.CallAfter(self.frame.on_admin_response, msg.get("response", ""))
+                    elif act == "server_info_response": wx.CallAfter(self.frame.on_server_info_response, msg)
+                    elif act == "user_directory_response": wx.CallAfter(self.frame.on_user_directory_response, msg)
+                    elif act == "admin_status_change": wx.CallAfter(self.frame.on_admin_status_change, msg.get("user"), msg.get("is_admin"))
+                    elif act == "server_alert": wx.CallAfter(self.frame.on_server_alert, msg.get("message", ""))
+                    elif act == "typing": wx.CallAfter(self.frame.on_typing_event, msg)
+                    elif act == "file_offer": wx.CallAfter(self.on_file_offer, msg)
+                    elif act == "file_offer_failed": wx.CallAfter(self.on_file_offer_failed, msg)
+                    elif act == "file_accepted": wx.CallAfter(self.on_file_accepted, msg)
+                    elif act == "file_declined": wx.CallAfter(self.on_file_declined, msg)
+                    elif act == "file_data": wx.CallAfter(self.on_file_data, msg)
+                    elif act == "invite_result": wx.CallAfter(self.frame.on_invite_result, msg)
+                    elif act == "change_password_result": wx.CallAfter(self.frame.on_change_password_result, msg)
+                    elif act == "bot_token_revoked": wx.CallAfter(self.frame.on_bot_token_revoked, msg.get("bot", "bot"))
+                    elif act == "bot_rules": wx.CallAfter(self.frame.on_bot_rules, msg)
+                    elif act == "bot_rules_update": wx.CallAfter(self.frame.on_bot_rules_update, msg)
+                    elif act == "group_policy": wx.CallAfter(self.frame.on_group_policy, msg)
+                    elif act == "group_policy_update": wx.CallAfter(self.frame.on_group_policy_update, msg)
+                    elif act == "group_call_list_response": wx.CallAfter(self.frame.on_group_call_list_response, msg)
+                    elif act == "group_call_event": wx.CallAfter(self.frame.on_group_call_event, msg)
+                    elif act == "group_call_result": wx.CallAfter(self.frame.on_group_call_result, msg)
+                    elif act == "group_call_signal": wx.CallAfter(self.frame.on_group_call_signal, msg)
+                    elif act == "group_call_signal_result": wx.CallAfter(self.frame.on_group_call_signal_result, msg)
+                    elif act == "feature_caps": wx.CallAfter(self.frame.set_feature_caps, msg.get("caps", {}))
+                    elif act == "banned_kick": wx.CallAfter(self.on_banned); handled = True; break
+                except Exception as dispatch_err:
+                    print(f"Warning: failed to process server action '{act}': {dispatch_err}")
         except (IOError, json.JSONDecodeError, ValueError):
             print("Disconnected from server.")
             if self.sock is sock and not self.intentional_disconnect: wx.CallAfter(self.on_server_disconnect); handled = True
@@ -3253,7 +3270,11 @@ class UserDirectoryDialog(wx.Dialog):
         if not user or user not in self.contact_states: return
         blocked = self.contact_states.get(user, 0) == 1
         action = "unblock_contact" if blocked else "block_contact"
-        self.parent_frame.sock.sendall(json.dumps({"action": action, "to": user}).encode() + b"\n")
+        try:
+            self.parent_frame.sock.sendall(json.dumps({"action": action, "to": user}).encode() + b"\n")
+        except Exception as e:
+            wx.MessageBox(f"Could not update block state for {user}:\n{e}", "Connection Error", wx.OK | wx.ICON_ERROR)
+            return
         self.contact_states[user] = 0 if blocked else 1
         for entry in self.parent_frame._all_contacts:
             if entry["user"] == user: entry["blocked"] = 0 if blocked else 1; break
@@ -3267,7 +3288,11 @@ class UserDirectoryDialog(wx.Dialog):
             wx.MessageBox("This server does not support cross-server contacts from the current connection.", "Feature Not Supported", wx.OK | wx.ICON_INFORMATION)
             return
         if not user: return
-        self.parent_frame.sock.sendall(json.dumps({"action": "add_contact", "to": user}).encode() + b"\n")
+        try:
+            self.parent_frame.sock.sendall(json.dumps({"action": "add_contact", "to": user}).encode() + b"\n")
+        except Exception as e:
+            wx.MessageBox(f"Could not add contact {user}:\n{e}", "Connection Error", wx.OK | wx.ICON_ERROR)
+            return
         self.btn_add.Disable(); self.btn_add.SetLabel("Adding...")
     def _select_user_from_context_event(self, event):
         lv = self._get_active_list()
@@ -3705,6 +3730,12 @@ class MainFrame(wx.Frame):
     def _selected_contact_name(self):
         sel = self.lv.GetSelection()
         if sel == wx.NOT_FOUND or sel >= len(self._contact_display_map):
+            # macOS ListBox can occasionally drop selection after focus/menu transitions.
+            # Keep actions usable by selecting the first valid contact row.
+            for idx, name in enumerate(self._contact_display_map):
+                if name:
+                    self.lv.SetSelection(idx)
+                    return name
             return None
         return self._contact_display_map[sel]
     def _clear_unread(self, contact):
@@ -4049,6 +4080,12 @@ class MainFrame(wx.Frame):
         with ServerInfoDialog(self, "\n".join(lines)) as dlg: dlg.ShowModal()
     def update_button_states(self, event=None):
         selected_contact = self._selected_contact_name()
+        if selected_contact is None and self.lv.GetCount() > 0 and self._contact_display_map:
+            for idx, name in enumerate(self._contact_display_map):
+                if name:
+                    self.lv.SetSelection(idx)
+                    selected_contact = name
+                    break
         is_selection = selected_contact is not None
         is_contact_selection = selected_contact is not None and selected_contact in self.contact_states
         self.btn_send.Enable(is_contact_selection)
@@ -4384,7 +4421,10 @@ class MainFrame(wx.Frame):
                 c = dlg.GetValue().strip()
                 if not c: wx.MessageBox("Username cannot be blank.", "Input Error", wx.ICON_ERROR); return
                 if c == self.user: wx.MessageBox("You cannot add yourself as a contact.", "Input Error", wx.ICON_ERROR); return
-                self.sock.sendall(json.dumps({"action":"add_contact","to":c}).encode()+b"\n")
+                try:
+                    self.sock.sendall(json.dumps({"action":"add_contact","to":c}).encode()+b"\n")
+                except Exception as e:
+                    wx.MessageBox(f"Could not add contact {c}:\n{e}", "Connection Error", wx.OK | wx.ICON_ERROR)
     def load_contacts(self, contacts):
         deduped = {}
         for c in contacts:
@@ -4594,7 +4634,14 @@ class MainFrame(wx.Frame):
     def on_block_toggle(self, _):
         c = self._selected_contact_name()
         if not c: return
-        blocked = self.contact_states.get(c,0) == 1; action = "unblock_contact" if blocked else "block_contact"; self.sock.sendall(json.dumps({"action":action,"to":c}).encode()+b"\n"); self.contact_states[c] = 0 if blocked else 1
+        blocked = self.contact_states.get(c,0) == 1
+        action = "unblock_contact" if blocked else "block_contact"
+        try:
+            self.sock.sendall(json.dumps({"action":action,"to":c}).encode()+b"\n")
+        except Exception as e:
+            wx.MessageBox(f"Could not update block state for {c}:\n{e}", "Connection Error", wx.OK | wx.ICON_ERROR)
+            return
+        self.contact_states[c] = 0 if blocked else 1
         for entry in self._all_contacts:
             if entry["user"] == c: entry["blocked"] = 0 if blocked else 1; break
         self._apply_search_filter()
@@ -4602,7 +4649,12 @@ class MainFrame(wx.Frame):
         c = self._selected_contact_name()
         if not c or c not in self.contact_states:
             return
-        self.sock.sendall(json.dumps({"action":"delete_contact","to":c}).encode()+b"\n"); self.contact_states.pop(c, None)
+        try:
+            self.sock.sendall(json.dumps({"action":"delete_contact","to":c}).encode()+b"\n")
+        except Exception as e:
+            wx.MessageBox(f"Could not delete contact {c}:\n{e}", "Connection Error", wx.OK | wx.ICON_ERROR)
+            return
+        self.contact_states.pop(c, None)
         self._all_contacts = [entry for entry in self._all_contacts if entry["user"] != c]
         self._apply_search_filter()
     def on_send(self, _):
@@ -5430,7 +5482,11 @@ class ChatDialog(wx.Dialog):
                 return
         else:
             msg = {"action":"msg","to":self.contact,"from":self.user,"msg":txt,"time":ts}
-            self.sock.sendall(json.dumps(msg).encode()+b"\n")
+            try:
+                self.sock.sendall(json.dumps(msg).encode()+b"\n")
+            except Exception as e:
+                self.append_error(f"Message failed to send: {e}")
+                return
         self.append(txt, self.user, ts)
         wx.GetApp().play_sound("send.wav")
         self.input_ctrl.Clear(); self.input_ctrl.SetFocus()
@@ -5447,8 +5503,8 @@ class ChatDialog(wx.Dialog):
         try:
             self.sock.sendall((json.dumps({"action": "voice_call_request", "to": self.contact}) + "\n").encode())
             show_notification("Calling", f"Placing call to {self.contact}...", timeout=4)
-        except Exception:
-            wx.MessageBox("This server does not support voice calling yet.", "Feature Not Supported", wx.OK | wx.ICON_INFORMATION)
+        except Exception as e:
+            wx.MessageBox(f"This server does not support voice calling yet.\n\n{e}", "Feature Not Supported", wx.OK | wx.ICON_INFORMATION)
     def _handle_enter_action(self):
         action = str(wx.GetApp().user_config.get('enter_key_action', 'send') or 'send')
         if action == 'place_call':
@@ -5460,7 +5516,11 @@ class ChatDialog(wx.Dialog):
         else:
             self.on_send(None)
     def on_add_contact(self, _):
-        self.sock.sendall(json.dumps({"action": "add_contact", "to": self.contact}).encode() + b"\n")
+        try:
+            self.sock.sendall(json.dumps({"action": "add_contact", "to": self.contact}).encode() + b"\n")
+        except Exception as e:
+            self.append_error(f"Could not add contact: {e}")
+            return
         self.btn_add_contact.Disable(); self.btn_add_contact.SetLabel("Adding...")
     def hide_add_button(self):
         self.is_contact = True
