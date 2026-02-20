@@ -44,8 +44,11 @@ jobs:
         run: |
           : "${DEPLOY_HOST:?missing DEPLOY_HOST secret}"
           : "${DEPLOY_USER:?missing DEPLOY_USER secret}"
-          : "${DEPLOY_REPO_DIR:?missing DEPLOY_REPO_DIR secret}"
           : "${PM2_APP_NAME:?missing DEPLOY_PM2_APP_NAME secret}"
+
+          if [ -z "${DEPLOY_REPO_DIR}" ]; then
+            DEPLOY_REPO_DIR="/home/${DEPLOY_USER}/apps/ThriveMessenger"
+          fi
 
           PORT_ARG=""
           if [ -n "${DEPLOY_PORT}" ]; then

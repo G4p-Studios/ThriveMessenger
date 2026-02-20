@@ -4,7 +4,7 @@ set -euo pipefail
 # Pull latest repo changes and restart PM2 process only when server-side files changed.
 #
 # Environment variables:
-#   REPO_DIR           Repo path on server (default: /opt/thrive/ThriveMessenger)
+#   REPO_DIR           Repo path on server (default: /home/${DEPLOY_USER}/apps/ThriveMessenger)
 #   REMOTE             Git remote (default: origin)
 #   BRANCH             Git branch (default: main)
 #   PM2_APP_NAME       PM2 app name/id (default: thrive-server)
@@ -21,7 +21,8 @@ set -euo pipefail
 #   2 local repo has uncommitted changes
 #   3 restart command failed
 
-REPO_DIR="${REPO_DIR:-/opt/thrive/ThriveMessenger}"
+DEFAULT_DEPLOY_USER="${DEPLOY_USER:-$(whoami)}"
+REPO_DIR="${REPO_DIR:-/home/${DEFAULT_DEPLOY_USER}/apps/ThriveMessenger}"
 REMOTE="${REMOTE:-origin}"
 BRANCH="${BRANCH:-main}"
 PM2_APP_NAME="${PM2_APP_NAME:-thrive-server}"

@@ -11,7 +11,7 @@ This repo now includes:
 ## 1) One-time server setup
 
 1. Ensure repo is present on server (example):
-   - `/opt/thrive/ThriveMessenger`
+   - `/home/<runtime-user>/apps/ThriveMessenger`
 2. Ensure PM2 process exists (example app name):
    - `thrive-server`
 3. If deploy user is not PM2 owner, allow targeted sudo for PM2 restart.
@@ -29,11 +29,12 @@ Adjust names and command path for your system.
 ## 2) Test deploy script manually
 
 ```bash
-REPO_DIR=/opt/thrive/ThriveMessenger \
+DEPLOY_USER=<deploy-user> \
+REPO_DIR=/home/<deploy-user>/apps/ThriveMessenger \
 PM2_APP_NAME=thrive-server \
 PM2_RUN_USER=thrive \
 PM2_HOME_PATH=/home/thrive/.pm2 \
-bash /opt/thrive/ThriveMessenger/srv/scripts/deploy_and_restart.sh
+bash /home/<deploy-user>/apps/ThriveMessenger/srv/scripts/deploy_and_restart.sh
 ```
 
 ## 3) GitHub Actions deploy over SSH
@@ -58,11 +59,12 @@ Run API endpoint on server (bind localhost):
 
 ```bash
 export DEPLOY_API_TOKEN='strong-random-token'
-export REPO_DIR='/opt/thrive/ThriveMessenger'
+export DEPLOY_USER='<deploy-user>'
+export REPO_DIR='/home/<deploy-user>/apps/ThriveMessenger'
 export PM2_APP_NAME='thrive-server'
 export PM2_RUN_USER='thrive'
 export PM2_HOME_PATH='/home/thrive/.pm2'
-python3 /opt/thrive/ThriveMessenger/srv/scripts/deploy_hook_api.py
+python3 /home/<deploy-user>/apps/ThriveMessenger/srv/scripts/deploy_hook_api.py
 ```
 
 Trigger deploy:
@@ -76,27 +78,27 @@ curl -sS -X POST http://127.0.0.1:18777/deploy \
 
 Recommended: expose only behind reverse proxy + auth (Authelia) or keep localhost-only.
 
-## 5) Shared handoff mode (`/home/wharper/shared/*`)
+## 5) Shared handoff mode (`/home/<deploy-user>/shared/*`)
 
 If the deploy account cannot restart PM2 directly (for example, runtime owned by another user), use the staging workflow:
 
 - Workflow: `Stage Server Bundle To Shared`
 - It uploads a bundle into:
-  - `/home/wharper/shared/thrive/incoming/*.tar.gz`
-  - plus `latest.tar.gz` symlink in `/home/wharper/shared/thrive/`
+  - `/home/<deploy-user>/shared/thrive/incoming/*.tar.gz`
+  - plus `latest.tar.gz` symlink in `/home/<deploy-user>/shared/thrive/`
 
 ### Required secrets for staging workflow
 
 - `DEPLOY_SSH_KEY`
 - `DEPLOY_HOST`
 - `DEPLOY_PORT` (optional)
-- `DEPLOY_USER` (for example `wharper`)
-- `DEPLOY_SHARED_DIR` (optional; default `/home/wharper/shared/thrive`)
+- `DEPLOY_USER` (runtime account username)
+- `DEPLOY_SHARED_DIR` (optional; default `/home/${DEPLOY_USER}/shared/thrive`)
 
 ### Apply from the runtime owner account (example)
 
 ```bash
 cd /path/to/runtime/repo
-tar -xzf /home/wharper/shared/thrive/latest.tar.gz -C .
+tar -xzf /home/<deploy-user>/shared/thrive/latest.tar.gz -C .
 pm2 restart thrive-server --update-env
 ```

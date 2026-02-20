@@ -59,7 +59,7 @@ jobs:
             ssh-keyscan -H "${{ secrets.DEPLOY_HOST }}" >> ~/.ssh/known_hosts
           fi
 
-      - name: Upload bundle to /home/wharper/shared
+      - name: Upload bundle to /home/<deploy_user>/shared
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
@@ -68,7 +68,7 @@ jobs:
         run: |
           : "${DEPLOY_HOST:?missing DEPLOY_HOST secret}"
           : "${DEPLOY_USER:?missing DEPLOY_USER secret}"
-          SHARED_DIR="${DEPLOY_SHARED_DIR:-/home/wharper/shared/thrive}"
+          SHARED_DIR="${DEPLOY_SHARED_DIR:-/home/${DEPLOY_USER}/shared/thrive}"
           TARGET_DIR="${SHARED_DIR}/incoming"
           SCP_PORT_ARG=""
           SSH_PORT_ARG=""
