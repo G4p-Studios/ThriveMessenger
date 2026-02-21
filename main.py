@@ -331,7 +331,7 @@ class ThriveTaskBarIcon(wx.adv.TaskBarIcon):
 
 class SettingsDialog(wx.Dialog):
     def __init__(self, parent, current_config):
-        super().__init__(parent, title="Settings", size=(300, 250)); self.config = current_config
+        super().__init__(parent, title="Settings", size=(300, 310)); self.config = current_config
         panel = wx.Panel(self); main_sizer = wx.BoxSizer(wx.VERTICAL); sound_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "&Sound Pack")
 
         dark_mode_on = is_windows_dark_mode()
@@ -356,11 +356,18 @@ class SettingsDialog(wx.Dialog):
             self.tts_cb.Enable(False)
             self.tts_cb.SetToolTip("accessible_output2 is not installed")
 
+        self.announce_status_cb = wx.CheckBox(panel, label="Speak online/offline &announcements")
+        self.announce_status_cb.SetValue(self.config.get('announce_status', False))
+        if not _ao2_available:
+            self.announce_status_cb.Enable(False)
+            self.announce_status_cb.SetToolTip("accessible_output2 is not installed")
+
         self.btn_chpass = wx.Button(panel, label="C&hange Password...")
         self.btn_chpass.Bind(wx.EVT_BUTTON, self.on_change_password)
 
         sound_box.Add(self.choice, 0, wx.EXPAND | wx.ALL, 5); main_sizer.Add(sound_box, 0, wx.EXPAND | wx.ALL, 5)
         main_sizer.Add(self.tts_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        main_sizer.Add(self.announce_status_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         main_sizer.Add(self.btn_chpass, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         btn_sizer = wx.StdDialogButtonSizer()
         ok_btn = wx.Button(panel, wx.ID_OK, label="&Apply"); ok_btn.SetDefault(); cancel_btn = wx.Button(panel, wx.ID_CANCEL)
@@ -368,6 +375,7 @@ class SettingsDialog(wx.Dialog):
         if dark_mode_on:
             self.choice.SetBackgroundColour(dark_color); self.choice.SetForegroundColour(light_text_color)
             self.tts_cb.SetForegroundColour(light_text_color); self.tts_cb.SetBackgroundColour(dark_color)
+            self.announce_status_cb.SetForegroundColour(light_text_color); self.announce_status_cb.SetBackgroundColour(dark_color)
             self.btn_chpass.SetBackgroundColour(dark_color); self.btn_chpass.SetForegroundColour(light_text_color)
             ok_btn.SetBackgroundColour(dark_color); ok_btn.SetForegroundColour(light_text_color)
             cancel_btn.SetBackgroundColour(dark_color); cancel_btn.SetForegroundColour(light_text_color)
@@ -1225,12 +1233,19 @@ class MainFrame(wx.Frame):
                 c["status"] = new_status
                 break
         self._apply_search_filter()
+        app = wx.GetApp()
         if online and not was_online:
-            wx.GetApp().play_sound("contact_online.wav")
-            show_notification("Contact online", f"{user} has come online.")
+            app.play_sound("contact_online.wav")
+            if app.user_config.get('announce_status', False):
+                speak(f"{user} has come online.")
+            else:
+                show_notification("Contact online", f"{user} has come online.")
         elif not online and was_online:
-            wx.GetApp().play_sound("contact_offline.wav")
-            show_notification("Contact offline", f"{user} has gone offline.")
+            app.play_sound("contact_offline.wav")
+            if app.user_config.get('announce_status', False):
+                speak(f"{user} has gone offline.")
+            else:
+                show_notification("Contact offline", f"{user} has gone offline.")
 
     def __init__(self, user, sock):
         super().__init__(None, title=f"Thrive Messenger – {user}", size=(400,380)); self.user, self.sock = user, sock; self.task_bar_icon = None; self.is_exiting = False; self._directory_dlg = None; self._conversations_dlg = None; self._noncontact_senders = load_noncontact_senders(user)
@@ -1298,7 +1313,7 @@ class MainFrame(wx.Frame):
         with SettingsDialog(self, app.user_config) as dlg:
             if dlg.ShowModal() == wx.ID_OK:
                 selected_pack = dlg.choice.GetStringSelection(); app.user_config['soundpack'] = selected_pack
-                app.user_config['tts_enabled'] = dlg.tts_cb.IsChecked(); save_user_config(app.user_config)
+                app.user_config['tts_enabled'] = dlg.tts_cb.IsChecked(); app.user_config['announce_status'] = dlg.announce_status_cb.IsChecked(); save_user_config(app.user_config)
                 wx.MessageBox("Settings have been applied.", "Settings Saved", wx.OK | wx.ICON_INFORMATION)
     def on_conversations(self, _):
         if self._conversations_dlg:
