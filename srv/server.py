@@ -554,7 +554,12 @@ def _active_usernames():
         return set(clients.keys()) | set(bot_usernames) | set(bot_external_usernames) | extra_bots
 
 def _is_online_user(username):
-    return username in _active_usernames()
+    if _is_registered_bot(username):
+        return username in _active_usernames()
+    with lock:
+        if username not in clients:
+            return False
+        return client_statuses.get(username, "online").lower() != "offline"
 
 def _status_for_user(username):
     if _is_registered_bot(username):
@@ -1185,7 +1190,26 @@ def handle_client(cs, addr):
                 sock.sendall(json.dumps({"status": "error", "reason": "Invalid code"}).encode() + b"\n")
             return
 
-        if action != "login": 
+        # --- File data on a dedicated connection (no login needed) ---
+        if action == "file_data":
+            transfer_id = req.get("transfer_id")
+            file_token = req.get("file_token")
+            with transfer_lock: transfer = pending_transfers.pop(transfer_id, None)
+            if not transfer or transfer.get("file_token") != file_token:
+                sock.sendall(b'{"status":"error","reason":"Invalid transfer"}\n')
+                return
+            recipient = transfer["to"]
+            with lock: sock_to = clients.get(recipient)
+            if sock_to:
+                name_map = {f["filename"]: f["filename"] for f in transfer["files"]}
+                safe_files = [dict(fd, filename=name_map.get(fd["filename"], fd["filename"])) for fd in req.get("files", [])
+                              if '/' not in fd["filename"] and '\\' not in fd["filename"]]
+                try: sock_to.sendall((json.dumps({"action": "file_data", "from": transfer["from"], "files": safe_files}) + "\n").encode())
+                except: pass
+            sock.sendall(b'{"status":"ok"}\n')
+            return
+
+        if action != "login":
             sock.sendall(b'{"status":"error","reason":"Expected login"}\n')
             return
 
@@ -2121,10 +2145,13 @@ def handle_client(cs, addr):
                 transfer_id = msg["transfer_id"]
                 with transfer_lock: transfer = pending_transfers.get(transfer_id)
                 if not transfer: continue
+                if transfer["to"] != user: continue
+                file_token = str(uuid.uuid4())
+                with transfer_lock: transfer["file_token"] = file_token
                 sender = transfer["from"]
                 with lock: sock_sender = clients.get(sender)
                 if sock_sender:
-                    try: sock_sender.sendall((json.dumps({"action": "file_accepted", "transfer_id": transfer_id, "client_transfer_id": transfer.get("client_transfer_id", ""), "to": transfer["to"], "files": transfer["files"]}) + "\n").encode())
+                    try: sock_sender.sendall((json.dumps({"action": "file_accepted", "transfer_id": transfer_id, "client_transfer_id": transfer.get("client_transfer_id", ""), "to": transfer["to"], "files": transfer["files"], "file_token": file_token}) + "\n").encode())
                     except: pass
 
             elif action == "file_decline":
@@ -2135,20 +2162,6 @@ def handle_client(cs, addr):
                 with lock: sock_sender = clients.get(sender)
                 if sock_sender:
                     try: sock_sender.sendall((json.dumps({"action": "file_declined", "transfer_id": transfer_id, "client_transfer_id": transfer.get("client_transfer_id", ""), "to": transfer["to"], "files": transfer["files"]}) + "\n").encode())
-                    except: pass
-
-            elif action == "file_data":
-                transfer_id = msg["transfer_id"]
-                with transfer_lock: transfer = pending_transfers.pop(transfer_id, None)
-                if not transfer: continue
-                recipient = transfer["to"]
-                with lock: sock_to = clients.get(recipient)
-                if sock_to:
-                    # Use the filenames stored at offer time (already validated); ignore client-supplied names in data packet
-                    name_map = {f["filename"]: f["filename"] for f in transfer["files"]}
-                    safe_files = [dict(fd, filename=name_map.get(fd["filename"], fd["filename"])) for fd in msg["files"]
-                                  if '/' not in fd["filename"] and '\\' not in fd["filename"]]
-                    try: sock_to.sendall((json.dumps({"action": "file_data", "from": transfer["from"], "files": safe_files}) + "\n").encode())
                     except: pass
 
             elif action == "set_status":
@@ -2180,6 +2193,10 @@ def handle_client(cs, addr):
             elif action == "logout": break
     except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
         pass
+    except Exception as e:
+        print(f"Unhandled error in handle_client for {addr}: {e}")
+        try: cs.sendall((json.dumps({"status": "error", "reason": "Internal server error."}) + "\n").encode())
+        except: pass
     finally:
         try: cs.close()
         except: pass

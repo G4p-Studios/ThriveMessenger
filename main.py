@@ -14,7 +14,7 @@ def speak(text):
         try: _ao2.speak(text, interrupt=True)
         except Exception: pass
 
-VERSION_TAG = "v2026-alpha15.2"
+VERSION_TAG = "v2026-alpha16"
 if sys.platform == 'win32':
     from winotify import Notification as _WinNotification
 else:
@@ -230,6 +230,22 @@ def delete_noncontact_messages(my_username, contact):
 
 SERVER_CONFIG = load_server_config()
 ADDR = (SERVER_CONFIG['host'], SERVER_CONFIG['port'])
+
+def _get_servers(user_config):
+    servers = user_config.get('servers')
+    if not servers:
+        servers = [{"name": "Official Server", "host": "msg.thecubed.cc", "port": 2005, "primary": True}]
+        user_config['servers'] = servers
+    return servers
+
+def _apply_active_server(user_config):
+    global SERVER_CONFIG, ADDR
+    servers = _get_servers(user_config)
+    primary = next((s for s in servers if s.get('primary')), servers[0])
+    SERVER_CONFIG['host'] = primary['host']
+    SERVER_CONFIG['port'] = primary['port']
+    ADDR = (SERVER_CONFIG['host'], SERVER_CONFIG['port'])
+
 _IPC_PORT = 48951
 
 def parse_github_tag(tag):
@@ -331,7 +347,7 @@ class ThriveTaskBarIcon(wx.adv.TaskBarIcon):
 
 class SettingsDialog(wx.Dialog):
     def __init__(self, parent, current_config):
-        super().__init__(parent, title="Settings", size=(300, 310)); self.config = current_config
+        super().__init__(parent, title="Settings", size=(300, 340)); self.config = current_config
         panel = wx.Panel(self); main_sizer = wx.BoxSizer(wx.VERTICAL); sound_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "&Sound Pack")
 
         dark_mode_on = is_windows_dark_mode()
@@ -362,12 +378,19 @@ class SettingsDialog(wx.Dialog):
             self.announce_status_cb.Enable(False)
             self.announce_status_cb.SetToolTip("accessible_output2 is not installed")
 
+        self.announce_files_cb = wx.CheckBox(panel, label="Speak &file received notifications")
+        self.announce_files_cb.SetValue(self.config.get('announce_files', False))
+        if not _ao2_available:
+            self.announce_files_cb.Enable(False)
+            self.announce_files_cb.SetToolTip("accessible_output2 is not installed")
+
         self.btn_chpass = wx.Button(panel, label="C&hange Password...")
         self.btn_chpass.Bind(wx.EVT_BUTTON, self.on_change_password)
 
         sound_box.Add(self.choice, 0, wx.EXPAND | wx.ALL, 5); main_sizer.Add(sound_box, 0, wx.EXPAND | wx.ALL, 5)
         main_sizer.Add(self.tts_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         main_sizer.Add(self.announce_status_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        main_sizer.Add(self.announce_files_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         main_sizer.Add(self.btn_chpass, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         btn_sizer = wx.StdDialogButtonSizer()
         ok_btn = wx.Button(panel, wx.ID_OK, label="&Apply"); ok_btn.SetDefault(); cancel_btn = wx.Button(panel, wx.ID_CANCEL)
@@ -376,6 +399,7 @@ class SettingsDialog(wx.Dialog):
             self.choice.SetBackgroundColour(dark_color); self.choice.SetForegroundColour(light_text_color)
             self.tts_cb.SetForegroundColour(light_text_color); self.tts_cb.SetBackgroundColour(dark_color)
             self.announce_status_cb.SetForegroundColour(light_text_color); self.announce_status_cb.SetBackgroundColour(dark_color)
+            self.announce_files_cb.SetForegroundColour(light_text_color); self.announce_files_cb.SetBackgroundColour(dark_color)
             self.btn_chpass.SetBackgroundColour(dark_color); self.btn_chpass.SetForegroundColour(light_text_color)
             ok_btn.SetBackgroundColour(dark_color); ok_btn.SetForegroundColour(light_text_color)
             cancel_btn.SetBackgroundColour(dark_color); cancel_btn.SetForegroundColour(light_text_color)
@@ -542,6 +566,7 @@ class ClientApp(wx.App):
         except Exception:
             self._ipc_sock = None
         self.user_config = load_user_config()
+        _apply_active_server(self.user_config)
         if self.user_config.get('autologin') and self.user_config.get('username') and self.user_config.get('password'):
             print("Attempting auto-login...")
             success, sock, sf, reason = self.perform_login(self.user_config['username'], self.user_config['password'])
@@ -623,6 +648,7 @@ class ClientApp(wx.App):
             except Exception: pass
         self.play_sound("login.wav"); threading.Thread(target=self.listen_loop, daemon=True).start()
         self.frame.on_check_updates(silent=True)
+
 
     def play_sound(self, sound_file):
         pack = self.user_config.get('soundpack', 'default')
@@ -762,6 +788,7 @@ class ClientApp(wx.App):
 
     def on_file_accepted(self, msg):
         transfer_id = msg["transfer_id"]; to = msg["to"]; files_info = msg["files"]
+        file_token = msg.get("file_token", "")
         client_tid = msg.get("client_transfer_id") or transfer_id
         file_paths = self.pending_file_paths.pop(client_tid, None)
         if not file_paths:
@@ -773,7 +800,16 @@ class ClientApp(wx.App):
                 files_data = []
                 for fp in file_paths:
                     with open(fp, 'rb') as f: files_data.append({"filename": os.path.basename(fp), "data": base64.b64encode(f.read()).decode('ascii')})
-                self.sock.sendall((json.dumps({"action": "file_data", "transfer_id": transfer_id, "to": to, "files": files_data}) + "\n").encode())
+                # Send file data on a dedicated connection so the main
+                # connection stays free for messages, directory, etc.
+                xfer_sock = create_secure_socket()
+                try:
+                    xfer_sock.sendall((json.dumps({"action": "file_data", "transfer_id": transfer_id, "file_token": file_token, "to": to, "files": files_data}) + "\n").encode())
+                    resp = json.loads(xfer_sock.makefile().readline() or "{}")
+                finally:
+                    xfer_sock.close()
+                if resp.get("status") != "ok":
+                    raise Exception(resp.get("reason", "Server rejected file data"))
                 names = [os.path.basename(fp) for fp in file_paths]
                 wx.CallAfter(self._on_files_sent, to, names)
             except Exception as e:
@@ -830,7 +866,10 @@ class ClientApp(wx.App):
             names = ", ".join(saved)
             if chat: chat.append(f"{len(saved)} file(s) received and saved: {names}", "System", time.time())
             else:
-                show_notification("Files Received", f"{sender} sent you {len(saved)} file(s)")
+                if wx.GetApp().user_config.get('announce_files', False):
+                    speak(f"{sender} sent you {len(saved)} file{'s' if len(saved) != 1 else ''}.")
+                else:
+                    show_notification("Files Received", f"{sender} sent you {len(saved)} file(s)")
 
     def send_file_to(self, contact, parent=None):
         if parent is None: parent = self.frame.get_chat(contact) or self.frame
@@ -966,6 +1005,104 @@ class CreateAccountDialog(wx.Dialog):
         if p1 != p2: wx.MessageBox("Passwords do not match.", "Validation Error", wx.ICON_ERROR); return
         self.EndModal(wx.ID_OK)
 
+class AddServerDialog(wx.Dialog):
+    def __init__(self, parent):
+        super().__init__(parent, title="Add Server", size=(300, 230))
+        panel = wx.Panel(self); s = wx.BoxSizer(wx.VERTICAL)
+        dark_mode_on = is_windows_dark_mode()
+        if dark_mode_on:
+            dark_color = wx.Colour(40, 40, 40); light_text_color = wx.WHITE
+            WxMswDarkMode().enable(self); self.SetBackgroundColour(dark_color); panel.SetBackgroundColour(dark_color)
+        name_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "&Name")
+        self.name_txt = wx.TextCtrl(name_box.GetStaticBox()); name_box.Add(self.name_txt, 0, wx.EXPAND | wx.ALL, 5)
+        host_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "&Host")
+        self.host_txt = wx.TextCtrl(host_box.GetStaticBox()); host_box.Add(self.host_txt, 0, wx.EXPAND | wx.ALL, 5)
+        port_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "P&ort")
+        self.port_txt = wx.TextCtrl(port_box.GetStaticBox()); self.port_txt.SetValue("2005"); port_box.Add(self.port_txt, 0, wx.EXPAND | wx.ALL, 5)
+        ok_btn = wx.Button(panel, wx.ID_OK, "&OK"); cancel_btn = wx.Button(panel, wx.ID_CANCEL, "&Cancel")
+        if dark_mode_on:
+            for box in [name_box, host_box, port_box]:
+                box.GetStaticBox().SetForegroundColour(light_text_color); box.GetStaticBox().SetBackgroundColour(dark_color)
+            for ctrl in [self.name_txt, self.host_txt, self.port_txt]: ctrl.SetBackgroundColour(dark_color); ctrl.SetForegroundColour(light_text_color)
+            for btn in [ok_btn, cancel_btn]: btn.SetBackgroundColour(dark_color); btn.SetForegroundColour(light_text_color)
+        s.Add(name_box, 0, wx.EXPAND | wx.ALL, 5); s.Add(host_box, 0, wx.EXPAND | wx.ALL, 5); s.Add(port_box, 0, wx.EXPAND | wx.ALL, 5)
+        btn_sizer = wx.BoxSizer(wx.HORIZONTAL); btn_sizer.Add(ok_btn, 0, wx.ALL, 5); btn_sizer.Add(cancel_btn, 0, wx.ALL, 5)
+        s.Add(btn_sizer, 0, wx.ALIGN_CENTER | wx.ALL, 5); panel.SetSizer(s)
+        self.SetEscapeId(wx.ID_CANCEL)
+
+class ServerManagerDialog(wx.Dialog):
+    def __init__(self, parent, user_config):
+        super().__init__(parent, title="Server Manager", size=(450, 300))
+        self.user_config = user_config; self.servers = [s.copy() for s in _get_servers(user_config)]
+        panel = wx.Panel(self); s = wx.BoxSizer(wx.VERTICAL)
+        dark_mode_on = is_windows_dark_mode()
+        if dark_mode_on:
+            dark_color = wx.Colour(40, 40, 40); light_text_color = wx.WHITE
+            WxMswDarkMode().enable(self); self.SetBackgroundColour(dark_color); panel.SetBackgroundColour(dark_color)
+        self.list = wx.ListCtrl(panel, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
+        self.list.InsertColumn(0, "Name", width=150); self.list.InsertColumn(1, "Host", width=150)
+        self.list.InsertColumn(2, "Port", width=60); self.list.InsertColumn(3, "Primary", width=60)
+        self._populate_list()
+        self.add_btn = wx.Button(panel, label="&Add..."); self.del_btn = wx.Button(panel, label="&Delete")
+        self.primary_btn = wx.Button(panel, label="Set as &Primary")
+        close_btn = wx.Button(panel, wx.ID_CANCEL, "&Close")
+        self.add_btn.Bind(wx.EVT_BUTTON, self.on_add); self.del_btn.Bind(wx.EVT_BUTTON, self.on_delete)
+        self.primary_btn.Bind(wx.EVT_BUTTON, self.on_set_primary)
+        close_btn.Bind(wx.EVT_BUTTON, lambda e: self.Close()); self.Bind(wx.EVT_CLOSE, self._on_close)
+        self.list.Bind(wx.EVT_LIST_ITEM_SELECTED, self._on_sel); self.list.Bind(wx.EVT_LIST_ITEM_DESELECTED, self._on_sel)
+        if dark_mode_on:
+            self.list.SetBackgroundColour(dark_color); self.list.SetForegroundColour(light_text_color)
+            for btn in [self.add_btn, self.del_btn, self.primary_btn, close_btn]: btn.SetBackgroundColour(dark_color); btn.SetForegroundColour(light_text_color)
+        btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        btn_sizer.Add(self.add_btn, 0, wx.ALL, 5); btn_sizer.Add(self.del_btn, 0, wx.ALL, 5); btn_sizer.Add(self.primary_btn, 0, wx.ALL, 5)
+        s.Add(self.list, 1, wx.EXPAND | wx.ALL, 5); s.Add(btn_sizer, 0, wx.ALIGN_CENTER)
+        s.Add(close_btn, 0, wx.ALIGN_CENTER | wx.ALL, 5); panel.SetSizer(s); self._update_buttons()
+
+    def _populate_list(self):
+        self.list.DeleteAllItems()
+        for i, srv in enumerate(self.servers):
+            self.list.InsertItem(i, srv['name']); self.list.SetItem(i, 1, srv['host'])
+            self.list.SetItem(i, 2, str(srv['port'])); self.list.SetItem(i, 3, "Yes" if srv.get('primary') else "")
+
+    def _update_buttons(self):
+        sel = self.list.GetFirstSelected()
+        if sel < 0: self.del_btn.Enable(False); self.primary_btn.Enable(False); return
+        srv = self.servers[sel]
+        self.del_btn.Enable(len(self.servers) > 1 and not srv.get('primary'))
+        self.primary_btn.Enable(not srv.get('primary'))
+
+    def _on_sel(self, event): self._update_buttons()
+
+    def on_add(self, event):
+        with AddServerDialog(self) as dlg:
+            if dlg.ShowModal() == wx.ID_OK:
+                name = dlg.name_txt.GetValue().strip(); host = dlg.host_txt.GetValue().strip()
+                try: port = int(dlg.port_txt.GetValue().strip())
+                except ValueError: wx.MessageBox("Port must be a number.", "Error", wx.ICON_ERROR); return
+                if not name or not host: wx.MessageBox("Name and host are required.", "Error", wx.ICON_ERROR); return
+                if port < 1 or port > 65535: wx.MessageBox("Port must be between 1 and 65535.", "Error", wx.ICON_ERROR); return
+                self.servers.append({"name": name, "host": host, "port": port, "primary": len(self.servers) == 0})
+                self._populate_list(); self._update_buttons()
+
+    def on_delete(self, event):
+        sel = self.list.GetFirstSelected()
+        if sel < 0: return
+        srv = self.servers[sel]
+        if srv.get('primary'): wx.MessageBox("Cannot delete the primary server.", "Error", wx.ICON_ERROR); return
+        if len(self.servers) <= 1: wx.MessageBox("Cannot delete the only server.", "Error", wx.ICON_ERROR); return
+        self.servers.pop(sel); self._populate_list(); self._update_buttons()
+
+    def on_set_primary(self, event):
+        sel = self.list.GetFirstSelected()
+        if sel < 0: return
+        for srv in self.servers: srv['primary'] = False
+        self.servers[sel]['primary'] = True
+        self._populate_list(); self.list.Select(sel); self._update_buttons()
+
+    def _on_close(self, event):
+        self.user_config['servers'] = self.servers; _apply_active_server(self.user_config)
+        save_user_config(self.user_config); self.EndModal(wx.ID_CLOSE)
+
 class LoginDialog(wx.Dialog):
     def __init__(self, parent, user_config):
         super().__init__(parent, title="Login", size=(300, 350)); self.user_config = user_config
@@ -988,25 +1125,31 @@ class LoginDialog(wx.Dialog):
         login_btn = wx.Button(panel, label="&Login"); login_btn.Bind(wx.EVT_BUTTON, self.on_login)
         create_btn = wx.Button(panel, label="&Create Account..."); create_btn.Bind(wx.EVT_BUTTON, self.on_create_account)
         forgot_btn = wx.Button(panel, label="&Forgot Password?"); forgot_btn.Bind(wx.EVT_BUTTON, self.on_forgot)
+        servers_btn = wx.Button(panel, label="&Servers..."); servers_btn.Bind(wx.EVT_BUTTON, self.on_servers)
 
         if dark_mode_on:
             for box in [user_box, pass_box]:
                 box.GetStaticBox().SetForegroundColour(light_text_color)
                 box.GetStaticBox().SetBackgroundColour(dark_color)
             for ctrl in [self.u, self.p]: ctrl.SetBackgroundColour(dark_color); ctrl.SetForegroundColour(light_text_color)
-            for btn in [login_btn, create_btn, forgot_btn]: btn.SetBackgroundColour(dark_color); btn.SetForegroundColour(light_text_color)
+            for btn in [login_btn, create_btn, forgot_btn, servers_btn]: btn.SetBackgroundColour(dark_color); btn.SetForegroundColour(light_text_color)
             self.remember_cb.SetForegroundColour(light_text_color); self.autologin_cb.SetForegroundColour(light_text_color)
-            
+
         s.Add(user_box, 0, wx.EXPAND | wx.ALL, 5); s.Add(pass_box, 0, wx.EXPAND | wx.ALL, 5)
         s.Add(self.remember_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10); s.Add(self.autologin_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
-        btn_sizer = wx.BoxSizer(wx.HORIZONTAL); 
+        btn_sizer = wx.BoxSizer(wx.HORIZONTAL);
         btn_sizer.Add(login_btn, 1, wx.EXPAND | wx.ALL, 2); btn_sizer.Add(create_btn, 1, wx.EXPAND | wx.ALL, 2)
         s.Add(btn_sizer, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 5)
-        s.Add(forgot_btn, 0, wx.ALIGN_CENTER | wx.ALL, 5)
+        btn_sizer2 = wx.BoxSizer(wx.HORIZONTAL)
+        btn_sizer2.Add(forgot_btn, 1, wx.EXPAND | wx.ALL, 2); btn_sizer2.Add(servers_btn, 1, wx.EXPAND | wx.ALL, 2)
+        s.Add(btn_sizer2, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 5)
         self.p.Bind(wx.EVT_TEXT_ENTER, self.on_login); panel.SetSizer(s); self.on_check_remember(None)
     
     def on_forgot(self, event):
         with ForgotPasswordDialog(self) as dlg: dlg.ShowModal()
+
+    def on_servers(self, event):
+        with ServerManagerDialog(self, self.user_config) as dlg: dlg.ShowModal()
 
     def on_create_account(self, event):
         with CreateAccountDialog(self) as dlg:
@@ -1313,7 +1456,7 @@ class MainFrame(wx.Frame):
         with SettingsDialog(self, app.user_config) as dlg:
             if dlg.ShowModal() == wx.ID_OK:
                 selected_pack = dlg.choice.GetStringSelection(); app.user_config['soundpack'] = selected_pack
-                app.user_config['tts_enabled'] = dlg.tts_cb.IsChecked(); app.user_config['announce_status'] = dlg.announce_status_cb.IsChecked(); save_user_config(app.user_config)
+                app.user_config['tts_enabled'] = dlg.tts_cb.IsChecked(); app.user_config['announce_status'] = dlg.announce_status_cb.IsChecked(); app.user_config['announce_files'] = dlg.announce_files_cb.IsChecked(); save_user_config(app.user_config)
                 wx.MessageBox("Settings have been applied.", "Settings Saved", wx.OK | wx.ICON_INFORMATION)
     def on_conversations(self, _):
         if self._conversations_dlg:
