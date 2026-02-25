@@ -11,7 +11,10 @@ except Exception:
 
 def speak(text):
     if _ao2_available and _ao2:
-        try: _ao2.speak(text, interrupt=True)
+        try:
+            app = wx.GetApp()
+            interrupt = app.user_config.get('interrupt_speech', True) if app else True
+            _ao2.speak(text, interrupt=interrupt)
         except Exception: pass
 
 VERSION_TAG = "v2026-alpha16"
@@ -347,7 +350,7 @@ class ThriveTaskBarIcon(wx.adv.TaskBarIcon):
 
 class SettingsDialog(wx.Dialog):
     def __init__(self, parent, current_config):
-        super().__init__(parent, title="Settings", size=(300, 340)); self.config = current_config
+        super().__init__(parent, title="Settings", size=(300, 370)); self.config = current_config
         panel = wx.Panel(self); main_sizer = wx.BoxSizer(wx.VERTICAL); sound_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "&Sound Pack")
 
         dark_mode_on = is_windows_dark_mode()
@@ -384,6 +387,12 @@ class SettingsDialog(wx.Dialog):
             self.announce_files_cb.Enable(False)
             self.announce_files_cb.SetToolTip("accessible_output2 is not installed")
 
+        self.interrupt_speech_cb = wx.CheckBox(panel, label="&Interrupt speech")
+        self.interrupt_speech_cb.SetValue(self.config.get('interrupt_speech', True))
+        if not _ao2_available:
+            self.interrupt_speech_cb.Enable(False)
+            self.interrupt_speech_cb.SetToolTip("accessible_output2 is not installed")
+
         self.btn_chpass = wx.Button(panel, label="C&hange Password...")
         self.btn_chpass.Bind(wx.EVT_BUTTON, self.on_change_password)
 
@@ -391,6 +400,7 @@ class SettingsDialog(wx.Dialog):
         main_sizer.Add(self.tts_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         main_sizer.Add(self.announce_status_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         main_sizer.Add(self.announce_files_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        main_sizer.Add(self.interrupt_speech_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         main_sizer.Add(self.btn_chpass, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         btn_sizer = wx.StdDialogButtonSizer()
         ok_btn = wx.Button(panel, wx.ID_OK, label="&Apply"); ok_btn.SetDefault(); cancel_btn = wx.Button(panel, wx.ID_CANCEL)
@@ -400,6 +410,7 @@ class SettingsDialog(wx.Dialog):
             self.tts_cb.SetForegroundColour(light_text_color); self.tts_cb.SetBackgroundColour(dark_color)
             self.announce_status_cb.SetForegroundColour(light_text_color); self.announce_status_cb.SetBackgroundColour(dark_color)
             self.announce_files_cb.SetForegroundColour(light_text_color); self.announce_files_cb.SetBackgroundColour(dark_color)
+            self.interrupt_speech_cb.SetForegroundColour(light_text_color); self.interrupt_speech_cb.SetBackgroundColour(dark_color)
             self.btn_chpass.SetBackgroundColour(dark_color); self.btn_chpass.SetForegroundColour(light_text_color)
             ok_btn.SetBackgroundColour(dark_color); ok_btn.SetForegroundColour(light_text_color)
             cancel_btn.SetBackgroundColour(dark_color); cancel_btn.SetForegroundColour(light_text_color)
@@ -1456,7 +1467,7 @@ class MainFrame(wx.Frame):
         with SettingsDialog(self, app.user_config) as dlg:
             if dlg.ShowModal() == wx.ID_OK:
                 selected_pack = dlg.choice.GetStringSelection(); app.user_config['soundpack'] = selected_pack
-                app.user_config['tts_enabled'] = dlg.tts_cb.IsChecked(); app.user_config['announce_status'] = dlg.announce_status_cb.IsChecked(); app.user_config['announce_files'] = dlg.announce_files_cb.IsChecked(); save_user_config(app.user_config)
+                app.user_config['tts_enabled'] = dlg.tts_cb.IsChecked(); app.user_config['announce_status'] = dlg.announce_status_cb.IsChecked(); app.user_config['announce_files'] = dlg.announce_files_cb.IsChecked(); app.user_config['interrupt_speech'] = dlg.interrupt_speech_cb.IsChecked(); save_user_config(app.user_config)
                 wx.MessageBox("Settings have been applied.", "Settings Saved", wx.OK | wx.ICON_INFORMATION)
     def on_conversations(self, _):
         if self._conversations_dlg:
