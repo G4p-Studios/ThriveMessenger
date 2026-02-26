@@ -711,6 +711,10 @@ def main():
         "--rollback", metavar="MANIFEST",
         help="Undo a previous migration using the specified manifest JSON file.",
     )
+    parser.add_argument(
+        "--contacts-only", action="store_true",
+        help="Only migrate contacts (skip accounts, bans, file bans, admins).",
+    )
     args = parser.parse_args()
 
     # --- Rollback mode ---
@@ -759,29 +763,38 @@ def main():
     if not args.dry_run:
         manifest.data["backup_path"] = backup_path
 
-    # Step 1: Migrate users (stores argon2 hashes for lazy rehash on login).
-    log("Step 1: Migrating user accounts...")
-    users_created = migrate_users(
-        old_db, prosody_db, args.domain, manifest, dry_run=args.dry_run,
-    )
+    users_created = 0
 
-    # Step 2: Migrate contacts (writes roster files directly to Prosody storage).
-    log("Step 2: Migrating contacts to XMPP roster...")
-    migrate_contacts(
-        old_db, args.domain, args.prosody_data, manifest, dry_run=args.dry_run,
-    )
+    if args.contacts_only:
+        # Only migrate contacts — skip everything else.
+        log("Migrating contacts only...")
+        migrate_contacts(
+            old_db, args.domain, args.prosody_data, manifest, dry_run=args.dry_run,
+        )
+    else:
+        # Step 1: Migrate users (stores argon2 hashes for lazy rehash on login).
+        log("Step 1: Migrating user accounts...")
+        users_created = migrate_users(
+            old_db, prosody_db, args.domain, manifest, dry_run=args.dry_run,
+        )
 
-    # Step 3: Migrate bans.
-    log("Step 3: Migrating user bans...")
-    migrate_bans(old_db, prosody_db, manifest, dry_run=args.dry_run)
+        # Step 2: Migrate contacts (writes roster files directly to Prosody storage).
+        log("Step 2: Migrating contacts to XMPP roster...")
+        migrate_contacts(
+            old_db, args.domain, args.prosody_data, manifest, dry_run=args.dry_run,
+        )
 
-    # Step 4: Migrate file bans.
-    log("Step 4: Migrating file type bans...")
-    migrate_file_bans(old_db, prosody_db, manifest, dry_run=args.dry_run)
+        # Step 3: Migrate bans.
+        log("Step 3: Migrating user bans...")
+        migrate_bans(old_db, prosody_db, manifest, dry_run=args.dry_run)
 
-    # Step 5: Migrate admins.
-    log("Step 5: Migrating admin list...")
-    migrate_admins(args.admins_file, prosody_db, manifest, dry_run=args.dry_run)
+        # Step 4: Migrate file bans.
+        log("Step 4: Migrating file type bans...")
+        migrate_file_bans(old_db, prosody_db, manifest, dry_run=args.dry_run)
+
+        # Step 5: Migrate admins.
+        log("Step 5: Migrating admin list...")
+        migrate_admins(args.admins_file, prosody_db, manifest, dry_run=args.dry_run)
 
     old_db.close()
     prosody_db.close()
