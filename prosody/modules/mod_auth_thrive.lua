@@ -91,22 +91,27 @@ end
 -- The helper reads a JSON file containing { "hash": "...", "password": "..." }
 -- and prints "ok" or "fail".
 local function verify_argon2(stored_hash, password)
+    module:log("debug", "verify_argon2: writing temp file");
     -- Write credentials to a temp file (avoids exposing passwords in process list).
     local tmpfile = os.tmpname();
     local f = io.open(tmpfile, "w");
     if not f then
-        log("error", "Could not create temp file for argon2 verification");
+        module:log("error", "Could not create temp file for argon2 verification");
         return false;
     end
     f:write(json.encode({ hash = stored_hash, password = password }));
     f:close();
 
-    local pipe = io.popen("python3 " .. verify_script .. " " .. tmpfile .. " 2>/dev/null");
+    -- Use timeout to prevent blocking Prosody's event loop indefinitely.
+    local cmd = "timeout 5 python3 " .. verify_script .. " " .. tmpfile .. " 2>&1";
+    module:log("debug", "verify_argon2: running command: %s", cmd);
+    local pipe = io.popen(cmd);
     local output = "";
     if pipe then
         output = (pipe:read("*a") or ""):gsub("%s+", "");
         pipe:close();
     end
+    module:log("debug", "verify_argon2: output = '%s'", output);
     os.remove(tmpfile);
 
     return output == "ok";
@@ -116,39 +121,50 @@ end
 -- SCRAM-SHA-1 credential helpers
 -- ---------------------------------------------------------------------------
 
+--- Hex-encode a binary string (for SCRAM credential storage).
+local function to_hex(s)
+    local t = {};
+    for i = 1, #s do
+        t[i] = string.format("%02x", s:byte(i));
+    end
+    return table.concat(t);
+end
+
 --- Generate and store SCRAM-SHA-1 credentials for a user.
+-- Matches Prosody's internal_hashed format: salt is a raw UUID string,
+-- stored_key and server_key are lowercase hex.
 local function store_scram(username, password)
     local salt = uuid.generate();
     local salted_password = hashes.scram_Hi_sha1(password, salt, scram_iterations);
     local client_key   = hashes.hmac_sha1(salted_password, "Client Key");
-    local stored_key   = hashes.sha1(client_key);
-    local server_key   = hashes.hmac_sha1(salted_password, "Server Key");
+    local stored_key   = hashes.sha1(client_key, true);  -- true = hex output
+    local server_key   = to_hex(hashes.hmac_sha1(salted_password, "Server Key"));
 
-    -- base64-encode binary values (same format as internal_hashed).
-    local b64 = require "util.encodings".base64.encode;
     return accounts:set(username, {
         iteration_count = scram_iterations,
-        salt            = b64(salt),
-        stored_key      = b64(stored_key),
-        server_key      = b64(server_key),
+        salt            = salt,         -- raw UUID string
+        stored_key      = stored_key,   -- hex
+        server_key      = server_key,   -- hex
     });
 end
 
 --- Verify a plaintext password against stored SCRAM-SHA-1 credentials.
--- Returns true if the password matches, false otherwise.
+-- Prosody's internal_hashed stores: salt as raw UUID string, stored_key
+-- and server_key as lowercase hex.  We compare hex directly.
 local function verify_scram(credentials, password)
     if not credentials or not credentials.stored_key then return false; end
+    if not credentials.salt or not credentials.iteration_count then
+        module:log("warn", "SCRAM credentials incomplete (salt=%s, iterations=%s)",
+            tostring(credentials.salt), tostring(credentials.iteration_count));
+        return false;
+    end
 
-    local b64_decode = require "util.encodings".base64.decode;
-    local salt       = b64_decode(credentials.salt);
-    local iterations = credentials.iteration_count;
-    local expected   = b64_decode(credentials.stored_key);
-
-    local salted_password = hashes.scram_Hi_sha1(password, salt, iterations);
+    local salted_password = hashes.scram_Hi_sha1(
+        password, credentials.salt, credentials.iteration_count);
     local client_key = hashes.hmac_sha1(salted_password, "Client Key");
-    local stored_key = hashes.sha1(client_key);
+    local computed   = hashes.sha1(client_key, true);  -- true = hex output
 
-    return stored_key == expected;
+    return computed == credentials.stored_key;
 end
 
 -- ---------------------------------------------------------------------------
@@ -158,26 +174,64 @@ end
 local provider = {};
 
 function provider.test_password(username, password)
+    module:log("debug", "test_password called for '%s'", username);
+
     -- 1. Try native SCRAM credentials.
-    local credentials = accounts:get(username);
+    module:log("debug", "Checking SCRAM credentials for '%s'", username);
+    local ok, credentials = pcall(accounts.get, accounts, username);
+    if not ok then
+        module:log("error", "accounts:get('%s') failed: %s", username, tostring(credentials));
+        return false;
+    end
     if credentials and credentials.stored_key then
-        if verify_scram(credentials, password) then
+        module:log("debug", "Found SCRAM credentials for '%s', verifying", username);
+        local scram_ok, scram_result = pcall(verify_scram, credentials, password);
+        if not scram_ok then
+            module:log("error", "verify_scram('%s') error: %s", username, tostring(scram_result));
+            return false;
+        end
+        if scram_result then
+            module:log("debug", "SCRAM verification succeeded for '%s'", username);
             return true;
         end
+        module:log("debug", "SCRAM verification failed for '%s'", username);
+    else
+        module:log("debug", "No SCRAM credentials for '%s'", username);
     end
 
     -- 2. Fall back to legacy argon2 hash.
-    local legacy_hash = get_legacy_hash(username);
+    module:log("debug", "Checking legacy argon2 hash for '%s'", username);
+    local hash_ok, legacy_hash = pcall(get_legacy_hash, username);
+    if not hash_ok then
+        module:log("error", "get_legacy_hash('%s') failed: %s", username, tostring(legacy_hash));
+        return false;
+    end
     if legacy_hash then
-        if verify_argon2(legacy_hash, password) then
+        module:log("debug", "Found legacy hash for '%s', verifying via argon2", username);
+        local a2_ok, a2_result = pcall(verify_argon2, legacy_hash, password);
+        if not a2_ok then
+            module:log("error", "verify_argon2('%s') error: %s", username, tostring(a2_result));
+            return false;
+        end
+        if a2_result then
             -- Lazy rehash: store as SCRAM so future logins are native.
-            log("info", "Migrating password for '%s' from argon2 to SCRAM", username);
-            store_scram(username, password);
-            delete_legacy_hash(username);
+            module:log("info", "Migrating password for '%s' from argon2 to SCRAM", username);
+            local store_ok, store_err = pcall(store_scram, username, password);
+            if not store_ok then
+                module:log("error", "store_scram('%s') failed: %s", username, tostring(store_err));
+            end
+            local del_ok, del_err = pcall(delete_legacy_hash, username);
+            if not del_ok then
+                module:log("error", "delete_legacy_hash('%s') failed: %s", username, tostring(del_err));
+            end
             return true;
         end
+        module:log("debug", "Argon2 verification failed for '%s'", username);
+    else
+        module:log("debug", "No legacy hash for '%s'", username);
     end
 
+    module:log("debug", "All auth methods exhausted for '%s' — denying", username);
     return false;
 end
 
@@ -211,7 +265,14 @@ function provider.get_sasl_handler()
     -- to verify against legacy argon2 hashes.
     local profile = {
         plain_test = function(_, auth_username, auth_password, auth_realm)
-            return provider.test_password(auth_username, auth_password), true;
+            module:log("debug", "SASL plain_test callback for '%s'", auth_username);
+            local ok, result = pcall(provider.test_password, auth_username, auth_password);
+            if not ok then
+                module:log("error", "test_password crashed for '%s': %s", auth_username, tostring(result));
+                return false, true;
+            end
+            module:log("debug", "SASL plain_test result for '%s': %s", auth_username, tostring(result));
+            return result, true;
         end,
     };
     return new_sasl(host, profile);
