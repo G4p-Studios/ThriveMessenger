@@ -22,11 +22,12 @@
 --   thrive_db_path = "/var/lib/prosody/thrive.db"
 --   thrive_argon2_verify = "/etc/prosody/thrive-modules/verify_argon2.py"
 
-local new_sasl = require "util.sasl".new;
-local hashes   = require "util.hashes";
-local uuid     = require "util.uuid";
-local json     = require "util.json";
-local DBI      = require "DBI";
+local new_sasl    = require "util.sasl".new;
+local hashes      = require "util.hashes";
+local uuid        = require "util.uuid";
+local json        = require "util.json";
+local DBI         = require "DBI";
+local datamanager = require "util.datamanager";
 
 local host     = module.host;
 local log      = module._log;
@@ -255,6 +256,10 @@ end
 function provider.delete_user(username)
     delete_legacy_hash(username);
     return accounts:set(username, nil);
+end
+
+function provider.users()
+    return datamanager.users(host, "accounts");
 end
 
 function provider.get_sasl_handler()
