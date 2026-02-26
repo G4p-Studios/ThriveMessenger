@@ -668,12 +668,13 @@ class XMPPClient:
             )
             resp = await iq.send(timeout=15)
             users = []
-            directory = resp.xml.find("{urn:thrive:directory}directory")
+            ns = "urn:thrive:directory"
+            directory = resp.xml.find(f"{{{ns}}}directory")
             if directory is not None:
-                for user_el in directory.findall("user"):
-                    username = user_el.findtext("username", "")
-                    status = user_el.findtext("status", "offline")
-                    is_admin = user_el.findtext("admin", "false") == "true"
+                for user_el in directory.findall(f"{{{ns}}}user"):
+                    username = user_el.findtext(f"{{{ns}}}username", "")
+                    status = user_el.findtext(f"{{{ns}}}status", "offline")
+                    is_admin = user_el.findtext(f"{{{ns}}}admin", "false") == "true"
                     users.append({
                         "user": username,
                         "status": status,

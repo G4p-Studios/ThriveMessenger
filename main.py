@@ -1375,7 +1375,7 @@ class MainFrame(wx.Frame):
                 show_notification("Contact offline", f"{user} has gone offline.")
 
     def __init__(self, user, sock):
-        super().__init__(None, title=f"Thrive Messenger – {user}", size=(400,380)); self.user, self.sock = user, sock; self.task_bar_icon = None; self.is_exiting = False; self._directory_dlg = None; self._conversations_dlg = None; self._noncontact_senders = load_noncontact_senders(user)
+        super().__init__(None, title=f"Thrive Messenger – {user}", size=(400,380)); self.user, self.sock = user, sock; self.task_bar_icon = None; self.is_exiting = False; self._directory_dlg = None; self._conversations_dlg = None; self._noncontact_senders = load_noncontact_senders(user); self.contact_states = {}
         self.current_status = wx.GetApp().user_config.get('status', 'online')
         self.notifications = []; self.Bind(wx.EVT_CLOSE, self.on_close_window); panel = wx.Panel(self)
 
@@ -1490,12 +1490,20 @@ class MainFrame(wx.Frame):
     def on_user_directory_response_xmpp(self, users):
         """Handle user directory from XMPP custom IQ."""
         # Convert to the format UserDirectoryDialog expects.
+        roster_users = set(self.contact_states.keys()) if self.contact_states else set()
         user_list = []
         for u in users:
+            uname = u.get("user", "")
+            status = u.get("status", "offline")
+            online = status != "offline"
             user_list.append({
-                "user": u.get("user", ""),
-                "status": u.get("status", "offline"),
+                "user": uname,
+                "status": status,
+                "status_text": status,
+                "online": online,
                 "is_admin": u.get("is_admin", False),
+                "is_contact": uname in roster_users,
+                "is_blocked": self.contact_states.get(uname, 0) == 1,
             })
         dlg = UserDirectoryDialog(self, user_list, self.user, self.contact_states)
         self._directory_dlg = dlg
