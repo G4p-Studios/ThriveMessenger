@@ -13,4 +13,7 @@ dependencies = [
     "pyinstaller-versionfile>=3.0.1",
     "wxpython>=4.2.5",
     "accessible-output2==0.16",
+    "slixmpp>=1.8.0",
+    "aiohttp>=3.9.0",
+    "slixmpp-omemo>=1.1.0",
 ]

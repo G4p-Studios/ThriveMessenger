@@ -1,5 +1,6 @@
 import wx, socket, json, threading, datetime, wx.adv, configparser, ssl, sys, os, base64, uuid, subprocess, tempfile, re, time
 import keyring
+from xmpp_client import XMPPClient
 
 try:
     from accessible_output2.outputs.auto import Auto as _AO2Auto
@@ -543,18 +544,36 @@ class StatusDialog(wx.Dialog):
             self.status_text.SetValue(sel); self.sizer.Hide(self.custom_box); self.panel.Layout()
             self.SetSize((350, 150))
 
-def create_secure_socket(timeout=None):
-    sock = socket.create_connection(ADDR, timeout=timeout)
-    if SERVER_CONFIG['cafile'] and os.path.exists(SERVER_CONFIG['cafile']):
-        context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=SERVER_CONFIG['cafile'])
-    else: context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
-    try: return context.wrap_socket(sock, server_hostname=SERVER_CONFIG['host'])
-    except ssl.SSLCertVerificationError:
-        sock.close(); sock = socket.create_connection(ADDR, timeout=timeout)
-        context = ssl.create_default_context(); context.check_hostname = False; context.verify_mode = ssl.CERT_NONE
-        return context.wrap_socket(sock, server_hostname=SERVER_CONFIG['host'])
-    except (ssl.SSLError, OSError):
-        sock.close(); return socket.create_connection(ADDR, timeout=timeout)
+class _XMPPSendAdapter:
+    """Drop-in for ``self.sock`` — translates sendall(json) calls to XMPPClient methods."""
+    def __init__(self, xmpp):
+        self.xmpp = xmpp
+    def sendall(self, data):
+        try: msg = json.loads(data.decode().rstrip("\n"))
+        except (json.JSONDecodeError, UnicodeDecodeError): return
+        action = msg.get("action")
+        if action == "msg": self.xmpp.send_message(msg["to"], msg["msg"])
+        elif action == "set_status": self.xmpp.set_status(msg.get("status_text", "online"))
+        elif action == "add_contact": self.xmpp.add_contact(msg["to"])
+        elif action == "delete_contact": self.xmpp.remove_contact(msg["to"])
+        elif action == "block_contact": self.xmpp.block_contact(msg["to"])
+        elif action == "unblock_contact": self.xmpp.unblock_contact(msg["to"])
+        elif action == "change_password":
+            ok, reason = self.xmpp.change_password(msg["new_pass"])
+            # Fire the result callback via wx.CallAfter if the app has a frame.
+            import wx as _wx
+            app = _wx.GetApp()
+            if app and hasattr(app, 'frame') and app.frame:
+                _wx.CallAfter(app.frame.on_change_password_result, {"ok": ok, "reason": reason})
+        elif action == "logout": self.xmpp.disconnect()
+        elif action == "user_directory": self.xmpp.get_user_directory()
+        elif action == "server_info": self.xmpp.get_server_info()
+        elif action == "admin_cmd": self.xmpp.send_admin_command(msg.get("cmd", ""))
+        elif action == "file_offer": pass  # Handled directly via xmpp.send_files()
+        elif action == "file_accept": pass  # HTTP Upload: no accept needed
+        elif action == "file_decline": pass  # HTTP Upload: no decline needed
+        elif action == "typing": self.xmpp.send_chat_state(msg.get("to", ""), msg.get("state", "composing"))
+    def close(self): pass
 
 class ClientApp(wx.App):
     def OnInit(self):
@@ -580,8 +599,8 @@ class ClientApp(wx.App):
         _apply_active_server(self.user_config)
         if self.user_config.get('autologin') and self.user_config.get('username') and self.user_config.get('password'):
             print("Attempting auto-login...")
-            success, sock, sf, reason = self.perform_login(self.user_config['username'], self.user_config['password'])
-            if success: self.start_main_session(self.user_config['username'], sock, sf); return True
+            success, xmpp, _, reason = self.perform_login(self.user_config['username'], self.user_config['password'])
+            if success: self.start_main_session(self.user_config['username'], xmpp); return True
             else: wx.MessageBox(f"Auto-login failed: {reason}", "Login Failed", wx.ICON_ERROR); self.user_config['autologin'] = False; save_user_config(self.user_config)
         return self.show_login_dialog()
     
@@ -613,7 +632,7 @@ class ClientApp(wx.App):
             dlg = LoginDialog(None, self.user_config)
             result = dlg.ShowModal()
             if result == wx.ID_OK:
-                success, sock, sf, _ = self.perform_login(dlg.username, dlg.password)
+                success, xmpp, _, _ = self.perform_login(dlg.username, dlg.password)
                 if success:
                     if dlg.remember_checked:
                         self.user_config['username'] = dlg.username
@@ -621,45 +640,71 @@ class ClientApp(wx.App):
                         self.user_config['remember'] = True
                         self.user_config['autologin'] = dlg.autologin_checked
                     else:
-                        # Clear sensitive data but keep generic settings
                         self.user_config.update({'username': '', 'password': '', 'remember': False, 'autologin': False})
 
                     save_user_config(self.user_config)
-                    self.start_main_session(dlg.username, sock, sf)
+                    self.start_main_session(dlg.username, xmpp)
                     return True
             elif result == wx.ID_ABORT:
-                success, sock, sf, _ = self.perform_login(dlg.new_username, dlg.new_password)
+                success, xmpp, _, _ = self.perform_login(dlg.new_username, dlg.new_password)
                 if success:
                     self.user_config = {'username': dlg.new_username, 'password': dlg.new_password, 'remember': True, 'autologin': True, 'soundpack': 'default', 'chat_logging': {}}
-                    save_user_config(self.user_config); self.start_main_session(dlg.new_username, sock, sf); return True
+                    save_user_config(self.user_config); self.start_main_session(dlg.new_username, xmpp); return True
             else: return False
     
     def perform_login(self, username, password, silent=False, connect_timeout=None):
         try:
-            ssock = create_secure_socket(timeout=connect_timeout)
-            ssock.settimeout(None)  # switch to blocking after connect
-            ssock.sendall(json.dumps({"action":"login","user":username,"pass":password}).encode()+b"\n")
-            sf = ssock.makefile()
-            resp = json.loads(sf.readline() or "{}")
-            if resp.get("status") == "ok": return True, ssock, sf, "Success"
+            xmpp = XMPPClient(SERVER_CONFIG['host'], SERVER_CONFIG['port'], SERVER_CONFIG['host'])
+            timeout = connect_timeout or 15
+            success, reason = xmpp.connect(username, password, timeout=timeout)
+            if success:
+                return True, xmpp, None, "Success"
             else:
-                reason = resp.get("reason", "Unknown error")
                 if not silent: wx.MessageBox("Login failed: " + reason, "Login Failed", wx.ICON_ERROR)
-                ssock.close(); return False, None, None, reason
+                return False, None, None, reason
         except Exception as e:
             if not silent: wx.MessageBox(f"A connection error occurred: {e}", "Connection Error", wx.ICON_ERROR)
             return False, None, None, str(e)
-    
-    def start_main_session(self, username, sock, sf):
-        self.username = username; self.sock = sock; self.sockfile = sf; self.pending_file_paths = {}
+
+    def start_main_session(self, username, xmpp, _sf_unused=None):
+        self.username = username; self.xmpp = xmpp; self.pending_file_paths = {}
         self.intentional_disconnect = False
+        self.sock = _XMPPSendAdapter(xmpp)  # Compatibility adapter for existing code
+        # Register XMPP event callbacks (dispatched to wx main thread).
+        self._register_xmpp_callbacks(xmpp)
         self.frame = MainFrame(self.username, self.sock); self.frame.Show()
         if self.frame.current_status != "online":
-            try: self.sock.sendall((json.dumps({"action": "set_status", "status_text": self.frame.current_status}) + "\n").encode())
-            except Exception: pass
-        self.play_sound("login.wav"); threading.Thread(target=self.listen_loop, daemon=True).start()
+            xmpp.set_status(self.frame.current_status)
+        self.play_sound("login.wav")
         self.frame.on_check_updates(silent=True)
 
+    def _register_xmpp_callbacks(self, xmpp):
+        """Wire all XMPP event callbacks to the wx main thread."""
+        xmpp.on_message = lambda from_user, body, ts: wx.CallAfter(self.frame.receive_message, {"from": from_user, "msg": body, "time": ts})
+        xmpp.on_presence = lambda user, online, status: wx.CallAfter(self.frame.update_contact_status, user, online, status)
+        xmpp.on_roster_loaded = lambda contacts: wx.CallAfter(self._on_roster_loaded, contacts)
+        xmpp.on_disconnected = lambda reason: wx.CallAfter(self.on_server_disconnect)
+        xmpp.on_chat_state = lambda user, state: wx.CallAfter(self.frame.on_chat_state, user, state)
+        xmpp.on_mam_messages = lambda msgs: wx.CallAfter(self.frame.on_offline_messages, msgs)
+        xmpp.on_server_info = lambda info: wx.CallAfter(self.frame.on_server_info_response_xmpp, info)
+        xmpp.on_user_directory = lambda users: wx.CallAfter(self.frame.on_user_directory_response_xmpp, users)
+        xmpp.on_file_message = lambda from_user, files: wx.CallAfter(self.on_file_message, from_user, files)
+        xmpp.on_file_uploaded = lambda to, files: wx.CallAfter(self._on_files_uploaded, to, files)
+        xmpp.on_file_upload_error = lambda to, err: wx.CallAfter(self._on_file_upload_error, to, err)
+        xmpp.on_admin_response = lambda resp: wx.CallAfter(self.frame.on_admin_response, resp)
+        xmpp.on_server_alert = lambda msg: wx.CallAfter(self.frame.on_server_alert, msg)
+
+    def _on_roster_loaded(self, contacts):
+        """Convert XMPP roster to the contact_list format MainFrame expects."""
+        contact_list = []
+        for c in contacts:
+            contact_list.append({
+                "user": c["user"],
+                "online": False,  # Will be updated by presence events
+                "status_text": "offline",
+                "blocked": 0,
+            })
+        self.frame.load_contacts(contact_list)
 
     def play_sound(self, sound_file):
         pack = self.user_config.get('soundpack', 'default')
@@ -669,47 +714,12 @@ class ClientApp(wx.App):
             default_path = os.path.join('sounds', 'default', sound_file)
             if os.path.exists(default_path): wx.adv.Sound.PlaySound(default_path, wx.adv.SOUND_ASYNC)
     
-    def listen_loop(self):
-        sock = self.sock
-        handled = False
-        try:
-            for line in self.sockfile:
-                msg = json.loads(line); act = msg.get("action")
-                if act == "contact_list": wx.CallAfter(self.frame.load_contacts, msg["contacts"])
-                elif act == "contact_status": wx.CallAfter(self.frame.update_contact_status, msg["user"], msg["online"], msg.get("status_text"))
-                elif act == "msg": wx.CallAfter(self.frame.receive_message, msg)
-                elif act == "msg_failed": wx.CallAfter(self.frame.on_message_failed, msg["to"], msg["reason"])
-                elif act == "add_contact_failed": wx.CallAfter(self.frame.on_add_contact_failed, msg["reason"])
-                elif act == "add_contact_success": wx.CallAfter(self.frame.on_add_contact_success, msg["contact"])
-                elif act == "admin_response": wx.CallAfter(self.frame.on_admin_response, msg["response"])
-                elif act == "server_info_response": wx.CallAfter(self.frame.on_server_info_response, msg)
-                elif act == "user_directory_response": wx.CallAfter(self.frame.on_user_directory_response, msg)
-                elif act == "admin_status_change": wx.CallAfter(self.frame.on_admin_status_change, msg["user"], msg["is_admin"])
-                elif act == "server_alert": wx.CallAfter(self.frame.on_server_alert, msg["message"])
-                elif act == "file_offer": wx.CallAfter(self.on_file_offer, msg)
-                elif act == "file_offer_failed": wx.CallAfter(self.on_file_offer_failed, msg)
-                elif act == "file_accepted": wx.CallAfter(self.on_file_accepted, msg)
-                elif act == "file_declined": wx.CallAfter(self.on_file_declined, msg)
-                elif act == "file_data": wx.CallAfter(self.on_file_data, msg)
-                elif act == "offline_messages": wx.CallAfter(self.frame.on_offline_messages, msg["messages"])
-                elif act == "change_password_result": wx.CallAfter(self.frame.on_change_password_result, msg)
-                elif act == "banned_kick": wx.CallAfter(self.on_banned); handled = True; break
-        except (IOError, json.JSONDecodeError, ValueError):
-            print("Disconnected from server.")
-            if self.sock is sock and not self.intentional_disconnect: wx.CallAfter(self.on_server_disconnect); handled = True
-            else: handled = True
-        if not handled and self.sock is sock and not self.intentional_disconnect:
-            print("Server closed connection.")
-            wx.CallAfter(self.on_server_disconnect)
-    
-    def on_banned(self):
-        self._return_to_login("You have been banned.", "Banned")
-
     def on_server_disconnect(self):
         if self.intentional_disconnect: return
         self.intentional_disconnect = True
-        try: self.sock.close()
-        except: pass
+        if hasattr(self, 'xmpp') and self.xmpp:
+            try: self.xmpp.disconnect()
+            except: pass
         username = getattr(self, 'username', '')
         password = self.user_config.get('password', '')
         if not username or not password:
@@ -728,9 +738,9 @@ class ClientApp(wx.App):
         for attempt in range(1, max_retries + 1):
             if dlg.cancelled: return
             wx.CallAfter(dlg.set_status, f"Reconnecting... (attempt {attempt} of {max_retries})")
-            success, sock, sf, _ = self.perform_login(username, password, silent=True, connect_timeout=10)
+            success, xmpp, _, _ = self.perform_login(username, password, silent=True, connect_timeout=10)
             if success:
-                wx.CallAfter(self._finish_reconnect, dlg, sock, sf); return
+                wx.CallAfter(self._finish_reconnect, dlg, xmpp); return
             if dlg.cancelled: return
             for remaining in range(wait_secs, 0, -1):
                 if dlg.cancelled: return
@@ -738,24 +748,26 @@ class ClientApp(wx.App):
                 time.sleep(1)
         wx.CallAfter(dlg.EndModal, wx.ID_CANCEL)
 
-    def _finish_reconnect(self, dlg, sock, sf):
-        self.sock = sock; self.sockfile = sf; self.pending_file_paths = {}
+    def _finish_reconnect(self, dlg, xmpp):
+        self.xmpp = xmpp; self.pending_file_paths = {}
         self.intentional_disconnect = False
-        self.frame.sock = sock
+        adapter = _XMPPSendAdapter(xmpp)
+        self.sock = adapter; self.frame.sock = adapter
         for child in self.frame.GetChildren():
-            if isinstance(child, (ChatDialog, AdminDialog)): child.sock = sock
-        threading.Thread(target=self.listen_loop, daemon=True).start()
+            if isinstance(child, (ChatDialog, AdminDialog)): child.sock = adapter
+        # Re-register XMPP callbacks for the new connection.
+        self._register_xmpp_callbacks(xmpp)
         if self.frame.current_status != "online":
-            try: sock.sendall((json.dumps({"action": "set_status", "status_text": self.frame.current_status}) + "\n").encode())
-            except: pass
+            xmpp.set_status(self.frame.current_status)
         self.play_sound("login.wav")
         dlg.EndModal(wx.ID_OK)
 
     def _return_to_login(self, message, title):
         if self.intentional_disconnect: return
         self.intentional_disconnect = True
-        try: self.sock.close()
-        except: pass
+        if hasattr(self, 'xmpp') and self.xmpp:
+            try: self.xmpp.disconnect()
+            except: pass
         self.SetExitOnFrameDelete(False)
         old_frame = None
         if hasattr(self, 'frame') and self.frame:
@@ -767,142 +779,102 @@ class ClientApp(wx.App):
         if old_frame: old_frame.is_exiting = True; old_frame.Destroy()
         if not result: self.ExitMainLoop()
 
-    def on_file_offer(self, msg):
-        sender = msg["from"]; files = msg["files"]; transfer_id = msg["transfer_id"]
+    def on_file_message(self, sender, files):
+        """Handle an incoming file transfer message (HTTP Upload URLs)."""
         self.play_sound("file_receive.wav")
         parent = self.frame.get_chat(sender) or self.frame
         if len(files) == 1:
-            f = files[0]; size = f.get("size", 0)
-            prompt = f"{sender} wants to send you a file:\n\n{f['filename']} ({format_size(size)})\n\nDo you want to accept?"
+            f = files[0]
+            prompt = f"{sender} wants to send you a file:\n\n{f['filename']} ({format_size(f.get('size', 0))})\n\nDo you want to accept?"
         else:
             total_size = sum(f.get("size", 0) for f in files)
             file_list = "\n".join(f"  {f['filename']} ({format_size(f.get('size', 0))})" for f in files)
             prompt = f"{sender} wants to send you {len(files)} files ({format_size(total_size)} total):\n\n{file_list}\n\nDo you want to accept?"
         result = wx.MessageBox(prompt, "File Transfer Request", wx.YES_NO | wx.ICON_QUESTION, parent)
         if result == wx.YES:
-            self.sock.sendall((json.dumps({"action": "file_accept", "transfer_id": transfer_id}) + "\n").encode())
             chat = self.frame.get_chat(sender)
             if chat:
                 names = ", ".join(f["filename"] for f in files)
-                chat.append(f"Accepting {len(files)} file(s): {names}...", "System", time.time())
+                chat.append(f"Downloading {len(files)} file(s): {names}...", "System", time.time())
+            docs_path = os.path.join(os.path.expanduser('~'), 'Documents')
+            save_dir = os.path.join(docs_path, 'ThriveMessenger', 'files')
+            # Download each file in a background thread.
+            def _download():
+                saved = []
+                for f in files:
+                    url = f.get("url", "")
+                    filename = f.get("filename", "download")
+                    if not url: continue
+                    try:
+                        import urllib.request
+                        os.makedirs(save_dir, exist_ok=True)
+                        save_path = os.path.join(save_dir, filename)
+                        if os.path.exists(save_path):
+                            name, ext = os.path.splitext(filename)
+                            counter = 1
+                            while os.path.exists(save_path):
+                                save_path = os.path.join(save_dir, f"{name} ({counter}){ext}")
+                                counter += 1
+                        urllib.request.urlretrieve(url, save_path)
+                        saved.append(os.path.basename(save_path))
+                    except Exception as e:
+                        wx.CallAfter(self._on_file_download_error, sender, filename, e)
+                if saved:
+                    wx.CallAfter(self._on_files_downloaded, sender, saved)
+            threading.Thread(target=_download, daemon=True).start()
         else:
-            self.sock.sendall((json.dumps({"action": "file_decline", "transfer_id": transfer_id}) + "\n").encode())
             chat = self.frame.get_chat(sender)
             if chat: chat.append(f"Declined {len(files)} file(s) from {sender}", "System", time.time())
 
-    def on_file_offer_failed(self, msg):
+    def _on_files_downloaded(self, sender, filenames):
+        self.play_sound("file_receive.wav")
+        chat = self.frame.get_chat(sender)
+        names = ", ".join(filenames)
+        if chat: chat.append(f"{len(filenames)} file(s) received and saved: {names}", "System", time.time())
+        else:
+            if self.user_config.get('announce_files', False):
+                speak(f"{sender} sent you {len(filenames)} file{'s' if len(filenames) != 1 else ''}.")
+            else:
+                show_notification("Files Received", f"{sender} sent you {len(filenames)} file(s)")
+
+    def _on_file_download_error(self, sender, filename, error):
         self.play_sound("file_error.wav")
-        to = msg.get("to", ""); reason = msg.get("reason", "Unknown error")
-        chat = self.frame.get_chat(to)
-        if chat: chat.append_error(f"File transfer failed: {reason}")
-        else: wx.MessageBox(f"File transfer failed: {reason}", "File Transfer Error", wx.ICON_ERROR)
+        chat = self.frame.get_chat(sender)
+        if chat: chat.append_error(f"Failed to download '{filename}': {error}")
 
-    def on_file_accepted(self, msg):
-        transfer_id = msg["transfer_id"]; to = msg["to"]; files_info = msg["files"]
-        file_token = msg.get("file_token", "")
-        client_tid = msg.get("client_transfer_id") or transfer_id
-        file_paths = self.pending_file_paths.pop(client_tid, None)
-        if not file_paths:
-            chat = self.frame.get_chat(to)
-            if chat: chat.append_error("File transfer error: files no longer available.")
-            return
-        def _send():
-            try:
-                files_data = []
-                for fp in file_paths:
-                    with open(fp, 'rb') as f: files_data.append({"filename": os.path.basename(fp), "data": base64.b64encode(f.read()).decode('ascii')})
-                # Send file data on a dedicated connection so the main
-                # connection stays free for messages, directory, etc.
-                xfer_sock = create_secure_socket()
-                try:
-                    xfer_sock.sendall((json.dumps({"action": "file_data", "transfer_id": transfer_id, "file_token": file_token, "to": to, "files": files_data}) + "\n").encode())
-                    resp = json.loads(xfer_sock.makefile().readline() or "{}")
-                finally:
-                    xfer_sock.close()
-                if resp.get("status") != "ok":
-                    raise Exception(resp.get("reason", "Server rejected file data"))
-                names = [os.path.basename(fp) for fp in file_paths]
-                wx.CallAfter(self._on_files_sent, to, names)
-            except Exception as e:
-                wx.CallAfter(self._on_file_send_error, to, e)
-        threading.Thread(target=_send, daemon=True).start()
-
-    def _on_files_sent(self, to, filenames):
+    def _on_files_uploaded(self, to, files):
+        """Callback when files have been uploaded and file message sent."""
         self.play_sound("file_send.wav")
         chat = self.frame.get_chat(to)
         if chat:
-            names = ", ".join(filenames)
-            chat.append(f"{len(filenames)} file(s) sent: {names}", "System", time.time())
+            names = ", ".join(f["filename"] for f in files)
+            chat.append(f"{len(files)} file(s) sent: {names}", "System", time.time())
 
-    def _on_file_send_error(self, to, error):
+    def _on_file_upload_error(self, to, error):
         self.play_sound("file_error.wav")
         chat = self.frame.get_chat(to)
-        if chat: chat.append_error(f"Failed to send file(s): {error}")
-
-    def on_file_declined(self, msg):
-        transfer_id = msg["transfer_id"]; to = msg["to"]; files = msg["files"]
-        client_tid = msg.get("client_transfer_id") or transfer_id
-        self.pending_file_paths.pop(client_tid, None)
-        self.play_sound("file_error.wav")
-        names = ", ".join(f["filename"] for f in files)
-        chat = self.frame.get_chat(to)
-        if chat: chat.append(f"{to} declined your file(s): {names}", "System", time.time())
-        else: wx.MessageBox(f"{to} declined your file(s): {names}", "File Declined", wx.ICON_INFORMATION)
-
-    def on_file_data(self, msg):
-        sender = msg["from"]; files = msg["files"]
-        docs_path = os.path.join(os.path.expanduser('~'), 'Documents')
-        save_dir = os.path.join(docs_path, 'ThriveMessenger', 'files')
-        os.makedirs(save_dir, exist_ok=True)
-        saved = []
-        for finfo in files:
-            filename = finfo["filename"]; data = finfo["data"]
-            try:
-                save_path = os.path.join(save_dir, filename)
-                if os.path.exists(save_path):
-                    name, ext = os.path.splitext(filename)
-                    counter = 1
-                    while os.path.exists(save_path):
-                        save_path = os.path.join(save_dir, f"{name} ({counter}){ext}")
-                        counter += 1
-                with open(save_path, 'wb') as f: f.write(base64.b64decode(data))
-                saved.append(os.path.basename(save_path))
-            except Exception as e:
-                self.play_sound("file_error.wav")
-                chat = self.frame.get_chat(sender)
-                if chat: chat.append_error(f"Failed to save file '{filename}': {e}")
-        if saved:
-            self.play_sound("file_receive.wav")
-            chat = self.frame.get_chat(sender)
-            names = ", ".join(saved)
-            if chat: chat.append(f"{len(saved)} file(s) received and saved: {names}", "System", time.time())
-            else:
-                if wx.GetApp().user_config.get('announce_files', False):
-                    speak(f"{sender} sent you {len(saved)} file{'s' if len(saved) != 1 else ''}.")
-                else:
-                    show_notification("Files Received", f"{sender} sent you {len(saved)} file(s)")
+        if chat: chat.append_error(f"Failed to upload file(s): {error}")
+        else: wx.MessageBox(f"File upload failed: {error}", "File Transfer Error", wx.ICON_ERROR)
 
     def send_file_to(self, contact, parent=None):
         if parent is None: parent = self.frame.get_chat(contact) or self.frame
         with wx.FileDialog(parent, "Choose file(s) to send", wildcard="All files (*.*)|*.*", style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST | wx.FD_MULTIPLE) as dlg:
             if dlg.ShowModal() == wx.ID_CANCEL: return
             file_paths = dlg.GetPaths()
-        files = []; valid_paths = []
+        valid_paths = []
         for file_path in file_paths:
             filename = os.path.basename(file_path)
-            try: size = os.path.getsize(file_path)
+            try: os.path.getsize(file_path)
             except OSError as e:
                 wx.MessageBox(f"Cannot read file '{filename}': {e}", "File Error", wx.ICON_ERROR); continue
-            files.append({"filename": filename, "size": size})
             valid_paths.append(file_path)
-        if not files: return
-        transfer_id = str(uuid.uuid4())
-        self.pending_file_paths[transfer_id] = valid_paths
-        self.sock.sendall((json.dumps({"action": "file_offer", "to": contact, "files": files, "transfer_id": transfer_id}) + "\n").encode())
+        if not valid_paths: return
         chat = self.frame.get_chat(contact)
         if chat:
-            names = ", ".join(f["filename"] for f in files)
-            chat.append(f"Sending file offer ({len(files)} file(s)): {names}...", "System", time.time())
+            names = ", ".join(os.path.basename(fp) for fp in valid_paths)
+            chat.append(f"Uploading {len(valid_paths)} file(s): {names}...", "System", time.time())
+        # Upload via HTTP and send file message (async in XMPPClient).
+        self.xmpp.send_files(contact, valid_paths)
 
 class VerificationDialog(wx.Dialog):
     def __init__(self, parent, username):
@@ -959,25 +931,23 @@ class ForgotPasswordDialog(wx.Dialog):
         ident = self.email_txt.GetValue().strip()
         if not ident: wx.MessageBox("Please enter email or username.", "Error"); return
         try:
-            sock = create_secure_socket()
-            sock.sendall(json.dumps({"action":"request_reset", "identifier":ident}).encode()+b"\n")
-            resp = json.loads(sock.makefile().readline() or "{}"); sock.close()
-            if resp.get("status") == "ok":
+            xmpp = XMPPClient(SERVER_CONFIG['host'], SERVER_CONFIG['port'], SERVER_CONFIG['host'])
+            ok, text = xmpp.request_password_reset(ident)
+            if ok:
                 wx.MessageBox("If that account exists, a code has been sent.", "Code Sent", wx.ICON_INFORMATION)
-                self.username_cache = resp.get("user", ident) 
+                self.username_cache = text or ident
                 self.sizer.Hide(self.step1_sizer); self.sizer.Show(self.step2_sizer); self.panel.Layout()
-            else: wx.MessageBox(resp.get("reason", "Error"), "Failed", wx.ICON_ERROR)
+            else: wx.MessageBox(text or "Error", "Failed", wx.ICON_ERROR)
         except Exception as ex: wx.MessageBox(str(ex), "Connection Error")
 
     def on_reset(self, e):
         code = self.code_txt.GetValue().strip(); new_p = self.pass_txt.GetValue()
         if not code or not new_p: return
         try:
-            sock = create_secure_socket()
-            sock.sendall(json.dumps({"action":"reset_password", "user": self.username_cache, "code": code, "new_pass": new_p}).encode()+b"\n")
-            resp = json.loads(sock.makefile().readline() or "{}"); sock.close()
-            if resp.get("status") == "ok": wx.MessageBox("Password changed successfully!", "Success"); self.EndModal(wx.ID_OK)
-            else: wx.MessageBox(resp.get("reason", "Error"), "Failed", wx.ICON_ERROR)
+            xmpp = XMPPClient(SERVER_CONFIG['host'], SERVER_CONFIG['port'], SERVER_CONFIG['host'])
+            ok, reason = xmpp.reset_password(self.username_cache, code, new_p)
+            if ok: wx.MessageBox("Password changed successfully!", "Success"); self.EndModal(wx.ID_OK)
+            else: wx.MessageBox(reason or "Error", "Failed", wx.ICON_ERROR)
         except Exception as ex: wx.MessageBox(str(ex), "Connection Error")
 
 class CreateAccountDialog(wx.Dialog):
@@ -1167,30 +1137,27 @@ class LoginDialog(wx.Dialog):
             if dlg.ShowModal() == wx.ID_OK:
                 u, p, em, auto = dlg.u_text.GetValue(), dlg.p1_text.GetValue(), dlg.e_text.GetValue(), dlg.autologin_cb.IsChecked()
                 try:
-                    ssock = create_secure_socket()
-                    ssock.sendall(json.dumps({"action":"create_account","user":u,"pass":p,"email":em}).encode()+b"\n")
-                    resp = json.loads(ssock.makefile().readline() or "{}")
-                    ssock.close()
-                    
-                    if resp.get("action") == "verify_pending":
+                    xmpp = XMPPClient(SERVER_CONFIG['host'], SERVER_CONFIG['port'], SERVER_CONFIG['host'])
+                    success, result = xmpp.register(u, p, em)
+                    if success and isinstance(result, dict) and result.get("verify_pending"):
                         wx.MessageBox("A verification code has been sent to your email.", "Verification Required", wx.ICON_INFORMATION)
                         while True:
                             with VerificationDialog(self, u) as vdlg:
                                 if vdlg.ShowModal() != wx.ID_OK: break
                                 code = vdlg.code_txt.GetValue().strip()
-                            sock2 = create_secure_socket()
-                            sock2.sendall(json.dumps({"action":"verify_account", "user":u, "code":code}).encode()+b"\n")
-                            vresp = json.loads(sock2.makefile().readline() or "{}"); sock2.close()
-                            if vresp.get("status") == "ok":
+                            ok, reason = xmpp.verify_account(u, code)
+                            if ok:
                                 wx.MessageBox("Account verified!", "Success")
                                 if auto: self.new_username = u; self.new_password = p; self.EndModal(wx.ID_ABORT)
                                 break
-                            wx.MessageBox("Verification failed: " + vresp.get("reason", "Unknown error"), "Error", wx.ICON_ERROR)
-                    elif resp.get("action") == "create_account_success":
+                            wx.MessageBox("Verification failed: " + reason, "Error", wx.ICON_ERROR)
+                    elif success:
                         wx.MessageBox("Account created successfully!", "Success", wx.OK | wx.ICON_INFORMATION)
                         if auto: self.new_username = u; self.new_password = p; self.EndModal(wx.ID_ABORT)
                         else: self.u.SetValue(u); self.p.SetValue("")
-                    else: wx.MessageBox("Failed to create account: " + resp.get("reason", "Unknown error"), "Creation Failed", wx.ICON_ERROR)
+                    else:
+                        reason = result if isinstance(result, str) else "Unknown error"
+                        wx.MessageBox("Failed to create account: " + reason, "Creation Failed", wx.ICON_ERROR)
                 except Exception as e: wx.MessageBox(f"A connection error occurred: {e}", "Connection Error", wx.ICON_ERROR)
     
     def on_check_remember(self, event):
@@ -1491,7 +1458,7 @@ class MainFrame(wx.Frame):
     def on_server_info(self, _):
         self.sock.sendall(json.dumps({"action": "server_info"}).encode() + b"\n")
     def on_server_info_response(self, msg):
-        encrypted = isinstance(self.sock, ssl.SSLSocket)
+        encrypted = True  # XMPP connections use TLS
         size_limit = msg.get("size_limit", 0)
         size_str = format_size(size_limit) if size_limit > 0 else "No limit"
         blackfiles = msg.get("blackfiles", [])
@@ -1499,6 +1466,34 @@ class MainFrame(wx.Frame):
         max_status_len = msg.get("max_status_length", "N/A")
         info = [("Hostname", SERVER_CONFIG['host']), ("Port", str(msg.get("port", SERVER_CONFIG['port']))), ("Encrypted", "Yes" if encrypted else "No"), ("Registered Users", str(msg.get("total_users", "N/A"))), ("Users Online", str(msg.get("online_users", "N/A"))), ("File Size Limit", size_str), ("Blacklisted Extensions", blackfiles_str), ("Max Status Length", str(max_status_len))]
         with ServerInfoDialog(self, info) as dlg: dlg.ShowModal()
+    def on_server_info_response_xmpp(self, info):
+        """Handle server info from XMPP service discovery."""
+        sw = info.get("server_software", "Unknown")
+        ver = info.get("server_version", "")
+        sw_os = info.get("server_os", "")
+        features = info.get("features", [])
+        rows = [
+            ("Hostname", info.get("hostname", SERVER_CONFIG['host'])),
+            ("Server Software", f"{sw} {ver}".strip()),
+            ("Encrypted", "Yes"),
+        ]
+        if sw_os:
+            rows.append(("Server OS", sw_os))
+        rows.append(("Features", str(len(features))))
+        with ServerInfoDialog(self, rows) as dlg: dlg.ShowModal()
+    def on_user_directory_response_xmpp(self, users):
+        """Handle user directory from XMPP custom IQ."""
+        # Convert to the format UserDirectoryDialog expects.
+        user_list = []
+        for u in users:
+            user_list.append({
+                "user": u.get("user", ""),
+                "status": u.get("status", "offline"),
+                "is_admin": u.get("is_admin", False),
+            })
+        dlg = UserDirectoryDialog(self, user_list, self.user, self.contact_states)
+        self._directory_dlg = dlg
+        dlg.Show()
     def update_button_states(self, event=None):
         is_selection = self.lv.GetSelectedItemCount() > 0
         self.btn_send.Enable(is_selection); self.btn_delete.Enable(is_selection); self.btn_block.Enable(is_selection); self.btn_send_file.Enable(is_selection)
@@ -1758,6 +1753,12 @@ class MainFrame(wx.Frame):
         if app.user_config.get('tts_enabled', True):
             speak(f"{msg['from']}: {msg['msg']}")
     def on_message_failed(self, to, reason): chat_dlg = self.get_chat(to); (chat_dlg.append_error(reason) if chat_dlg else wx.MessageBox(reason, "Message Failed", wx.OK | wx.ICON_ERROR))
+    def on_chat_state(self, from_user, state):
+        """Handle incoming chat state notifications (typing indicators)."""
+        dlg = self.get_chat(from_user)
+        if dlg:
+            if state == "composing": dlg.show_typing()
+            else: dlg.hide_typing()
     def on_offline_messages(self, messages):
         if not messages: return
         by_sender = {}
@@ -1876,9 +1877,18 @@ class ChatDialog(wx.Dialog):
             btn.SetBackgroundColour(dark_color); btn.SetForegroundColour(light_text_color)
             btn_file.SetBackgroundColour(dark_color); btn_file.SetForegroundColour(light_text_color)
 
+        self.typing_label = wx.StaticText(self, label="")
+        if dark_mode_on:
+            self.typing_label.SetForegroundColour(wx.Colour(180, 180, 180))
+        self._typing_timer = wx.Timer(self)
+        self._is_composing = False
+        self.Bind(wx.EVT_TIMER, self._on_typing_timeout, self._typing_timer)
+
         s.Add(self.hist, 1, wx.EXPAND|wx.ALL, 5)
+        s.Add(self.typing_label, 0, wx.LEFT | wx.RIGHT, 10)
         s.Add(self.save_hist_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         self.input_ctrl.Bind(wx.EVT_KEY_DOWN, self.on_input_key)
+        self.input_ctrl.Bind(wx.EVT_TEXT, self._on_input_text)
         box_msg.Add(self.input_ctrl, 1, wx.EXPAND|wx.ALL, 5)
         s.Add(box_msg, 1, wx.EXPAND|wx.ALL, 5)
 
@@ -1903,6 +1913,30 @@ class ChatDialog(wx.Dialog):
         if 'chat_logging' not in app.user_config: app.user_config['chat_logging'] = {}
         app.user_config['chat_logging'][self.contact] = is_enabled
         save_user_config(app.user_config)
+    def _on_input_text(self, event):
+        """User typed something — send composing state and reset the pause timer."""
+        event.Skip()
+        if not self._is_composing:
+            self._is_composing = True
+            app = wx.GetApp()
+            if hasattr(app, 'xmpp') and app.xmpp:
+                app.xmpp.send_chat_state(self.contact, "composing")
+        self._typing_timer.Start(3000, wx.TIMER_ONE_SHOT)
+    def _on_typing_timeout(self, event):
+        """User stopped typing for 3 seconds — send paused state."""
+        if self._is_composing:
+            self._is_composing = False
+            app = wx.GetApp()
+            if hasattr(app, 'xmpp') and app.xmpp:
+                app.xmpp.send_chat_state(self.contact, "paused")
+    def show_typing(self):
+        """Show that the remote contact is typing."""
+        self.typing_label.SetLabel(f"{self.contact} is typing...")
+        self.GetSizer().Layout()
+    def hide_typing(self):
+        """Hide the typing indicator."""
+        self.typing_label.SetLabel("")
+        self.GetSizer().Layout()
     def _save_message_to_log(self, formatted_log_line):
         try:
             docs_path = os.path.join(os.path.expanduser('~'), 'Documents')
@@ -1950,6 +1984,8 @@ class ChatDialog(wx.Dialog):
     def on_send(self, _):
         txt = self.input_ctrl.GetValue().strip()
         if not txt: return
+        self._typing_timer.Stop()
+        self._is_composing = False
         ts = time.time()
         msg = {"action":"msg","to":self.contact,"from":self.user,"msg":txt,"time":ts}
         self.sock.sendall(json.dumps(msg).encode()+b"\n")

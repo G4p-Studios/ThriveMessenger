@@ -138,8 +138,8 @@ You can start an IM conversation with a contact simply by pressing Enter on them
 
 ### File transfer
 
-As well as sending standard text messages, users can also send files to each other. To send a file, simply highlight the contact you want to send the file to and press Alt + F or click the send file button. A dialog will open where you can choose the file you wish to send. Once you choose your file, the receiving user will get a pop-up message asking if they want to accept the file. Your file will begin sending as soon as the receiver hits yes. Received files are stored in Documents/ThriveMessenger/files.
-Note: server owners might place file size limits and certain file type restrictions on users; see below on how to do this yourself.
+As well as sending standard text messages, users can also send files to each other. To send a file, simply highlight the contact you want to send the file to and press Alt + F or click the send file button. A dialog will open where you can choose the file(s) you wish to send. Multiple files can be selected at once. The file is uploaded to the server and a download link is sent to the recipient, who will be prompted to accept or decline. Received files are stored in Documents/ThriveMessenger/files.
+Note: server owners might place file size limits on uploads; see below on how to configure this.
 
 ### Server side commands
 
@@ -149,14 +149,15 @@ Each server side command must start with a forward slash (/). The following serv
 
 *   /admin username: makes the specified user an admin.
 *   /unadmin username: takes the admin user's powers away.
-*   /create username password: creates a user account with the specified username and password.
+*   /create username password [email]: creates a user account with the specified username and password, with an optional email address.
 *   /del user: deletes the specified user's account from the server.
 *   /ban username date reason: bans the specified user from the server until the specified date (in MM/DD/YYYY format) for the specified reason. Wanna ban someone permanently? Just do what they do on Xbox Live and ban them until December 31st, 9999! Ha ha ha!
 *   /unban username: Unbans the specified user.
 * /banfile username type date reason: bans the user from sending a certain type of file until a given date. For example, /banfile doglover05 exe 12/31/9999 sending malware. Using a star (*) in the type argument will ban the user from sending files altogether. Using the command without a date will result in a permanent file ban.
 * /unbanfile username type: Lifts the user's file ban for the given type. If no type is given, all file bans for the user will be lifted.
 * /alert message: Sends a Windows Live style alert message to all online users. For example, /alert The server is about to be shut down for maintenance.
-*   /exit: Shuts down the Thrive Messenger server.
+*   /restart: Restarts the server after a brief delay.
+*   /exit: Shuts down the server.
 
 Shift Tabbing once from the command input field will show a list of outputs for the commands you've run.
 
@@ -248,11 +249,11 @@ With the Thrive Messenger client open and logged in, follow these steps to chang
 2. Choose a sound pack from the sound pack dropdown menu with the up and down arrow keys.
 3. Either press Enter or click the apply button to apply your settings.
 
-### The client.conf file
+### Server manager
 
-The client.conf file controls what server and port the Thrive Messenger client connects to. If you have your own Thrive Messenger server up, or you have one that you like to use, you can simply open client.conf in your text editor of choice, such as Notepad++, and modify the server hostname and port to point to your desired server.
+Thrive Messenger supports connecting to multiple servers. You can manage your server list from the login screen by clicking the Servers button (Alt + S). From there you can add new servers, remove servers, and choose which server is your primary.
 
-The default server is msg.thecubed.cc, running on port 2005.
+The default server is msg.thecubed.cc.
 
 You can also control update sources in `client.conf`:
 
@@ -297,16 +298,15 @@ Someone sends you a message and they aren't in your contacts. You get to chattin
 
 ## Server usage
 
-### Running the server
+Thrive Messenger uses [Prosody](https://prosody.im), an open-source XMPP server, as its backend. All messages are sent over XMPP with optional OMEMO end-to-end encryption. The following instructions are for Linux.
 
-The Thrive Messenger server is also written in Python. It is almost standard library, meaning it does not require any external dependencies to run, save for the argon2-cffi library used for hashing passwords.
-Note: the server will technically run on both Windows and Linux, but the following instructions are optimised for Linux, so you will need a Linux machine either in the cloud or on your local network.
+### Installing Prosody
 
-1. If for some reason git is not installed on your machine, install it with these commands, substituting apt for your distro's package manager.
+1. Install Prosody using your distribution's package manager.
 
     ```
     sudo apt update
-    sudo apt install git
+    sudo apt install prosody prosody-modules lua-dbi-sqlite3
     ```
 
 2. Clone this repository.
@@ -315,93 +315,156 @@ Note: the server will technically run on both Windows and Linux, but the followi
     git clone https://github.com/G4p-Studios/ThriveMessenger
     ```
 
-3. Navigate to the srv directory inside the repo.
+3. Copy the Thrive custom modules to the Prosody modules directory.
 
     ```
-    cd ThriveMessenger/srv
+    sudo cp ThriveMessenger/prosody/modules/*.lua /etc/prosody/thrive-modules/
+    sudo mkdir -p /etc/prosody/thrive-modules
     ```
 
-4. Install the argon2-cffi library.
+4. Copy the example Prosody configuration and edit it to match your domain.
 
     ```
-    pip3 install --break-system-packages argon2-cffi
+    sudo cp ThriveMessenger/prosody/prosody.cfg.lua /etc/prosody/prosody.cfg.lua
+    sudo nano /etc/prosody/prosody.cfg.lua
     ```
 
-Note: we aren't actually breaking any packages here, we're just using that argument to stop pip whining about virtual environments.
+    At a minimum, update:
+    * The `VirtualHost` line to your domain (e.g. `VirtualHost "chat.example.com"`)
+    * The `ssl` certificate and key paths
+    * The `admins` list with your admin JID (e.g. `admins = { "yourname@chat.example.com" }`)
 
-5. Make a screen session so you're not constantly tied to the terminal when running the server.
-
-    ```
-    screen -S thrive
-    ```
-
-6. Ensure the server's port is allowed through the firewall.
+5. Allow the XMPP ports through the firewall.
 
     ```
-    sudo ufw allow 2005
+    sudo ufw allow 5222
+    sudo ufw allow 5269
+    sudo ufw allow 5280
     ```
 
-7. Finally, runn the server.
+6. Start Prosody.
 
     ```
-    python3 server.py
+    sudo systemctl enable prosody
+    sudo systemctl start prosody
     ```
 
-8. Detach yourself from the screen session by pressing Control + A, then press D.
+### Setting up TLS
 
-Please note: the server will run in unencrypted mode by default, meaning data sent from the client will be sent in plain text. This should only be used for testing servers. In a production environment, you must use valid SSL certificates from a trusted certificate authority such as Let's Encrypt.
+Thrive Messenger requires TLS encryption for all connections. Use Let's Encrypt to get free certificates.
 
-### Encrypting the server
+1. Install Certbot. [This guide from the Electronic Frontier Foundation](https://certbot.eff.org/instructions?ws=other&os=pip) covers the setup.
 
-Assuming you have a domain or hostname, do the following to enable SSL on your Thrive Messenger server.
-
-1. Use a tool like Certbot to generate your Let's Encrypt certificates. [This guide from the Electronic Frontier Foundation](https://certbot.eff.org/instructions?ws=other&os=pip) should help with this.
-2. In the srv directory of the Thrive Messenger repo, run this command to edit the server's srv.conf file.
+2. Generate certificates for your domain.
 
     ```
-    nano srv.conf
+    sudo certbot certonly --standalone -d chat.example.com
     ```
 
-3. Add these lines to the end of the file, replacing example.com with your actual domain name.
+3. Import the certificates into Prosody.
 
     ```
-    certfile=/etc/letsencrypt/live/example.com/fullchain.pem
-    keyfile=/etc/letsencrypt/live/example.com/privkey.pem
+    sudo prosodyctl cert import /etc/letsencrypt/live
     ```
 
-4. Start the server. It should now say that there's a secure server listening on port <port>.
+    Alternatively, update the `ssl` section in `prosody.cfg.lua` to point to your certificate files directly.
+
+4. Restart Prosody.
+
+    ```
+    sudo systemctl restart prosody
+    ```
+
+### Creating user accounts
+
+You can create user accounts from the server command line or from the admin console in the client.
+
+```
+sudo prosodyctl register username chat.example.com password
+```
+
+Or, from the admin console in the client: `/create username password`
 
 ### Allowing your server to send emails
 
-You can optionally enable SMTP on your Thrive Messenger server to allow account verification and password reset codes to be sent to users by email. Users that create accounts on SMTP-enabled servers are required to supply a valid email address for these features to work.
-To allow your server to send emails, simply add these files to the end of your server's srv.conf file, replacing values with those given to you by your email provider.
+You can optionally enable SMTP on your server to allow account verification and password reset codes to be sent to users by email. Users that create accounts on SMTP-enabled servers are required to supply a valid email address for these features to work.
 
-    ```
-    [smtp]
-    enabled=true
-    server=host.tld
-    port=587
-    email=your_username@host.tld
-    password=your_password
-    ```
+Edit your `prosody.cfg.lua` and fill in the SMTP settings:
+
+```lua
+thrive_smtp_server   = "smtp.example.com"
+thrive_smtp_port     = 587
+thrive_smtp_user     = "noreply@example.com"
+thrive_smtp_password = "your-smtp-password"
+thrive_smtp_from     = "noreply@example.com"
+```
+
+Then restart Prosody for the changes to take effect.
 
 ### File transfer limits
 
-There are 2 config options available for customising file transfer restrictions for users.
+File transfers use HTTP Upload (XEP-0363). You can configure limits in `prosody.cfg.lua`:
 
-* size_limit (bites): files larger than this size cannot be sent. For example, to set the size limit to 2GB, you would do
+* `http_file_share_size_limit`: Maximum file size in bytes. For example, to set a 2 GB limit:
+
+    ```lua
+    http_file_share_size_limit = 2000000000
+    ```
+
+* `http_file_share_expires_after`: How long uploaded files are kept, in seconds. Default is 7 days (604800).
+
+* `http_file_share_daily_quota`: Maximum total upload size per user per day, in bytes.
+
+### Running bots
+
+Thrive Messenger supports AI-powered bots that connect to the server as regular XMPP users. Bots are powered by a local [Ollama](https://ollama.com) instance.
+
+1. Register bot accounts on the server.
 
     ```
-    size_limit=2000000000
+    sudo prosodyctl register assistant-bot chat.example.com botpassword123
+    sudo prosodyctl register helper-bot chat.example.com botpassword456
     ```
-.
 
-* blackfiles: a comma-separated blacklist of file extensions that are blocked from sending by default. For example:
+2. Edit `bot_config.ini` with your server details and bot passwords.
+
+3. Run the bot process.
 
     ```
-    blackfiles=exe,bat,cmd,app,vbs
+    python3 thrive_bot.py
     ```
-.
+
+    Each `[bot:name]` section in the config file spawns a bot that logs in and responds to messages via Ollama.
+
+### Migrating from the legacy server
+
+If you are migrating from the old custom Python server (`srv/server.py`), a migration script is provided to transfer your user accounts, contacts, bans, and admin list to Prosody.
+
+1. Make sure Prosody is installed and running.
+
+2. Preview the migration with `--dry-run` first.
+
+    ```
+    python3 srv/migrate_accounts.py --old-db srv/thrive.db --prosody-db /var/lib/prosody/thrive.db --domain chat.example.com --dry-run
+    ```
+
+3. Run the migration for real. The script automatically backs up Prosody's data directory and thrive.db before making any changes, and writes a JSON manifest recording every action taken.
+
+    ```
+    python3 srv/migrate_accounts.py --old-db srv/thrive.db --prosody-db /var/lib/prosody/thrive.db --domain chat.example.com
+    ```
+
+4. If something goes wrong, roll back using the manifest file printed at the end.
+
+    ```
+    python3 srv/migrate_accounts.py --rollback migration-manifest-20260226-153012.json
+    ```
+
+    This deletes all created Prosody accounts, removes roster entries, and clears the thrive.db tables that were populated. A pre-migration backup is also available in the backup directory for manual restoration if needed.
+
+5. Users keep their existing passwords. The custom auth module (`mod_auth_thrive`) transparently verifies against the old argon2 hashes on first login and re-hashes to Prosody's native SCRAM format. No password reset is needed.
+
+6. Once all users have logged in at least once, you can optionally switch `authentication` in `prosody.cfg.lua` from `"thrive"` back to `"internal_hashed"` for SCRAM-only auth.
 
 * * *
 
