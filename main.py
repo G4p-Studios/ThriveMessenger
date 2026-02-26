@@ -86,9 +86,14 @@ def load_server_config():
     # Now reading connection details from client.conf instead of srv.conf
     config = configparser.ConfigParser(interpolation=None)
     config.read('client.conf')
+    # domain = XMPP domain for JIDs (VirtualHost in Prosody).
+    # host   = server hostname to connect to (may differ from domain).
+    # If domain is not set, it defaults to host.
+    host = config.get('server', 'host', fallback='msg.thecubed.cc')
     return {
-        'host': config.get('server', 'host', fallback='msg.thecubed.cc'),
-        'port': config.getint('server', 'port', fallback=2005),
+        'host': host,
+        'port': config.getint('server', 'port', fallback=5222),
+        'domain': config.get('server', 'domain', fallback=host),
         'cafile': config.get('server', 'cafile', fallback=None),
         'max_retries': config.getint('server', 'max_retries', fallback=5),
         'retry_timeout': config.getint('server', 'retry_timeout', fallback=15),
@@ -238,7 +243,7 @@ ADDR = (SERVER_CONFIG['host'], SERVER_CONFIG['port'])
 def _get_servers(user_config):
     servers = user_config.get('servers')
     if not servers:
-        servers = [{"name": "Official Server", "host": "msg.thecubed.cc", "port": 2005, "primary": True}]
+        servers = [{"name": "Official Server", "host": "msg.thecubed.cc", "port": 5222, "primary": True}]
         user_config['servers'] = servers
     return servers
 
@@ -248,6 +253,7 @@ def _apply_active_server(user_config):
     primary = next((s for s in servers if s.get('primary')), servers[0])
     SERVER_CONFIG['host'] = primary['host']
     SERVER_CONFIG['port'] = primary['port']
+    SERVER_CONFIG['domain'] = primary.get('domain', primary['host'])
     ADDR = (SERVER_CONFIG['host'], SERVER_CONFIG['port'])
 
 _IPC_PORT = 48951
@@ -654,7 +660,7 @@ class ClientApp(wx.App):
     
     def perform_login(self, username, password, silent=False, connect_timeout=None):
         try:
-            xmpp = XMPPClient(SERVER_CONFIG['host'], SERVER_CONFIG['port'], SERVER_CONFIG['host'])
+            xmpp = XMPPClient(SERVER_CONFIG['host'], SERVER_CONFIG['port'], SERVER_CONFIG['domain'])
             timeout = connect_timeout or 15
             success, reason = xmpp.connect(username, password, timeout=timeout)
             if success:
@@ -672,7 +678,7 @@ class ClientApp(wx.App):
         self.sock = _XMPPSendAdapter(xmpp)  # Compatibility adapter for existing code
         # Register XMPP event callbacks (dispatched to wx main thread).
         self._register_xmpp_callbacks(xmpp)
-        self.frame = MainFrame(self.username, self.sock); self.frame.Show()
+        self.frame = MainFrame(self.username, self.sock); self.frame.xmpp = xmpp; self.frame.Show()
         if self.frame.current_status != "online":
             xmpp.set_status(self.frame.current_status)
         self.play_sound("login.wav")
@@ -752,7 +758,7 @@ class ClientApp(wx.App):
         self.xmpp = xmpp; self.pending_file_paths = {}
         self.intentional_disconnect = False
         adapter = _XMPPSendAdapter(xmpp)
-        self.sock = adapter; self.frame.sock = adapter
+        self.sock = adapter; self.frame.sock = adapter; self.frame.xmpp = xmpp
         for child in self.frame.GetChildren():
             if isinstance(child, (ChatDialog, AdminDialog)): child.sock = adapter
         # Re-register XMPP callbacks for the new connection.
@@ -931,7 +937,7 @@ class ForgotPasswordDialog(wx.Dialog):
         ident = self.email_txt.GetValue().strip()
         if not ident: wx.MessageBox("Please enter email or username.", "Error"); return
         try:
-            xmpp = XMPPClient(SERVER_CONFIG['host'], SERVER_CONFIG['port'], SERVER_CONFIG['host'])
+            xmpp = XMPPClient(SERVER_CONFIG['host'], SERVER_CONFIG['port'], SERVER_CONFIG['domain'])
             ok, text = xmpp.request_password_reset(ident)
             if ok:
                 wx.MessageBox("If that account exists, a code has been sent.", "Code Sent", wx.ICON_INFORMATION)
@@ -944,7 +950,7 @@ class ForgotPasswordDialog(wx.Dialog):
         code = self.code_txt.GetValue().strip(); new_p = self.pass_txt.GetValue()
         if not code or not new_p: return
         try:
-            xmpp = XMPPClient(SERVER_CONFIG['host'], SERVER_CONFIG['port'], SERVER_CONFIG['host'])
+            xmpp = XMPPClient(SERVER_CONFIG['host'], SERVER_CONFIG['port'], SERVER_CONFIG['domain'])
             ok, reason = xmpp.reset_password(self.username_cache, code, new_p)
             if ok: wx.MessageBox("Password changed successfully!", "Success"); self.EndModal(wx.ID_OK)
             else: wx.MessageBox(reason or "Error", "Failed", wx.ICON_ERROR)
@@ -999,7 +1005,7 @@ class AddServerDialog(wx.Dialog):
         host_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "&Host")
         self.host_txt = wx.TextCtrl(host_box.GetStaticBox()); host_box.Add(self.host_txt, 0, wx.EXPAND | wx.ALL, 5)
         port_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "P&ort")
-        self.port_txt = wx.TextCtrl(port_box.GetStaticBox()); self.port_txt.SetValue("2005"); port_box.Add(self.port_txt, 0, wx.EXPAND | wx.ALL, 5)
+        self.port_txt = wx.TextCtrl(port_box.GetStaticBox()); self.port_txt.SetValue("5222"); port_box.Add(self.port_txt, 0, wx.EXPAND | wx.ALL, 5)
         ok_btn = wx.Button(panel, wx.ID_OK, "&OK"); cancel_btn = wx.Button(panel, wx.ID_CANCEL, "&Cancel")
         if dark_mode_on:
             for box in [name_box, host_box, port_box]:
@@ -1137,7 +1143,7 @@ class LoginDialog(wx.Dialog):
             if dlg.ShowModal() == wx.ID_OK:
                 u, p, em, auto = dlg.u_text.GetValue(), dlg.p1_text.GetValue(), dlg.e_text.GetValue(), dlg.autologin_cb.IsChecked()
                 try:
-                    xmpp = XMPPClient(SERVER_CONFIG['host'], SERVER_CONFIG['port'], SERVER_CONFIG['host'])
+                    xmpp = XMPPClient(SERVER_CONFIG['host'], SERVER_CONFIG['port'], SERVER_CONFIG['domain'])
                     success, result = xmpp.register(u, p, em)
                     if success and isinstance(result, dict) and result.get("verify_pending"):
                         wx.MessageBox("A verification code has been sent to your email.", "Verification Required", wx.ICON_INFORMATION)
@@ -1449,14 +1455,14 @@ class MainFrame(wx.Frame):
     def on_user_directory(self, _):
         if self._directory_dlg:
             self._directory_dlg.Raise(); self._directory_dlg.SetFocus(); return
-        self.sock.sendall(json.dumps({"action": "user_directory"}).encode() + b"\n")
+        self.xmpp.get_user_directory()
     def on_user_directory_response(self, msg):
         users = msg.get("users", [])
         dlg = UserDirectoryDialog(self, users, self.user, self.contact_states)
         self._directory_dlg = dlg
         dlg.Show()
     def on_server_info(self, _):
-        self.sock.sendall(json.dumps({"action": "server_info"}).encode() + b"\n")
+        self.xmpp.get_server_info()
     def on_server_info_response(self, msg):
         encrypted = True  # XMPP connections use TLS
         size_limit = msg.get("size_limit", 0)
@@ -1479,7 +1485,7 @@ class MainFrame(wx.Frame):
         ]
         if sw_os:
             rows.append(("Server OS", sw_os))
-        rows.append(("Features", str(len(features))))
+        rows.append(("Supported Features", str(len(features))))
         with ServerInfoDialog(self, rows) as dlg: dlg.ShowModal()
     def on_user_directory_response_xmpp(self, users):
         """Handle user directory from XMPP custom IQ."""
@@ -1510,7 +1516,7 @@ class MainFrame(wx.Frame):
                 if not status: return
                 self.current_status = status
                 app = wx.GetApp(); app.user_config['status'] = status; save_user_config(app.user_config)
-                try: self.sock.sendall((json.dumps({"action": "set_status", "status_text": status}) + "\n").encode())
+                try: self.xmpp.set_status(status)
                 except Exception as e: print(f"Error setting status: {e}")
     def on_check_updates(self, event=None, silent=False):
         self.btn_update.Disable()
@@ -1557,9 +1563,7 @@ class MainFrame(wx.Frame):
                 else:
                     apply_zip_update(dest)
                 app = wx.GetApp(); app.intentional_disconnect = True
-                try: self.sock.sendall(json.dumps({"action":"logout"}).encode()+b"\n")
-                except: pass
-                try: self.sock.close()
+                try: self.xmpp.disconnect()
                 except: pass
                 if self.task_bar_icon: self.task_bar_icon.Destroy()
                 self.is_exiting = True; self.Destroy()
@@ -1591,7 +1595,7 @@ class MainFrame(wx.Frame):
                 c = dlg.GetValue().strip()
                 if not c: wx.MessageBox("Username cannot be blank.", "Input Error", wx.ICON_ERROR); return
                 if c == self.user: wx.MessageBox("You cannot add yourself as a contact.", "Input Error", wx.ICON_ERROR); return
-                self.sock.sendall(json.dumps({"action":"add_contact","to":c}).encode()+b"\n")
+                self.xmpp.add_contact(c)
     def load_contacts(self, contacts):
         self.contact_states = {c["user"]: c["blocked"] for c in contacts}
         self._all_contacts = []
@@ -1662,9 +1666,7 @@ class MainFrame(wx.Frame):
     def on_exit(self, _):
         print("Exiting application...");
         app = wx.GetApp(); app.intentional_disconnect = True
-        try: self.sock.sendall(json.dumps({"action":"logout"}).encode()+b"\n")
-        except: pass
-        try: self.sock.close()
+        try: self.xmpp.disconnect()
         except: pass
         if self._directory_dlg: self._directory_dlg.Destroy(); self._directory_dlg = None
         if self._conversations_dlg: self._conversations_dlg.Destroy(); self._conversations_dlg = None
@@ -1673,9 +1675,7 @@ class MainFrame(wx.Frame):
         app.ExitMainLoop()
     def on_logout(self, _):
         self.is_exiting = True; app = wx.GetApp(); app.intentional_disconnect = True
-        try: self.sock.sendall(json.dumps({"action":"logout"}).encode()+b"\n")
-        except: pass
-        try: self.sock.close()
+        try: self.xmpp.disconnect()
         except: pass
         if self._directory_dlg: self._directory_dlg.Destroy(); self._directory_dlg = None
         if self._conversations_dlg: self._conversations_dlg.Destroy(); self._conversations_dlg = None
@@ -1688,14 +1688,17 @@ class MainFrame(wx.Frame):
     def on_block_toggle(self, _):
         sel = self.lv.GetFirstSelected()
         if sel < 0: return
-        c = self.lv.GetItemText(sel); blocked = self.contact_states.get(c,0) == 1; action = "unblock_contact" if blocked else "block_contact"; self.sock.sendall(json.dumps({"action":action,"to":c}).encode()+b"\n"); self.contact_states[c] = 0 if blocked else 1
+        c = self.lv.GetItemText(sel); blocked = self.contact_states.get(c,0) == 1
+        if blocked: self.xmpp.unblock_contact(c)
+        else: self.xmpp.block_contact(c)
+        self.contact_states[c] = 0 if blocked else 1
         for entry in self._all_contacts:
             if entry["user"] == c: entry["blocked"] = 0 if blocked else 1; break
         self._apply_search_filter()
     def on_delete(self, _):
         sel = self.lv.GetFirstSelected()
         if sel < 0: return
-        c = self.lv.GetItemText(sel); self.sock.sendall(json.dumps({"action":"delete_contact","to":c}).encode()+b"\n"); self.contact_states.pop(c, None)
+        c = self.lv.GetItemText(sel); self.xmpp.remove_contact(c); self.contact_states.pop(c, None)
         self._all_contacts = [entry for entry in self._all_contacts if entry["user"] != c]
         self._apply_search_filter()
     def on_send(self, _):
@@ -1833,7 +1836,9 @@ class AdminDialog(wx.Dialog):
         cmd = self.input_ctrl.GetValue().strip()
         if not cmd: return
         if not cmd.startswith('/'): self.append_response("Error: Commands must start with /"); return
-        msg = {"action":"admin_cmd", "cmd": cmd[1:]}; self.sock.sendall(json.dumps(msg).encode()+b"\n"); self.input_ctrl.Clear(); self.input_ctrl.SetFocus()
+        app = wx.GetApp()
+        if hasattr(app, 'xmpp') and app.xmpp: app.xmpp.send_admin_command(cmd[1:])
+        self.input_ctrl.Clear(); self.input_ctrl.SetFocus()
     def append_response(self, text):
         ts = time.time(); idx = self.hist.GetItemCount(); self.hist.InsertItem(idx, text); self.hist.SetItem(idx, 1, format_timestamp(ts))
         if text.lower().startswith('error'): self.hist.SetItemTextColour(idx, wx.RED)
@@ -1842,7 +1847,7 @@ class AdminDialog(wx.Dialog):
 class ChatDialog(wx.Dialog):
     def __init__(self, parent, contact, sock, user, logging_enabled=False, is_contact=True):
         super().__init__(parent, title=f"Chat with {contact}", size=(450, 450))
-        self.contact, self.sock, self.user = contact, sock, user
+        self.contact, self.user = contact, user
         self.is_contact = is_contact
         self._msg_log = []
         self.Bind(wx.EVT_CHAR_HOOK, self.on_key)
@@ -1987,15 +1992,16 @@ class ChatDialog(wx.Dialog):
         self._typing_timer.Stop()
         self._is_composing = False
         ts = time.time()
-        msg = {"action":"msg","to":self.contact,"from":self.user,"msg":txt,"time":ts}
-        self.sock.sendall(json.dumps(msg).encode()+b"\n")
+        app = wx.GetApp()
+        if hasattr(app, 'xmpp') and app.xmpp: app.xmpp.send_message(self.contact, txt)
         self.append(txt, self.user, ts)
         wx.GetApp().play_sound("send.wav")
         self.input_ctrl.Clear(); self.input_ctrl.SetFocus()
     def on_send_file(self, _):
         wx.GetApp().send_file_to(self.contact)
     def on_add_contact(self, _):
-        self.sock.sendall(json.dumps({"action": "add_contact", "to": self.contact}).encode() + b"\n")
+        app = wx.GetApp()
+        if hasattr(app, 'xmpp') and app.xmpp: app.xmpp.add_contact(self.contact)
         self.btn_add_contact.Disable(); self.btn_add_contact.SetLabel("Adding...")
     def hide_add_button(self):
         self.is_contact = True

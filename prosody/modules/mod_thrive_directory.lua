@@ -23,8 +23,6 @@
 
 local st = require "util.stanza";
 local usermanager = require "core.usermanager";
-local presence_manager = require "core.presencemanager";
-local jid_bare = require "util.jid".bare;
 local jid_join = require "util.jid".join;
 local DBI = require "DBI";
 

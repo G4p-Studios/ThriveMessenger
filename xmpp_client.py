@@ -90,60 +90,22 @@ class XMPPClient:
         Returns (True, "") on success, or (False, reason) on failure.
         """
         self._username = username
+        self._password = password
         self._intentional_disconnect = False
         self._connected_event.clear()
         self._connect_error = None
 
-        jid = f"{username}@{self._domain}"
-        self._client = slixmpp.ClientXMPP(jid, password)
-
-        # Register plugins.
-        self._client.register_plugin("xep_0030")  # Service Discovery
-        self._client.register_plugin("xep_0077")  # In-Band Registration
-        self._client.register_plugin("xep_0085")  # Chat State Notifications (typing)
-        self._client.register_plugin("xep_0092")  # Software Version
-        self._client.register_plugin("xep_0184")  # Message Delivery Receipts
-        self._client.register_plugin("xep_0191")  # Blocking Command
-        self._client.register_plugin("xep_0199")  # Ping
-        self._client.register_plugin("xep_0313")  # Message Archive Management
-        self._client.register_plugin("xep_0363")  # HTTP File Upload
-        self._client.register_plugin("xep_0380")  # Explicit Message Encryption
-
-        # OMEMO (XEP-0384) — per-user key storage.
-        omemo_dir = os.path.join(os.path.expanduser("~"), ".thrive_messenger")
-        os.makedirs(omemo_dir, exist_ok=True)
-        omemo_path = os.path.join(omemo_dir, f"omemo_{username}.json")
-        self._client.register_plugin(
-            "xep_0384",
-            {"json_file_path": omemo_path},
-            module=omemo_plugin,
-        )
-
-        # Event handlers.
-        self._client.add_event_handler("session_start", self._on_session_start)
-        # Use a CoroutineCallback for messages so we can decrypt OMEMO
-        # before the standard message event fires.
-        self._client.register_handler(CoroutineCallback(
-            "ThriveOMEMOMessage",
-            MatchXPath(f"{{{self._client.default_ns}}}message"),
-            self._on_message_omemo,
-        ))
-        self._client.add_event_handler("changed_status", self._on_presence_changed)
-        self._client.add_event_handler("got_offline", self._on_got_offline)
-        self._client.add_event_handler("disconnected", self._on_disconnected)
-        self._client.add_event_handler("connection_failed", self._on_connection_failed)
-        self._client.add_event_handler("failed_auth", self._on_failed_auth)
-        self._client.add_event_handler("chatstate_composing", self._on_chatstate_composing)
-        self._client.add_event_handler("chatstate_paused", self._on_chatstate_paused)
-        self._client.add_event_handler("chatstate_active", self._on_chatstate_active)
-        self._client.add_event_handler("receipt_received", self._on_receipt_received)
+        # Enable slixmpp debug logging to diagnose connection issues.
+        logging.basicConfig(level=logging.DEBUG, format="%(name)s %(levelname)s: %(message)s")
+        logging.getLogger("slixmpp").setLevel(logging.DEBUG)
 
         # Start the asyncio loop in a background thread.
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
 
-        # Kick off the connection from the asyncio loop.
+        # Create the client and connect on the asyncio loop so that
+        # slixmpp binds to the correct event loop.
         asyncio.run_coroutine_threadsafe(
             self._async_connect(), self._loop
         )
@@ -379,7 +341,9 @@ class XMPPClient:
         thread.start()
 
         try:
-            client.connect(address=(self._server_host, self._server_port))
+            client.enable_direct_tls = False
+            client.enable_starttls = True
+            client.connect(host=self._server_host, port=self._server_port)
             asyncio.run_coroutine_threadsafe(_do_register(), loop)
             done.wait(timeout=timeout)
             if not done.is_set():
@@ -514,16 +478,71 @@ class XMPPClient:
         self._loop.run_forever()
 
     async def _async_connect(self):
-        """Initiate the XMPP connection (called on the asyncio loop)."""
+        """Create the client and connect (called on the asyncio loop).
+
+        The ClientXMPP must be created here — on the background event loop —
+        so that slixmpp's internal futures are bound to the correct loop.
+        """
         try:
-            self._client.connect(
-                address=(self._server_host, self._server_port),
-                disable_starttls=False,
-                force_starttls=False,
+            jid = f"{self._username}@{self._domain}"
+            self._client = slixmpp.ClientXMPP(jid, self._password)
+
+            # Register plugins.
+            self._client.register_plugin("xep_0030")  # Service Discovery
+            self._client.register_plugin("xep_0077")  # In-Band Registration
+            self._client.register_plugin("xep_0085")  # Chat State Notifications
+            self._client.register_plugin("xep_0092")  # Software Version
+            self._client.register_plugin("xep_0184")  # Message Delivery Receipts
+            self._client.register_plugin("xep_0191")  # Blocking Command
+            self._client.register_plugin("xep_0199")  # Ping
+            self._client.register_plugin("xep_0313")  # Message Archive Management
+            self._client.register_plugin("xep_0363")  # HTTP File Upload
+            self._client.register_plugin("xep_0380")  # Explicit Message Encryption
+
+            # OMEMO (XEP-0384) — per-user key storage.
+            omemo_dir = os.path.join(os.path.expanduser("~"), ".thrive_messenger")
+            os.makedirs(omemo_dir, exist_ok=True)
+            omemo_path = os.path.join(omemo_dir, f"omemo_{self._username}.json")
+            self._client.register_plugin(
+                "xep_0384",
+                {"json_file_path": omemo_path},
+                module=omemo_plugin,
             )
-            self._client.process(forever=False)
+
+            # Event handlers.
+            self._client.add_event_handler("session_start", self._on_session_start)
+            self._client.register_handler(CoroutineCallback(
+                "ThriveOMEMOMessage",
+                MatchXPath(f"{{{self._client.default_ns}}}message"),
+                self._on_message_omemo,
+            ))
+            self._client.add_event_handler("changed_status", self._on_presence_changed)
+            self._client.add_event_handler("got_offline", self._on_got_offline)
+            self._client.add_event_handler("disconnected", self._on_disconnected)
+            self._client.add_event_handler("connection_failed", self._on_connection_failed)
+            self._client.add_event_handler("failed_auth", self._on_failed_auth)
+            self._client.add_event_handler("chatstate_composing", self._on_chatstate_composing)
+            self._client.add_event_handler("chatstate_paused", self._on_chatstate_paused)
+            self._client.add_event_handler("chatstate_active", self._on_chatstate_active)
+            self._client.add_event_handler("receipt_received", self._on_receipt_received)
+
+            # Debug: log connection lifecycle events.
+            self._client.add_event_handler("connected", self._on_tcp_connected)
+            self._client.add_event_handler("tls_success", self._on_tls_success)
+            self._client.add_event_handler("tls_failed", self._on_tls_failed)
+
+            # Port 5222 uses STARTTLS (not direct TLS).
+            self._client.enable_direct_tls = False
+            self._client.enable_starttls = True
+
+            log.info("Connecting to %s:%s (domain=%s)",
+                     self._server_host, self._server_port, self._domain)
+            self._client.connect(
+                host=self._server_host,
+                port=self._server_port,
+            )
         except Exception as exc:
-            self._connect_error = str(exc)
+            self._connect_error = f"Connection error: {type(exc).__name__}: {exc}"
             self._connected_event.set()
 
     async def _async_disconnect(self):
@@ -988,16 +1007,47 @@ class XMPPClient:
         if self.on_presence:
             self.on_presence(from_user, False, "offline")
 
+    def _on_tcp_connected(self, event):
+        """TCP connection established (before STARTTLS/auth)."""
+        log.info("TCP connected to server.")
+
+    def _on_tls_success(self, event):
+        """STARTTLS upgrade succeeded."""
+        log.info("TLS handshake successful.")
+
+    def _on_tls_failed(self, event):
+        """STARTTLS upgrade failed."""
+        log.error("TLS handshake failed: %s", event)
+        self._connect_error = f"TLS handshake failed: {event}"
+        self._connected_event.set()
+
     def _on_disconnected(self, event):
         """Connection lost."""
+        log.info("Disconnected event: %s", event)
         if self._intentional_disconnect:
+            return
+        # If we haven't connected yet, treat as a connection failure.
+        if not self._connected_event.is_set():
+            reason = str(event) if event else "Server closed the connection."
+            self._connect_error = f"Disconnected during login: {reason}"
+            self._connected_event.set()
             return
         if self.on_disconnected:
             self.on_disconnected("Connection to the server was lost.")
 
     def _on_connection_failed(self, event):
         """Initial connection attempt failed."""
-        self._connect_error = "Could not connect to server."
+        detail = ""
+        if isinstance(event, dict):
+            detail = event.get("reason", "")
+        elif isinstance(event, Exception):
+            detail = str(event)
+        elif isinstance(event, str):
+            detail = event
+        if detail:
+            self._connect_error = f"Could not connect to server: {detail}"
+        else:
+            self._connect_error = "Could not connect to server."
         self._connected_event.set()
 
     def _on_failed_auth(self, event):
@@ -1127,7 +1177,9 @@ class XMPPClient:
         thread.start()
 
         try:
-            client.connect(address=(self._server_host, self._server_port))
+            client.enable_direct_tls = False
+            client.enable_starttls = True
+            client.connect(host=self._server_host, port=self._server_port)
             asyncio.run_coroutine_threadsafe(_do(), loop)
             done.wait(timeout=timeout)
             if not done.is_set():

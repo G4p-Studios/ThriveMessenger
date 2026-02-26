@@ -25,7 +25,8 @@ What it does:
        - Users with legacy plaintext passwords: registered with the
          actual password (prosodyctl hashes it to SCRAM).
     4. Migrates email addresses to thrive_emails.
-    5. Migrates contacts to XMPP roster via ``prosodyctl mod_roster``.
+    5. Migrates contacts to XMPP roster by writing Prosody's internal
+       storage files directly (does not use prosodyctl mod_roster).
     6. Migrates active bans to thrive_bans.
     7. Migrates file bans to thrive_file_bans.
     8. Migrates admins from admins.txt to thrive_admins.
@@ -38,8 +39,9 @@ Requirements:
     - ``prosodyctl`` must be available on PATH (run on the Prosody server).
     - The Prosody thrive.db must be writable (same file referenced by
       thrive_db_path in prosody.cfg.lua).
-    - ``authentication = "thrive"`` must be set in prosody.cfg.lua so
-      the custom auth module picks up the legacy hashes.
+    - ``authentication = "internal_hashed"`` during migration (the default).
+      After migration, deploy the thrive modules, switch to
+      ``authentication = "thrive"``, and restart Prosody.
 """
 
 import argparse
@@ -204,7 +206,8 @@ class Manifest:
             "users_created": [],         # usernames registered via prosodyctl
             "legacy_hashes_stored": [],   # usernames with argon2 entries
             "emails_stored": [],          # usernames with email entries
-            "contacts_added": [],         # [owner, contact] pairs
+            "contacts_added": [],         # [owner, [contacts]] per user
+            "roster_files_written": [],   # absolute paths to roster .dat files
             "bans_added": [],             # usernames with ban entries
             "file_bans_added": [],        # [username, file_type] pairs
             "admins_added": [],           # usernames with admin entries
@@ -215,6 +218,64 @@ class Manifest:
         with open(path, "w") as f:
             json.dump(self.data, f, indent=2)
         log(f"  Manifest saved to: {path}")
+
+
+# ---------------------------------------------------------------------------
+# Prosody internal storage helpers
+# ---------------------------------------------------------------------------
+
+def encode_prosody_path(s):
+    """Encode a string for Prosody's internal file storage paths.
+
+    Matches Prosody's util.datamanager encode() function: all non-alphanumeric
+    characters are replaced with %xx hex encoding.
+    E.g. "msg.thecubed.cc" -> "msg%2ethecubed%2ecc"
+    """
+    result = []
+    for c in s:
+        if c.isalnum():
+            result.append(c)
+        else:
+            result.append(f"%{ord(c):02x}")
+    return "".join(result)
+
+
+def write_prosody_roster(username, domain, entries, prosody_data_dir):
+    """Write a roster .dat file to Prosody's internal storage.
+
+    Args:
+        username: The local part of the JID (e.g. "alice").
+        domain: The XMPP domain (e.g. "msg.thecubed.cc").
+        entries: Dict of {jid: {"subscription": "both"/"to"/"from"/"none"}}.
+        prosody_data_dir: Path to Prosody's data directory (e.g. /var/lib/prosody).
+
+    Creates/overwrites: <data_dir>/<encoded_host>/roster/<encoded_user>.dat
+    """
+    encoded_host = encode_prosody_path(domain)
+    encoded_user = encode_prosody_path(username)
+
+    roster_dir = os.path.join(prosody_data_dir, encoded_host, "roster")
+    os.makedirs(roster_dir, exist_ok=True)
+
+    roster_path = os.path.join(roster_dir, f"{encoded_user}.dat")
+
+    with open(roster_path, "w") as f:
+        f.write("return {\n")
+        # Roster metadata (tells Prosody to send full roster on first connect).
+        f.write("\t[false] = {\n")
+        f.write("\t\tversion = true;\n")
+        f.write("\t};\n")
+        # Contact entries.
+        for jid in sorted(entries):
+            sub = entries[jid].get("subscription", "both")
+            f.write(f'\t["{jid}"] = {{\n')
+            f.write(f'\t\tsubscription = "{sub}";\n')
+            f.write("\t\tgroups = {\n")
+            f.write("\t\t};\n")
+            f.write("\t};\n")
+        f.write("};\n")
+
+    return roster_path
 
 
 # ---------------------------------------------------------------------------
@@ -306,45 +367,64 @@ def migrate_users(old_db, prosody_db, domain, manifest, dry_run=False):
     return created
 
 
-def migrate_contacts(old_db, domain, manifest, dry_run=False):
-    """Migrate contacts to XMPP roster entries via prosodyctl."""
+def migrate_contacts(old_db, domain, prosody_data_dir, manifest, dry_run=False):
+    """Migrate contacts to XMPP roster by writing Prosody internal storage files.
+
+    Writes roster .dat files directly to Prosody's data directory, bypassing
+    prosodyctl (which doesn't support mod_roster commands on Prosody 0.12.x).
+
+    Detects bidirectional contact relationships and sets subscription="both"
+    when both directions exist, or subscription="to" for one-way contacts.
+    """
     rows = old_db.execute(
         "SELECT owner, contact, blocked FROM contacts"
     ).fetchall()
 
-    added = 0
-    errors = 0
+    # Build lookup structures.
+    contact_pairs = set()       # (owner, contact) tuples for bidirectional check
+    roster_map = {}             # owner -> {contact: {...}}
 
     for row in rows:
         owner = row["owner"].strip().lower()
         contact = row["contact"].strip().lower()
-        blocked = row["blocked"]
 
         if not owner or not contact:
             continue
 
-        contact_jid = f"{contact}@{domain}"
+        contact_pairs.add((owner, contact))
+        roster_map.setdefault(owner, {})[contact] = {}
+
+    # Write a roster file per user.
+    added = 0
+    errors = 0
+
+    for owner, contacts in sorted(roster_map.items()):
+        # Build roster entries with correct subscription state.
+        entries = {}
+        for contact in sorted(contacts):
+            jid = f"{contact}@{domain}"
+            is_mutual = (contact, owner) in contact_pairs
+            entries[jid] = {"subscription": "both" if is_mutual else "to"}
 
         if dry_run:
-            log(f"  [DRY RUN] Would add roster: {owner} -> {contact_jid}")
-            added += 1
+            log(f"  [DRY RUN] Would write roster for {owner}: {len(entries)} entries")
+            added += len(entries)
             continue
 
-        # Use prosodyctl to add roster entry.
-        # prosodyctl mod_roster <action> <jid> <contact_jid> [options]
-        ok, out = prosodyctl(
-            "mod_roster", "subscribe",
-            f"{owner}@{domain}", contact_jid,
-        )
-        if ok:
-            added += 1
-            manifest.data["contacts_added"].append([owner, contact])
-        else:
-            # Fallback: try direct roster command.  prosodyctl versions vary.
-            warn(f"  Roster add failed for {owner} -> {contact}: {out}")
-            errors += 1
+        try:
+            path = write_prosody_roster(owner, domain, entries, prosody_data_dir)
+            log(f"  Wrote roster for {owner}: {len(entries)} entries -> {path}")
+            added += len(entries)
+            manifest.data["contacts_added"].append([owner, list(contacts)])
+            manifest.data.setdefault("roster_files_written", []).append(path)
+        except OSError as e:
+            warn(f"  Failed to write roster for {owner}: {e}")
+            errors += len(contacts)
 
     log(f"  Contacts: {added} added, {errors} errors")
+    if added and not dry_run:
+        log("  NOTE: Run 'sudo chown -R prosody:prosody "
+            f"{prosody_data_dir}' to fix file ownership.")
     return added
 
 
@@ -488,19 +568,19 @@ def rollback(manifest_path):
                 warn(f"  Failed to delete user {username}: {out}")
                 errors += 1
 
-    # 2. Remove roster entries that were added.
-    contacts = data.get("contacts_added", [])
-    if contacts:
-        log(f"Removing {len(contacts)} roster entries...")
-        for owner, contact in contacts:
-            ok, out = prosodyctl(
-                "mod_roster", "unsubscribe",
-                f"{owner}@{domain}", f"{contact}@{domain}",
-            )
-            if ok:
-                log(f"  Removed roster: {owner} -> {contact}")
-            else:
-                warn(f"  Failed to remove roster {owner} -> {contact}: {out}")
+    # 2. Remove roster files that were written.
+    roster_files = data.get("roster_files_written", [])
+    if roster_files:
+        log(f"Removing {len(roster_files)} roster files...")
+        for path in roster_files:
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+                    log(f"  Deleted roster file: {path}")
+                else:
+                    log(f"  Roster file already gone: {path}")
+            except OSError as e:
+                warn(f"  Failed to delete roster file {path}: {e}")
                 errors += 1
 
     # 3. Clean up thrive.db tables.
@@ -569,18 +649,25 @@ def print_summary(users_created, manifest_path, domain):
 
     print()
     print("  Next steps:")
-    print("  1. Verify Prosody is running and modules are loaded")
-    print("  2. Ensure authentication = \"thrive\" in prosody.cfg.lua")
-    print("  3. Test login with a migrated account (same password as before)")
-    print("  4. Verify contacts appear in the roster")
-    print("  5. Verify bans are enforced")
-    print("  6. Register bot accounts if not already done:")
+    print("  1. Fix file ownership:")
+    print("       sudo chown -R prosody:prosody /var/lib/prosody")
+    print("  2. Deploy custom Thrive modules to Prosody:")
+    print("       sudo cp prosody/modules/*.lua /etc/prosody/thrive-modules/")
+    print("       sudo cp prosody/modules/verify_argon2.py /etc/prosody/thrive-modules/")
+    print("  3. Switch authentication in prosody.cfg.lua:")
+    print("       authentication = \"thrive\"")
+    print("  4. Restart Prosody:")
+    print("       sudo systemctl restart prosody")
+    print("  5. Test login with a migrated account (same password as before)")
+    print("  6. Verify contacts appear in the roster")
+    print("  7. Verify bans are enforced")
+    print("  8. Register bot accounts if not already done:")
     print(f"       prosodyctl register assistant-bot {domain} <password>")
     print(f"       prosodyctl register helper-bot {domain} <password>")
-    print("  7. Once all users have logged in at least once, legacy hashes")
-    print("     are gone.  You can switch to authentication = \"internal_hashed\"")
-    print("     in prosody.cfg.lua for SCRAM-only auth (optional).")
-    print("  8. Once verified, the old srv/server.py can be decommissioned")
+    print("  9. Once all users have logged in at least once, legacy hashes")
+    print("     are gone.  You can switch authentication back to")
+    print("     \"internal_hashed\" for SCRAM-only auth (optional).")
+    print(" 10. Once verified, the old srv/server.py can be decommissioned")
     print()
 
 
@@ -678,9 +765,11 @@ def main():
         old_db, prosody_db, args.domain, manifest, dry_run=args.dry_run,
     )
 
-    # Step 2: Migrate contacts.
+    # Step 2: Migrate contacts (writes roster files directly to Prosody storage).
     log("Step 2: Migrating contacts to XMPP roster...")
-    migrate_contacts(old_db, args.domain, manifest, dry_run=args.dry_run)
+    migrate_contacts(
+        old_db, args.domain, args.prosody_data, manifest, dry_run=args.dry_run,
+    )
 
     # Step 3: Migrate bans.
     log("Step 3: Migrating user bans...")

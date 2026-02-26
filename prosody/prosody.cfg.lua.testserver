@@ -22,6 +22,7 @@ modules_enabled = {
     "pep";
     "register";
     "carbons";
+    "version";               -- XEP-0092: Software Version
 
     -- Standard XEPs
     "vcard_legacy";          -- XEP-0054: vCards

@@ -61,9 +61,12 @@ c2s_require_encryption = true
 s2s_require_encryption = true
 
 -- Authentication
--- Uses custom "thrive" provider for transparent argon2 → SCRAM migration.
--- Once all legacy hashes are gone, you can switch back to "internal_hashed".
-authentication = "thrive"
+-- During migration: keep "internal_hashed" so prosodyctl register works.
+-- After migration: deploy thrive-modules, switch to "thrive", restart Prosody.
+-- The "thrive" provider transparently verifies legacy argon2 hashes on first
+-- login and re-hashes to SCRAM-SHA-1.  Once all users have logged in, you
+-- can switch back to "internal_hashed" for SCRAM-only auth.
+authentication = "internal_hashed"
 
 -- Storage (default internal, can switch to sql for larger deployments)
 storage = "internal"
