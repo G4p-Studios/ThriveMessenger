@@ -89,6 +89,7 @@ http_external_url = "https://msg.thecubed.cc/"
 
 ---------- Registration ----------
 allow_registration = true
+registration_watchers = {}  -- Disable admin notifications for new registrations
 -- registration_throttle_period = 60       -- Seconds between registrations
 -- registration_throttle_max = 3           -- Max registrations per period
 

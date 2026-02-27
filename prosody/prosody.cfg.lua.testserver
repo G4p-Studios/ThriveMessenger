@@ -84,6 +84,7 @@ http_external_url = "https://xmpp.seedy.cc/"
 
 ---------- Registration ----------
 allow_registration = true
+registration_watchers = {}  -- Disable admin notifications for new registrations
 
 ---------- Thrive: Email Verification & Password Reset ----------
 thrive_smtp_server   = "smtp-auth.mythic-beasts.com"

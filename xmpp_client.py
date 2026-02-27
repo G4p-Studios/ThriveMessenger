@@ -303,54 +303,58 @@ class XMPPClient:
         requires email verification.
         """
         jid = f"{username}@{self._domain}"
-        client = slixmpp.ClientXMPP(jid, password)
-        client.register_plugin("xep_0030")
-        client.register_plugin("xep_0077")
-
         result = {"success": False, "reason": "", "verify_pending": False}
         done = threading.Event()
+        host, port, domain = self._server_host, self._server_port, self._domain
 
-        async def _do_register():
-            try:
-                reg = client.plugin["xep_0077"]
-                form = reg.get_registration()
-                # Build registration fields.
-                form_data = {"username": username, "password": password}
-                if email:
-                    form_data["email"] = email
-                resp = await reg.register(form_data)
-                result["success"] = True
-            except IqError as err:
-                condition = err.iq["error"]["condition"]
-                text = err.iq["error"].get("text", "")
-                if condition == "not-acceptable" and "verif" in text.lower():
+        def _thread_fn():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            client = slixmpp.ClientXMPP(jid, password)
+            client.register_plugin("xep_0030")
+            client.register_plugin("xep_0004")
+            client.register_plugin("xep_0066")
+            client.register_plugin("xep_0077", {"create_account": True})
+
+            async def _on_register(form):
+                """Called during stream features when server offers registration."""
+                try:
+                    iq = client.make_iq_set()
+                    iq['to'] = domain
+                    iq.enable('register')
+                    iq['register']['username'] = username
+                    iq['register']['password'] = password
+                    if email:
+                        iq['register']['email'] = email
+                    await iq.send()
                     result["success"] = True
-                    result["verify_pending"] = True
-                else:
-                    result["reason"] = text or condition
-            except IqTimeout:
-                result["reason"] = "Request timed out."
-            except Exception as exc:
-                result["reason"] = str(exc)
-            finally:
-                client.disconnect()
-                done.set()
+                except IqError as err:
+                    condition = err.iq["error"]["condition"]
+                    text = err.iq["error"].get("text", "")
+                    if condition == "not-acceptable" and "verif" in text.lower():
+                        result["success"] = True
+                        result["verify_pending"] = True
+                    else:
+                        result["reason"] = text or condition
+                except IqTimeout:
+                    result["reason"] = "Request timed out."
+                except Exception as exc:
+                    result["reason"] = str(exc)
+                finally:
+                    client.disconnect()
+                    done.set()
 
-        loop = asyncio.new_event_loop()
-        thread = threading.Thread(target=loop.run_forever, daemon=True)
-        thread.start()
-
-        try:
+            client.add_event_handler("register", _on_register)
             client.enable_direct_tls = False
             client.enable_starttls = True
-            client.connect(host=self._server_host, port=self._server_port)
-            asyncio.run_coroutine_threadsafe(_do_register(), loop)
-            done.wait(timeout=timeout)
-            if not done.is_set():
-                result["reason"] = "Registration timed out."
-        finally:
-            loop.call_soon_threadsafe(loop.stop)
-            thread.join(timeout=5)
+            client.connect(host=host, port=port)
+            loop.run_forever()
+
+        thread = threading.Thread(target=_thread_fn, daemon=True)
+        thread.start()
+        done.wait(timeout=timeout)
+        if not done.is_set():
+            result["reason"] = "Registration timed out."
 
         if result["success"]:
             return True, result
