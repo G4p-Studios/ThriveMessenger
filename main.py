@@ -82,18 +82,107 @@ if sys.platform == 'win32':
     try: ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('Thrive.Thrive_Messenger')
     except Exception: pass
 
-def load_server_config():
-    # Now reading connection details from client.conf instead of srv.conf
+def _conf_path():
+    """Return the path to client.conf (next to the running script/exe)."""
+    if getattr(sys, 'frozen', False):
+        return os.path.join(os.path.dirname(sys.executable), 'client.conf')
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'client.conf')
+
+def _load_servers_from_conf():
+    """Load the server list from [server:Name] sections in client.conf."""
     config = configparser.ConfigParser(interpolation=None)
-    config.read('client.conf')
-    # domain = XMPP domain for JIDs (VirtualHost in Prosody).
-    # host   = server hostname to connect to (may differ from domain).
-    # If domain is not set, it defaults to host.
-    host = config.get('server', 'host', fallback='msg.thecubed.cc')
+    config.read(_conf_path())
+    servers = []
+    prefix = 'server:'
+    for section in config.sections():
+        if section.startswith(prefix):
+            name = section[len(prefix):]
+            host = config.get(section, 'host', fallback='')
+            if not host:
+                continue
+            servers.append({
+                'name': name,
+                'host': host,
+                'port': config.getint(section, 'port', fallback=5222),
+                'domain': config.get(section, 'domain', fallback=host),
+                'primary': config.getboolean(section, 'primary', fallback=False),
+            })
+    # One-time migration: pull servers from user_settings.json if client.conf has none.
+    if not servers:
+        try:
+            with open(get_settings_path(), 'r') as f:
+                old = json.load(f)
+            old_servers = old.get('servers')
+            if old_servers and isinstance(old_servers, list):
+                for s in old_servers:
+                    if not s.get('host'):
+                        continue
+                    servers.append({
+                        'name': s.get('name', s['host']),
+                        'host': s['host'],
+                        'port': int(s.get('port', 5222)),
+                        'domain': s.get('domain', s['host']),
+                        'primary': bool(s.get('primary')),
+                    })
+                if servers:
+                    _save_servers_to_conf(servers)
+                    old.pop('servers', None)
+                    with open(get_settings_path(), 'w') as f:
+                        json.dump(old, f, indent=4)
+        except (OSError, json.JSONDecodeError, TypeError):
+            pass
+    # Backward compat: old client.conf with only [server] host= and no [server:*] sections.
+    if not servers and config.has_option('server', 'host'):
+        host = config.get('server', 'host')
+        servers.append({
+            'name': host,
+            'host': host,
+            'port': config.getint('server', 'port', fallback=5222),
+            'domain': config.get('server', 'domain', fallback=host),
+            'primary': True,
+        })
+    if not servers:
+        servers.append({'name': 'Official Server', 'host': 'msg.thecubed.cc', 'port': 5222, 'domain': 'msg.thecubed.cc', 'primary': True})
+    # Ensure exactly one primary.
+    if not any(s.get('primary') for s in servers):
+        servers[0]['primary'] = True
+    return servers
+
+def _save_servers_to_conf(servers):
+    """Write the server list to [server:Name] sections in client.conf."""
+    config = configparser.ConfigParser(interpolation=None)
+    config.read(_conf_path())
+    # Remove all existing [server:*] sections.
+    for section in list(config.sections()):
+        if section.startswith('server:'):
+            config.remove_section(section)
+    # Remove host/port/domain from [server] if present (now in named sections).
+    for key in ('host', 'port', 'domain'):
+        if config.has_option('server', key):
+            config.remove_option('server', key)
+    # Write named sections.
+    for srv in servers:
+        section = f"server:{srv['name']}"
+        config.add_section(section)
+        config.set(section, 'host', srv['host'])
+        config.set(section, 'port', str(srv['port']))
+        if srv.get('domain') and srv['domain'] != srv['host']:
+            config.set(section, 'domain', srv['domain'])
+        if srv.get('primary'):
+            config.set(section, 'primary', 'true')
+    with open(_conf_path(), 'w') as f:
+        config.write(f)
+
+def load_server_config():
+    """Load global connection settings and apply the primary server."""
+    config = configparser.ConfigParser(interpolation=None)
+    config.read(_conf_path())
+    servers = _load_servers_from_conf()
+    primary = next((s for s in servers if s.get('primary')), servers[0])
     return {
-        'host': host,
-        'port': config.getint('server', 'port', fallback=5222),
-        'domain': config.get('server', 'domain', fallback=host),
+        'host': primary['host'],
+        'port': primary['port'],
+        'domain': primary.get('domain', primary['host']),
         'cafile': config.get('server', 'cafile', fallback=None),
         'max_retries': config.getint('server', 'max_retries', fallback=5),
         'retry_timeout': config.getint('server', 'retry_timeout', fallback=15),
@@ -173,6 +262,7 @@ def save_user_config(settings):
     data_to_save = settings.copy()
     if 'password' in data_to_save:
         del data_to_save['password'] # Never save password to file
+    data_to_save.pop('servers', None)  # Servers live in client.conf now
 
     try:
         with open(get_settings_path(), 'w') as f:
@@ -240,16 +330,13 @@ def delete_noncontact_messages(my_username, contact):
 SERVER_CONFIG = load_server_config()
 ADDR = (SERVER_CONFIG['host'], SERVER_CONFIG['port'])
 
-def _get_servers(user_config):
-    servers = user_config.get('servers')
-    if not servers:
-        servers = [{"name": "Official Server", "host": "msg.thecubed.cc", "port": 5222, "primary": True}]
-        user_config['servers'] = servers
-    return servers
+def _get_servers():
+    """Return the server list from client.conf."""
+    return _load_servers_from_conf()
 
-def _apply_active_server(user_config):
+def _apply_active_server():
     global SERVER_CONFIG, ADDR
-    servers = _get_servers(user_config)
+    servers = _get_servers()
     primary = next((s for s in servers if s.get('primary')), servers[0])
     SERVER_CONFIG['host'] = primary['host']
     SERVER_CONFIG['port'] = primary['port']
@@ -602,7 +689,7 @@ class ClientApp(wx.App):
         except Exception:
             self._ipc_sock = None
         self.user_config = load_user_config()
-        _apply_active_server(self.user_config)
+        _apply_active_server()
         if self.user_config.get('autologin') and self.user_config.get('username') and self.user_config.get('password'):
             print("Attempting auto-login...")
             success, xmpp, _, reason = self.perform_login(self.user_config['username'], self.user_config['password'])
@@ -1021,9 +1108,9 @@ class AddServerDialog(wx.Dialog):
         self.SetEscapeId(wx.ID_CANCEL)
 
 class ServerManagerDialog(wx.Dialog):
-    def __init__(self, parent, user_config):
+    def __init__(self, parent):
         super().__init__(parent, title="Server Manager", size=(450, 300))
-        self.user_config = user_config; self.servers = [s.copy() for s in _get_servers(user_config)]
+        self.servers = [s.copy() for s in _get_servers()]
         panel = wx.Panel(self); s = wx.BoxSizer(wx.VERTICAL)
         dark_mode_on = is_windows_dark_mode()
         if dark_mode_on:
@@ -1090,8 +1177,8 @@ class ServerManagerDialog(wx.Dialog):
         self._populate_list(); self.list.Select(sel); self._update_buttons()
 
     def _on_close(self, event):
-        self.user_config['servers'] = self.servers; _apply_active_server(self.user_config)
-        save_user_config(self.user_config); self.EndModal(wx.ID_CLOSE)
+        _save_servers_to_conf(self.servers); _apply_active_server()
+        self.EndModal(wx.ID_CLOSE)
 
 class LoginDialog(wx.Dialog):
     def __init__(self, parent, user_config):
@@ -1139,7 +1226,7 @@ class LoginDialog(wx.Dialog):
         with ForgotPasswordDialog(self) as dlg: dlg.ShowModal()
 
     def on_servers(self, event):
-        with ServerManagerDialog(self, self.user_config) as dlg: dlg.ShowModal()
+        with ServerManagerDialog(self) as dlg: dlg.ShowModal()
 
     def on_create_account(self, event):
         with CreateAccountDialog(self) as dlg:
