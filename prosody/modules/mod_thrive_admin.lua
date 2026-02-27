@@ -177,7 +177,7 @@ local function cmd_exit(parts, admin_username)
     timer.add_task(shutdown_timeout, function()
         log("info", "Shutdown timer fired — closing sessions, then calling prosody.shutdown()");
         close_all_sessions("Server is shutting down.");
-        local ok, err = pcall(prosody.shutdown, "Admin shutdown by " .. admin_username);
+        local ok, err = pcall(prosody.shutdown, "Admin shutdown by " .. admin_username, 0);
         if not ok then
             log("error", "prosody.shutdown() failed: %s", tostring(err));
         end
@@ -191,10 +191,9 @@ local function cmd_restart(parts, admin_username)
     timer.add_task(shutdown_timeout, function()
         log("info", "Restart timer fired — closing sessions, forking restart helper, then shutting down");
         close_all_sessions("Server is restarting.");
-        -- Spawn restart helper in a separate systemd scope so it survives
-        -- Prosody's shutdown (systemd kills the entire cgroup on exit).
-        os.execute("systemd-run --no-block sh -c 'sleep 2; systemctl start prosody' >/dev/null 2>&1");
-        local ok, err = pcall(prosody.shutdown, "Admin restart by " .. admin_username);
+        -- Exit with code 1 so systemd (Restart=on-failure) brings Prosody back.
+        -- /exit uses code 0, so systemd leaves it stopped.
+        local ok, err = pcall(prosody.shutdown, "Admin restart by " .. admin_username, 1);
         if not ok then
             log("error", "prosody.shutdown() failed during restart: %s", tostring(err));
         end

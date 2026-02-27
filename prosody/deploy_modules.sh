@@ -30,6 +30,16 @@ cp "$SCRIPT_DIR"/prosody.cfg.lua.testserver /etc/prosody/prosody.cfg.lua
 chown prosody:prosody /etc/prosody/prosody.cfg.lua
 echo "  Done."
 
+echo "=== Ensuring systemd Restart=on-failure for /restart command ==="
+mkdir -p /etc/systemd/system/prosody.service.d
+cat > /etc/systemd/system/prosody.service.d/restart.conf <<'UNIT'
+[Service]
+Restart=on-failure
+RestartSec=2
+UNIT
+systemctl daemon-reload
+echo "  Done."
+
 echo "=== Clearing old error log ==="
 > /var/log/prosody/prosody.err
 echo "  Done."
