@@ -683,6 +683,9 @@ class ClientApp(wx.App):
             xmpp.set_status(self.frame.current_status)
         self.play_sound("login.wav")
         self.frame.on_check_updates(silent=True)
+        # Re-deliver roster — the initial delivery in _on_session_start may
+        # have fired before callbacks were registered (race condition).
+        xmpp.request_roster()
 
     def _register_xmpp_callbacks(self, xmpp):
         """Wire all XMPP event callbacks to the wx main thread."""
@@ -1478,14 +1481,34 @@ class MainFrame(wx.Frame):
         ver = info.get("server_version", "")
         sw_os = info.get("server_os", "")
         features = info.get("features", [])
+        size_limit = info.get("file_size_limit", 0)
+        size_str = format_size(size_limit) if size_limit else "N/A"
         rows = [
             ("Hostname", info.get("hostname", SERVER_CONFIG['host'])),
+            ("Port", str(info.get("port", SERVER_CONFIG['port']))),
             ("Server Software", f"{sw} {ver}".strip()),
             ("Encrypted", "Yes"),
         ]
         if sw_os:
             rows.append(("Server OS", sw_os))
-        rows.append(("Supported Features", str(len(features))))
+        rows.append(("Registered Users", str(info.get("total_users", "N/A"))))
+        rows.append(("Users Online", str(info.get("online_users", "N/A"))))
+        rows.append(("File Size Limit", size_str))
+        # Translate XMPP feature URIs to human-readable names.
+        _feature_names = {
+            "urn:xmpp:http:upload:0": "File Upload",
+            "urn:xmpp:mam:2": "Message Archive",
+            "urn:xmpp:blocking": "Contact Blocking",
+            "urn:xmpp:carbons:2": "Message Carbons",
+            "urn:xmpp:ping": "Server Ping",
+            "jabber:iq:register": "In-Band Registration",
+            "jabber:iq:version": "Software Version",
+            "vcard-temp": "vCards",
+            "msgoffline": "Offline Messages",
+        }
+        known = [_feature_names[f] for f in features if f in _feature_names]
+        if known:
+            rows.append(("Features", ", ".join(sorted(known))))
         with ServerInfoDialog(self, rows) as dlg: dlg.ShowModal()
     def on_user_directory_response_xmpp(self, users):
         """Handle user directory from XMPP custom IQ."""

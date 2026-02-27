@@ -628,9 +628,12 @@ class XMPPClient:
             log.warning("MAM query failed: %s", exc)
 
     async def _async_get_server_info(self):
-        """Query server version and disco info."""
+        """Query server version, disco info, and user directory for stats."""
         try:
-            info = {"hostname": self._domain}
+            info = {
+                "hostname": self._domain,
+                "port": self._server_port,
+            }
 
             # XEP-0092: Software Version
             try:
@@ -644,13 +647,46 @@ class XMPPClient:
             except Exception:
                 pass
 
-            # XEP-0030: Disco info for feature list
+            # XEP-0030: Disco info for feature list + file upload limit
             try:
                 disco = await self._client.plugin["xep_0030"].get_info(
                     self._domain, timeout=10
                 )
                 features = [f for f in disco["disco_info"]["features"]]
                 info["features"] = features
+
+                # Extract max-file-size from the raw XML (XEP-0128 extended info).
+                ns_data = "jabber:x:data"
+                for x_form in disco.xml.iter(f"{{{ns_data}}}x"):
+                    for field in x_form.iter(f"{{{ns_data}}}field"):
+                        if field.get("var") == "max-file-size":
+                            val_el = field.find(f"{{{ns_data}}}value")
+                            if val_el is not None and val_el.text:
+                                try:
+                                    info["file_size_limit"] = int(val_el.text)
+                                except (ValueError, TypeError):
+                                    pass
+            except Exception:
+                pass
+
+            # User directory: get total/online user counts.
+            try:
+                ns = "urn:thrive:directory"
+                iq = self._client.make_iq_get(
+                    queryxmlns=ns, ito=self._domain
+                )
+                resp = await iq.send(timeout=10)
+                directory = resp.xml.find(f"{{{ns}}}directory")
+                if directory is not None:
+                    total = 0
+                    online = 0
+                    for user_el in directory.findall(f"{{{ns}}}user"):
+                        total += 1
+                        status = user_el.findtext(f"{{{ns}}}status", "offline")
+                        if status != "offline":
+                            online += 1
+                    info["total_users"] = total
+                    info["online_users"] = online
             except Exception:
                 pass
 
