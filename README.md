@@ -124,8 +124,6 @@ When you log into Thrive Messenger, you will land on your contact list. Of cours
 * Alt + F will allow you to send a file to the focused contact.
 *   You can delete the focused contact with the Delete button or Alt + D.
 *   The Use Server Side Commands (Alt + V) button will allow you to perform various server side commands; more on these later.
-*   Bot Rules Manager is available from File menu, Settings > Administration, and Server Side Commands. Admins can load, edit, and reset bot rules without editing files manually.
-*   Directory can optionally allow direct messaging users on other configured servers. If duplicate usernames exist across servers, the client lets you choose which server user to message and remembers that default.
 *   The logout (Alt + O) and exit (Alt + X) buttons are self explanatory.
 * The server info button (Alt + I) will show information about the server you're currently logged into.
 * Alt + U will allow you to set an online status that your contacts will see. You can choose from a list of preset statuses, such as online, offline and busy, or you can choose a custom one and type a personal message. Server owners can customize the character limit for custom statuses via max_status_length, so check that you have enough characters before you start setting System of a Down lyrics as your status.
@@ -133,6 +131,8 @@ When you log into Thrive Messenger, you will land on your contact list. Of cours
 * Pressing Alt F4 will minimize the client to the system tray, ready for you to receive messages. Simply double click or press Enter on the Thrive Messenger system tray item to bring it back up.
 
 ### Sending and receiving messages
+
+All messages are end-to-end encrypted using OMEMO (XEP-0384). Encryption keys are generated automatically on first login and exchanged via PEP/PubSub — no manual key setup is needed. Both sides of a conversation must have logged in at least once for encryption to work.
 
 You can start an IM conversation with a contact simply by pressing Enter on them in the contact list. Once you do, you will land on a text field where you can type your message. Pressing Enter will send the message, and pressing Shift + Enter will type a new line. Pressing Shift + Tab once will take you to a checkbox which will allow you to save a permanent log of your chat with the current contact, stored in Documents/ThriveMessenger/chats/<contact>. Pressing Shift + Tab again will show a list of all messages sent and received in the chat. Use the up and down arrow keys to navigate this list. To get out of the chat and go back to the main Thrive Messenger window, simply press the Escape key.
 
@@ -161,60 +161,7 @@ Each server side command must start with a forward slash (/). The following serv
 
 Shift Tabbing once from the command input field will show a list of outputs for the commands you've run.
 
-### Bot rules and agent rulesets
-
-Thrive bots can follow a shared agent ruleset loaded from an agent ZIP (for example `/home/devinecr/downloads/*.zip`), and server admins can override rules per bot for their own admin account/server workflow.
-
-Key behavior:
-
-* Global fallback rules are loaded from the configured agent ZIP/file.
-* Admin-specific bot rules are seeded from global rules on first use.
-* Admins can edit and save their own bot rule override from the client UI.
-* Non-admin users can view active bot rules, but cannot edit them.
-* Reset action restores a bot back to global seeded rules for that admin scope.
-
-### Advanced group chat policy controls
-
-Server admins can define advanced group chat/call policies globally and per group.
-
-Managed in client UI:
-
-* File menu: `Manage Group Policy`
-* Settings -> Administration -> `Open Group Policy Manager`
-* Server Side Commands window -> `Manage Group Policy`
-
-Examples of policy controls:
-
-* Group text, links, files, voice/video/screen share permissions
-* Member invite, pin, and channel-creation permissions
-* Message length limits, attachments per message, max file size
-* Group participants limit and concurrent voice limit
-* Slow mode, rate limits, and retention settings
-
-Admin command shortcuts:
-
-* `/gpolicy keys`
-* `/gpolicy show [group_name]`
-* `/gpolicy set <key> <value> [group_name]`
-* `/gpolicy reset [group_name]`
-
-### In-app F1 webview documentation generation
-
-This repo includes an Ollama-based generator for contextual in-app help pages used by F1 dialogs/webviews.
-
-Generate help templates:
-
-```bash
-python3 scripts/generate_help_docs_with_ollama.py
-```
-
-Output:
-
-* `assets/help/help_docs.json`
-
-The app loads these templates at runtime and writes per-context HTML help pages from them.
-
-Those of you familiar with IRC will know that this feature was very much inspired by the concept of server and channel operator commands.
+Those of you familiar with IRC will know that slash commands were very much inspired by IRC's server and channel operator commands.
 
 ### Sound packs
 
@@ -315,11 +262,18 @@ Thrive Messenger uses [Prosody](https://prosody.im), an open-source XMPP server,
     git clone https://github.com/G4p-Studios/ThriveMessenger
     ```
 
-3. Copy the Thrive custom modules to the Prosody modules directory.
+3. Deploy the Thrive custom modules and Prosody configuration. A deployment script is provided that copies modules, the config, and sets up the systemd restart override.
 
     ```
-    sudo cp ThriveMessenger/prosody/modules/*.lua /etc/prosody/thrive-modules/
+    sudo bash ThriveMessenger/prosody/deploy_modules.sh
+    ```
+
+    Alternatively, you can deploy manually:
+
+    ```
     sudo mkdir -p /etc/prosody/thrive-modules
+    sudo cp ThriveMessenger/prosody/modules/*.lua /etc/prosody/thrive-modules/
+    sudo cp ThriveMessenger/prosody/modules/verify_argon2.py /etc/prosody/thrive-modules/
     ```
 
 4. Copy the example Prosody configuration and edit it to match your domain.
@@ -438,33 +392,59 @@ Thrive Messenger supports AI-powered bots that connect to the server as regular 
 
 ### Migrating from the legacy server
 
-If you are migrating from the old custom Python server (`srv/server.py`), a migration script is provided to transfer your user accounts, contacts, bans, and admin list to Prosody.
+If you are migrating from the old custom Python server (`srv/server.py`), a migration script is provided to transfer your user accounts, contacts, bans, and admin list to Prosody. A wrapper script (`migrate.sh`) simplifies the process.
 
-1. Make sure Prosody is installed and running.
+1. Make sure Prosody is installed and running with `authentication = "internal_hashed"` (the default in the provided config).
 
-2. Preview the migration with `--dry-run` first.
+2. Preview the migration with a dry run first.
 
     ```
-    python3 srv/migrate_accounts.py --old-db srv/thrive.db --prosody-db /var/lib/prosody/thrive.db --domain chat.example.com --dry-run
+    bash migrate.sh -d
     ```
+
+    The script auto-detects your XMPP domain from `prosody.cfg.lua` and locates the legacy `thrive.db` in the repo. You can override these with environment variables: `DOMAIN=example.com OLD_DB=/path/to/thrive.db bash migrate.sh`
 
 3. Run the migration for real. The script automatically backs up Prosody's data directory and thrive.db before making any changes, and writes a JSON manifest recording every action taken.
 
     ```
-    python3 srv/migrate_accounts.py --old-db srv/thrive.db --prosody-db /var/lib/prosody/thrive.db --domain chat.example.com
+    bash migrate.sh
     ```
 
-4. If something goes wrong, roll back using the manifest file printed at the end.
+4. If accounts are already migrated but you need to re-run just the contacts migration:
 
     ```
-    python3 srv/migrate_accounts.py --rollback migration-manifest-20260226-153012.json
+    bash migrate.sh -c
     ```
 
-    This deletes all created Prosody accounts, removes roster entries, and clears the thrive.db tables that were populated. A pre-migration backup is also available in the backup directory for manual restoration if needed.
+5. If something goes wrong, roll back using a manifest file.
 
-5. Users keep their existing passwords. The custom auth module (`mod_auth_thrive`) transparently verifies against the old argon2 hashes on first login and re-hashes to Prosody's native SCRAM format. No password reset is needed.
+    ```
+    bash migrate.sh -r migration-manifest-20260226-153012.json
+    ```
 
-6. Once all users have logged in at least once, you can optionally switch `authentication` in `prosody.cfg.lua` from `"thrive"` back to `"internal_hashed"` for SCRAM-only auth.
+    This deletes all created Prosody accounts, removes roster files, and clears the thrive.db tables that were populated. A pre-migration backup is also available in the backup directory for manual restoration if needed.
+
+6. Deploy the custom modules (including the auth module) and fix file ownership.
+
+    ```
+    sudo bash prosody/deploy_modules.sh
+    ```
+
+7. Switch authentication to the Thrive provider in `prosody.cfg.lua`.
+
+    ```lua
+    authentication = "thrive"
+    ```
+
+8. Restart Prosody.
+
+    ```
+    sudo systemctl restart prosody
+    ```
+
+9. Users keep their existing passwords. The custom auth module (`mod_auth_thrive`) transparently verifies against the old argon2 hashes on first login and re-hashes to Prosody's native SCRAM format. No password reset is needed. Make sure `argon2-cffi` is installed on the server: `pip3 install argon2-cffi`.
+
+10. Once all users have logged in at least once, you can optionally switch `authentication` in `prosody.cfg.lua` from `"thrive"` back to `"internal_hashed"` for SCRAM-only auth.
 
 * * *
 
