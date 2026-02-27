@@ -494,7 +494,9 @@ class XMPPClient:
             self._client.register_plugin("xep_0092")  # Software Version
             self._client.register_plugin("xep_0184")  # Message Delivery Receipts
             self._client.register_plugin("xep_0191")  # Blocking Command
-            self._client.register_plugin("xep_0199")  # Ping
+            self._client.register_plugin("xep_0199", {  # Ping + keepalive
+                "keepalive": True, "interval": 60, "timeout": 15,
+            })
             self._client.register_plugin("xep_0313")  # Message Archive Management
             self._client.register_plugin("xep_0363")  # HTTP File Upload
             self._client.register_plugin("xep_0380")  # Explicit Message Encryption

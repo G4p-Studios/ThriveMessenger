@@ -155,11 +155,28 @@ end
 -- Each receives (parts, admin_username) and returns a response string.
 -- ---------------------------------------------------------------------------
 
+--- Close all client sessions on this host with a stream error.
+-- This ensures clients detect the disconnect immediately rather than
+-- waiting for TCP keepalives to notice the dead connection.
+local function close_all_sessions(reason_text)
+    local sessions = prosody.hosts[host] and prosody.hosts[host].sessions;
+    if not sessions then return; end
+    for username, user_sessions in pairs(sessions) do
+        for resource, session in pairs(user_sessions.sessions or {}) do
+            session:close({
+                condition = "system-shutdown",
+                text = reason_text or "Server is shutting down.",
+            });
+        end
+    end
+end
+
 local function cmd_exit(parts, admin_username)
     log("info", "Shutdown initiated by admin: %s", admin_username);
     broadcast_alert("The server is shutting down in " .. shutdown_timeout .. " seconds.");
     timer.add_task(shutdown_timeout, function()
-        log("info", "Shutdown timer fired — calling prosody.shutdown()");
+        log("info", "Shutdown timer fired — closing sessions, then calling prosody.shutdown()");
+        close_all_sessions("Server is shutting down.");
         local ok, err = pcall(prosody.shutdown, "Admin shutdown by " .. admin_username);
         if not ok then
             log("error", "prosody.shutdown() failed: %s", tostring(err));
@@ -172,7 +189,8 @@ local function cmd_restart(parts, admin_username)
     log("info", "Restart initiated by admin: %s", admin_username);
     broadcast_alert("The server is restarting in " .. shutdown_timeout .. " seconds.");
     timer.add_task(shutdown_timeout, function()
-        log("info", "Restart timer fired — forking restart helper, then shutting down");
+        log("info", "Restart timer fired — closing sessions, forking restart helper, then shutting down");
+        close_all_sessions("Server is restarting.");
         -- Fork a helper that waits for Prosody to stop, then starts it again.
         -- Try systemctl first (when running as a systemd service), fall back to prosodyctl.
         os.execute("(sleep 2 && (systemctl start prosody 2>/dev/null || /usr/bin/prosodyctl start)) &");
