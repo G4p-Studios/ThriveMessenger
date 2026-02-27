@@ -694,7 +694,7 @@ class ClientApp(wx.App):
             print("Attempting auto-login...")
             success, xmpp, _, reason = self.perform_login(self.user_config['username'], self.user_config['password'])
             if success: self.start_main_session(self.user_config['username'], xmpp); return True
-            else: wx.MessageBox(f"Auto-login failed: {reason}", "Login Failed", wx.ICON_ERROR); self.user_config['autologin'] = False; save_user_config(self.user_config)
+            else: wx.MessageBox(f"Auto-login failed: {reason}", "Login Failed", wx.ICON_ERROR)
         return self.show_login_dialog()
     
     def _ipc_listener(self):
