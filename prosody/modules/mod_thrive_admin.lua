@@ -191,9 +191,9 @@ local function cmd_restart(parts, admin_username)
     timer.add_task(shutdown_timeout, function()
         log("info", "Restart timer fired — closing sessions, forking restart helper, then shutting down");
         close_all_sessions("Server is restarting.");
-        -- Fork a fully detached helper that waits for Prosody to stop, then starts it.
-        -- nohup + redirects ensure it survives the parent process exiting.
-        os.execute("nohup sh -c 'sleep 2; systemctl start prosody 2>/dev/null || /usr/bin/prosodyctl start' >/dev/null 2>&1 &");
+        -- Spawn restart helper in a separate systemd scope so it survives
+        -- Prosody's shutdown (systemd kills the entire cgroup on exit).
+        os.execute("systemd-run --no-block sh -c 'sleep 2; systemctl start prosody' >/dev/null 2>&1");
         local ok, err = pcall(prosody.shutdown, "Admin restart by " .. admin_username);
         if not ok then
             log("error", "prosody.shutdown() failed during restart: %s", tostring(err));
