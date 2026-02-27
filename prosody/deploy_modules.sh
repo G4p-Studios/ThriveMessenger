@@ -34,7 +34,8 @@ echo "=== Ensuring systemd Restart=on-failure for /restart command ==="
 mkdir -p /etc/systemd/system/prosody.service.d
 cat > /etc/systemd/system/prosody.service.d/restart.conf <<'UNIT'
 [Service]
-Restart=on-failure
+Restart=always
+RestartPreventExitStatus=0
 RestartSec=2
 UNIT
 systemctl daemon-reload

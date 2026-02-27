@@ -189,14 +189,16 @@ local function cmd_restart(parts, admin_username)
     log("info", "Restart initiated by admin: %s", admin_username);
     broadcast_alert("The server is restarting in " .. shutdown_timeout .. " seconds.");
     timer.add_task(shutdown_timeout, function()
-        log("info", "Restart timer fired — closing sessions, forking restart helper, then shutting down");
+        log("info", "Restart timer fired — closing sessions, then exiting with code 1");
         close_all_sessions("Server is restarting.");
-        -- Exit with code 1 so systemd (Restart=on-failure) brings Prosody back.
-        -- /exit uses code 0, so systemd leaves it stopped.
-        local ok, err = pcall(prosody.shutdown, "Admin restart by " .. admin_username, 1);
-        if not ok then
-            log("error", "prosody.shutdown() failed during restart: %s", tostring(err));
-        end
+        -- prosody.shutdown() may not honour the exit code, so set it manually
+        -- and then force os.exit(1) to ensure systemd sees a non-zero exit.
+        prosody.shutdown_reason = "Admin restart by " .. admin_username;
+        prosody.shutdown_code = 1;
+        -- Force non-zero exit so systemd (Restart=always + RestartPreventExitStatus=0)
+        -- brings Prosody back. os.exit bypasses clean shutdown but sessions are
+        -- already closed above.
+        os.exit(1);
     end);
     return "Server restarting in " .. shutdown_timeout .. " seconds...";
 end
