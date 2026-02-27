@@ -926,6 +926,7 @@ class XMPPClient:
         # Server alerts arrive as headline messages (e.g. broadcast from admin).
         if msg["type"] == "headline":
             body = msg["body"]
+            log.info("Received headline message from %s: %s", msg["from"], body)
             if body and self.on_server_alert:
                 self.on_server_alert(str(body))
             return

@@ -159,7 +159,11 @@ local function cmd_exit(parts, admin_username)
     log("info", "Shutdown initiated by admin: %s", admin_username);
     broadcast_alert("The server is shutting down in " .. shutdown_timeout .. " seconds.");
     timer.add_task(shutdown_timeout, function()
-        prosody.shutdown("Admin shutdown by " .. admin_username, 0);
+        log("info", "Shutdown timer fired — calling prosody.shutdown()");
+        local ok, err = pcall(prosody.shutdown, "Admin shutdown by " .. admin_username);
+        if not ok then
+            log("error", "prosody.shutdown() failed: %s", tostring(err));
+        end
     end);
     return "Server shutting down in " .. shutdown_timeout .. " seconds...";
 end
@@ -168,7 +172,14 @@ local function cmd_restart(parts, admin_username)
     log("info", "Restart initiated by admin: %s", admin_username);
     broadcast_alert("The server is restarting in " .. shutdown_timeout .. " seconds.");
     timer.add_task(shutdown_timeout, function()
-        os.execute("prosodyctl restart &");
+        log("info", "Restart timer fired — forking restart helper, then shutting down");
+        -- Fork a helper that waits for Prosody to stop, then starts it again.
+        -- Try systemctl first (when running as a systemd service), fall back to prosodyctl.
+        os.execute("(sleep 2 && (systemctl start prosody 2>/dev/null || /usr/bin/prosodyctl start)) &");
+        local ok, err = pcall(prosody.shutdown, "Admin restart by " .. admin_username);
+        if not ok then
+            log("error", "prosody.shutdown() failed during restart: %s", tostring(err));
+        end
     end);
     return "Server restarting in " .. shutdown_timeout .. " seconds...";
 end
