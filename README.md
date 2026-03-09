@@ -188,7 +188,7 @@ Shift Tabbing once from the command input field will show a list of outputs for 
 
 ### Bot rules and agent rulesets
 
-Thrive bots can follow a shared agent ruleset loaded from an agent ZIP (for example `/home/devinecr/downloads/*.zip`), and server admins can override rules per bot for their own admin account/server workflow.
+Thrive bots can follow a shared agent ruleset loaded from an agent ZIP (for example `/home/<current-user>/shared/agents/*.zip`), and server admins can override rules per bot for their own admin account/server workflow.
 
 Key behavior:
 
@@ -287,8 +287,8 @@ You can also control update sources in `client.conf`:
 ```
 [updates]
 feed_url = https://im.tappedin.fm/updates/latest.json
-preferred_repo = G4p-Studios/ThriveMessenger
-fallback_repos = Raywonder/ThriveMessenger
+preferred_repo = Raywonder/ThriveMessenger
+fallback_repos =
 ```
 
 - `feed_url` is optional. If set, the client checks your hosted feed first.

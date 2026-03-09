@@ -392,6 +392,7 @@ def load_user_config():
         'incoming_popup_on_message': False,
         'incoming_alert_on_message': False,
         'incoming_message_behavior': 'silent_count',
+        'notify_on_other_device_login': False,
         'message_timestamp_mode': 'start',
         'saved_history_date_order': 'mdy',
         'passkey_ids': {},
@@ -439,6 +440,7 @@ def load_user_config():
         settings['directory_dm_defaults'] = {}
     settings['incoming_popup_on_message'] = bool(settings.get('incoming_popup_on_message', False))
     settings['incoming_alert_on_message'] = bool(settings.get('incoming_alert_on_message', False))
+    settings['notify_on_other_device_login'] = bool(settings.get('notify_on_other_device_login', False))
     incoming_behavior = str(settings.get('incoming_message_behavior', '') or '').strip().lower()
     valid_incoming_behaviors = ('popup', 'notify', 'do_nothing', 'play_sound', 'silent_count')
     if incoming_behavior not in valid_incoming_behaviors:
@@ -967,15 +969,15 @@ def _load_update_settings():
     cfg = configparser.ConfigParser(interpolation=None)
     cfg.read('client.conf')
     update_feed_url = cfg.get('updates', 'feed_url', fallback='').strip()
-    preferred_repo = cfg.get('updates', 'preferred_repo', fallback='G4p-Studios/ThriveMessenger').strip()
-    fallback_repos = [x.strip() for x in cfg.get('updates', 'fallback_repos', fallback='Raywonder/ThriveMessenger').split(',') if x.strip()]
+    preferred_repo = cfg.get('updates', 'preferred_repo', fallback='Raywonder/ThriveMessenger').strip()
+    fallback_repos = [x.strip() for x in cfg.get('updates', 'fallback_repos', fallback='').split(',') if x.strip()]
     repos = []
     for candidate in [preferred_repo] + fallback_repos:
         if '/' in candidate and candidate not in repos:
             repos.append(candidate)
     return {
         "feed_url": update_feed_url,
-        "repos": repos or ["G4p-Studios/ThriveMessenger", "Raywonder/ThriveMessenger"],
+        "repos": repos or ["Raywonder/ThriveMessenger"],
     }
 
 def get_program_dir():
@@ -1384,6 +1386,11 @@ class SettingsDialog(wx.Dialog):
         self.announce_typing_cb.SetValue(bool(self.config.get('announce_typing', True)))
         self.prefer_display_names_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Prefer contact display names in chat and contacts")
         self.prefer_display_names_cb.SetValue(bool(self.config.get('prefer_contact_display_names', False)))
+        self.notify_other_device_login_cb = wx.CheckBox(
+            accessibility_box.GetStaticBox(),
+            label="Notify me when this account signs in from another device",
+        )
+        self.notify_other_device_login_cb.SetValue(bool(self.config.get('notify_on_other_device_login', False)))
         incoming_row = wx.BoxSizer(wx.HORIZONTAL)
         incoming_row.Add(wx.StaticText(accessibility_box.GetStaticBox(), label="Incoming message behavior:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
         self.incoming_behavior_choice = wx.Choice(accessibility_box.GetStaticBox(), choices=[
@@ -1466,11 +1473,11 @@ class SettingsDialog(wx.Dialog):
         feed_row.Add(self.admin_feed_txt, 1, wx.EXPAND)
         pref_row = wx.BoxSizer(wx.HORIZONTAL)
         pref_row.Add(wx.StaticText(admin_box.GetStaticBox(), label="Preferred repo:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
-        self.admin_pref_repo_txt = wx.TextCtrl(admin_box.GetStaticBox(), value=cfg.get('updates', 'preferred_repo', fallback='G4p-Studios/ThriveMessenger'))
+        self.admin_pref_repo_txt = wx.TextCtrl(admin_box.GetStaticBox(), value=cfg.get('updates', 'preferred_repo', fallback='Raywonder/ThriveMessenger'))
         pref_row.Add(self.admin_pref_repo_txt, 1, wx.EXPAND)
         fallback_row = wx.BoxSizer(wx.HORIZONTAL)
         fallback_row.Add(wx.StaticText(admin_box.GetStaticBox(), label="Fallback repos:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
-        self.admin_fallback_txt = wx.TextCtrl(admin_box.GetStaticBox(), value=cfg.get('updates', 'fallback_repos', fallback='Raywonder/ThriveMessenger'))
+        self.admin_fallback_txt = wx.TextCtrl(admin_box.GetStaticBox(), value=cfg.get('updates', 'fallback_repos', fallback=''))
         fallback_row.Add(self.admin_fallback_txt, 1, wx.EXPAND)
         self.restart_after_save_cb = wx.CheckBox(admin_box.GetStaticBox(), label="Restart server after saving admin settings")
         self.restart_after_save_cb.SetValue(False)
@@ -1510,6 +1517,7 @@ class SettingsDialog(wx.Dialog):
         accessibility_box.Add(self.typing_indicator_cb, 0, wx.ALL, 5)
         accessibility_box.Add(self.announce_typing_cb, 0, wx.ALL, 5)
         accessibility_box.Add(self.prefer_display_names_cb, 0, wx.ALL, 5)
+        accessibility_box.Add(self.notify_other_device_login_cb, 0, wx.ALL, 5)
         accessibility_box.Add(incoming_row, 0, wx.EXPAND | wx.ALL, 5)
         accessibility_box.Add(timestamp_row, 0, wx.EXPAND | wx.ALL, 5)
         accessibility_box.Add(date_group_row, 0, wx.EXPAND | wx.ALL, 5)
@@ -2239,7 +2247,20 @@ class ClientApp(wx.App):
             self.sock.sendall((json.dumps({"action": "get_feature_caps"}) + "\n").encode())
         except Exception:
             pass
+        self.sync_session_preferences()
         self.frame.on_check_updates(silent=True)
+
+    def sync_session_preferences(self):
+        sock = getattr(self, "sock", None)
+        if not sock:
+            return
+        try:
+            sock.sendall((json.dumps({
+                "action": "set_session_pref",
+                "notify_on_other_device_login": bool(self.user_config.get("notify_on_other_device_login", False)),
+            }) + "\n").encode())
+        except Exception:
+            pass
 
     def _resolved_sound_pack(self):
         selected = str(self.user_config.get('soundpack', 'default') or 'default').strip().lower()
@@ -2315,6 +2336,7 @@ class ClientApp(wx.App):
                     elif act == "user_directory_response": wx.CallAfter(self.frame.on_user_directory_response, msg)
                     elif act == "admin_status_change": wx.CallAfter(self.frame.on_admin_status_change, msg.get("user"), msg.get("is_admin"))
                     elif act == "server_alert": wx.CallAfter(self.frame.on_server_alert, msg.get("message", ""))
+                    elif act == "other_device_login": wx.CallAfter(self.frame.on_other_device_login, msg)
                     elif act == "typing": wx.CallAfter(self.frame.on_typing_event, msg)
                     elif act == "file_offer": wx.CallAfter(self.on_file_offer, msg)
                     elif act == "file_offer_failed": wx.CallAfter(self.on_file_offer_failed, msg)
@@ -4311,6 +4333,7 @@ class MainFrame(wx.Frame):
                 app.user_config['typing_indicators'] = dlg.typing_indicator_cb.IsChecked()
                 app.user_config['announce_typing'] = dlg.announce_typing_cb.IsChecked()
                 app.user_config['prefer_contact_display_names'] = dlg.prefer_display_names_cb.IsChecked()
+                app.user_config['notify_on_other_device_login'] = dlg.notify_other_device_login_cb.IsChecked()
                 incoming_behavior_map = {0: 'popup', 1: 'notify', 2: 'do_nothing', 3: 'play_sound', 4: 'silent_count'}
                 incoming_behavior = incoming_behavior_map.get(dlg.incoming_behavior_choice.GetSelection(), 'silent_count')
                 app.user_config['incoming_message_behavior'] = incoming_behavior
@@ -4332,6 +4355,7 @@ class MainFrame(wx.Frame):
                 if can_admin_settings:
                     ok_admin, admin_err = dlg.apply_admin_config()
                 save_user_config(app.user_config)
+                app.sync_session_preferences()
                 self.apply_action_button_layout()
                 self._apply_search_filter()
                 restart_req, restart_delay = dlg.restart_requested()
@@ -4667,7 +4691,7 @@ class MainFrame(wx.Frame):
                 asset_url = UPDATE_CONTEXT.get("installer_url") if use_installer else (UPDATE_CONTEXT.get("win_zip_url") or UPDATE_CONTEXT.get("zip_url"))
 
         if not asset_url:
-            repo = UPDATE_CONTEXT.get("repo") if UPDATE_CONTEXT.get("repo") else "G4p-Studios/ThriveMessenger"
+            repo = UPDATE_CONTEXT.get("repo") if UPDATE_CONTEXT.get("repo") else "Raywonder/ThriveMessenger"
             api_url = f"https://api.github.com/repos/{repo}/releases/tags/{tag}"
             try:
                 req = urllib.request.Request(api_url, headers={"Accept": "application/vnd.github+json", "User-Agent": "ThriveMessenger/" + VERSION_TAG})
@@ -4804,6 +4828,11 @@ class MainFrame(wx.Frame):
     def on_server_alert(self, message):
         wx.GetApp().play_sound("receive.wav")
         show_notification("Server Alert", message, timeout=8)
+    def on_other_device_login(self, msg):
+        ip = str(msg.get("ip", "") or "").strip()
+        suffix = f" (IP: {ip})" if ip else ""
+        wx.GetApp().play_sound("receive.wav")
+        show_notification("Account Sign-In Alert", f"This account signed in from another device{suffix}.", timeout=8)
     def on_file_transfers(self, _):
         with FileTransfersDialog(self, wx.GetApp().transfer_history) as dlg:
             dlg.ShowModal()
