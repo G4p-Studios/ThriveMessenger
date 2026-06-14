@@ -1156,24 +1156,32 @@ def handle_client(cs, addr):
                     con.commit()
                     expire_human = smtp_config.get('code_expires_human', '5 minutes')
                     EmailManager.send_email(t_email, "Thrive Messenger - Password Reset", f"Your password reset code is: {code}\n\nThis code will expire in {expire_human}.")
-                    # Return OK even if email fails to prevent enumeration, mostly.
-                    sock.sendall(json.dumps({"status": "ok", "user": t_user}).encode() + b"\n")
-                else:
-                    sock.sendall(json.dumps({"status": "error", "reason": "No email on file."}).encode() + b"\n")
-            else:
-                # Security: Don't reveal user existence? For this app, we'll just say ok to pretend.
-                sock.sendall(json.dumps({"status": "ok"}).encode() + b"\n")
             con.close()
+            # Always answer the same way regardless of whether the identifier
+            # matched a user, whether that user had an email on file, or whether
+            # the email was actually deliverable. This prevents enumeration of
+            # usernames and of which-email-belongs-to-which-account.
+            sock.sendall(json.dumps({"status": "ok"}).encode() + b"\n")
             return
 
         # --- Perform Password Reset ---
         if action == "reset_password":
-            t_user = req.get("user")
+            t_ident = req.get("user")
             t_code = req.get("code")
             new_p = req.get("new_pass")
             con = sqlite3.connect(DB)
-            row = con.execute("SELECT reset_code, reset_code_at FROM users WHERE username=?", (t_user,)).fetchone()
-            if row and row[0] == t_code and t_code:
+            # Accept either username or email as the identifier so we don't have to
+            # leak which one was used in request_reset.
+            row = con.execute(
+                "SELECT username, reset_code, reset_code_at FROM users WHERE username=? OR email=?",
+                (t_ident, t_ident),
+            ).fetchone()
+            if row:
+                t_user = row[0]
+                row = (row[1], row[2])
+            else:
+                t_user = None
+            if t_user and row and row[0] == t_code and t_code:
                 # Check expiration
                 if row[1]:
                     elapsed = (datetime.datetime.utcnow() - datetime.datetime.fromisoformat(row[1])).total_seconds()
@@ -1201,9 +1209,14 @@ def handle_client(cs, addr):
             recipient = transfer["to"]
             with lock: sock_to = clients.get(recipient)
             if sock_to:
-                name_map = {f["filename"]: f["filename"] for f in transfer["files"]}
-                safe_files = [dict(fd, filename=name_map.get(fd["filename"], fd["filename"])) for fd in req.get("files", [])
-                              if '/' not in fd["filename"] and '\\' not in fd["filename"]]
+                # Only forward filenames that were declared and approved in the
+                # original file_offer. This shuts down any attempt by the sender
+                # to swap in a different (e.g., path-traversing) name on the
+                # second connection.
+                allowed_names = {f["filename"] for f in transfer["files"]}
+                safe_files = [fd for fd in req.get("files", [])
+                              if isinstance(fd.get("filename"), str)
+                              and fd["filename"] in allowed_names]
                 try: sock_to.sendall((json.dumps({"action": "file_data", "from": transfer["from"], "files": safe_files}) + "\n").encode())
                 except: pass
             sock.sendall(b'{"status":"ok"}\n')
@@ -2044,7 +2057,15 @@ def handle_client(cs, addr):
                     sock.sendall((json.dumps({"action": "group_call_signal_result", "ok": False, "reason": "Signal relay failed."}) + "\n").encode())
 
             elif action == "msg":
-                to, frm = msg["to"], msg["from"]
+                # Always treat the authenticated session user as the sender.
+                # Never trust a client-supplied "from" — that allowed any logged-in
+                # user to impersonate any other user.
+                to = msg.get("to")
+                frm = user
+                msg["from"] = user
+                if not to or not isinstance(to, str):
+                    sock.sendall(json.dumps({"action": "msg_failed", "to": to, "reason": "Missing recipient."}).encode() + b"\n")
+                    continue
                 if _is_registered_bot(to) and not _can_user_use_feature(user, "bots"):
                     sock.sendall(json.dumps({"action": "msg_failed", "to": to, "reason": "Bot messaging is disabled for your account."}).encode() + b"\n")
                     continue
@@ -2052,23 +2073,33 @@ def handle_client(cs, addr):
                 recipient_has_blocked = con.execute("SELECT blocked FROM contacts WHERE owner=? AND contact=?", (to, frm)).fetchone()
                 sender_has_blocked = con.execute("SELECT blocked FROM contacts WHERE owner=? AND contact=?", (frm, to)).fetchone()
                 con.close()
-                
+
                 with lock: sock_to = clients.get(to)
                 reason = None
                 if recipient_has_blocked and recipient_has_blocked[0] == 1:
                     reason = f"Message couldn't be sent because {to} has you blocked."
-                elif sender_has_blocked and sender_has_blocked[0] == 1: 
+                elif sender_has_blocked and sender_has_blocked[0] == 1:
                     reason = "You have blocked this contact."
                 elif _maybe_send_bot_reply(sock, frm, to, msg.get("msg", "")):
                     reason = None
-                elif not sock_to: 
+                elif not sock_to:
                     reason = f"{to} is offline."
                 else:
-                    try: 
-                        sock_to.sendall((json.dumps(msg)+"\n").encode())
+                    # Forward only the fields we trust. Anything else the client
+                    # tucked into the dict (fake tts payload, fake action, etc.)
+                    # is discarded.
+                    forwarded = {
+                        "action": "msg",
+                        "from": frm,
+                        "to": to,
+                        "msg": msg.get("msg", ""),
+                        "time": msg.get("time") or datetime.datetime.now().isoformat(),
+                    }
+                    try:
+                        sock_to.sendall((json.dumps(forwarded)+"\n").encode())
                         reason = None
                     except: pass
-                if reason: 
+                if reason:
                     sock.sendall(json.dumps({"action": "msg_failed", "to": to, "reason": reason}).encode() + b"\n")
 
             elif action == "typing":
@@ -2087,9 +2118,28 @@ def handle_client(cs, addr):
             elif action == "file_offer":
                 to = msg["to"]
                 files = msg.get("files", [])
-                # Reject any filename containing a path separator (OS-independent check)
-                bad = next((f["filename"] for f in files if '/' in f["filename"] or '\\' in f["filename"]), None)
-                if bad:
+                # Reject anything that looks like a path or a Windows-special name.
+                # Forward/backslash separators, drive-letter prefixes (C:foo.exe),
+                # NTFS alternate data streams (file.txt:hidden.exe), leading dots,
+                # control characters, and reserved device names all get bounced.
+                _RESERVED = {"CON","PRN","AUX","NUL",
+                             "COM1","COM2","COM3","COM4","COM5","COM6","COM7","COM8","COM9",
+                             "LPT1","LPT2","LPT3","LPT4","LPT5","LPT6","LPT7","LPT8","LPT9"}
+                def _bad_filename(name):
+                    if not isinstance(name, str) or not name or len(name) > 255:
+                        return True
+                    if '/' in name or '\\' in name or ':' in name or '\x00' in name:
+                        return True
+                    if name in ('.', '..'):
+                        return True
+                    if any(ord(c) < 32 for c in name):
+                        return True
+                    stem = name.split('.', 1)[0].upper()
+                    if stem in _RESERVED:
+                        return True
+                    return False
+                bad = next((f["filename"] for f in files if _bad_filename(f.get("filename"))), None)
+                if bad is not None:
                     sock.sendall((json.dumps({"action": "file_offer_failed", "to": to, "reason": f"Invalid filename: '{bad}'"}) + "\n").encode())
                     continue
 
