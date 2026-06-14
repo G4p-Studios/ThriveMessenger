@@ -1,4 +1,4 @@
-import wx, socket, json, threading, datetime, wx.adv, configparser, ssl, sys, os, base64, uuid, subprocess, tempfile, re, time
+import wx, socket, json, threading, datetime, wx.adv, configparser, ssl, sys, os, base64, uuid, subprocess, tempfile, re, time, hashlib
 import keyring
 
 try:
@@ -91,6 +91,10 @@ def load_server_config():
         'cafile': config.get('server', 'cafile', fallback=None),
         'max_retries': config.getint('server', 'max_retries', fallback=5),
         'retry_timeout': config.getint('server', 'retry_timeout', fallback=15),
+        # If true, the client will connect over plaintext TCP when the server
+        # has no TLS configured. Defaults to False: production deployments must
+        # use TLS, and a network attacker cannot silently strip it.
+        'allow_insecure': config.getboolean('server', 'allow_insecure', fallback=False),
     }
 
 def get_config_dir():
@@ -284,7 +288,34 @@ def check_for_update(callback):
             wx.CallAfter(callback, None, None, str(e))
     threading.Thread(target=_check, daemon=True).start()
 
-def download_update(url, dest, progress_dlg, callback):
+def _fetch_expected_sha256(checksums_url, asset_name):
+    """Fetch SHA256SUMS, return the hex digest for asset_name, or None if not found.
+    Expected format is the standard `sha256sum` output: '<hex>  <filename>' per line.
+    """
+    import urllib.request
+    req = urllib.request.Request(checksums_url, headers={"User-Agent": "ThriveMessenger/" + VERSION_TAG})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        body = resp.read().decode('utf-8', errors='replace')
+    for line in body.splitlines():
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            continue
+        digest, name = parts[0].strip().lower(), parts[1].strip().lstrip('*')
+        if name == asset_name and len(digest) == 64 and all(c in '0123456789abcdef' for c in digest):
+            return digest
+    return None
+
+def _file_sha256(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1 << 20), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+def download_update(url, dest, progress_dlg, callback, expected_sha256=None):
     def _download():
         import urllib.request
         try:
@@ -301,6 +332,19 @@ def download_update(url, dest, progress_dlg, callback):
                         if total > 0:
                             pct = min(int(downloaded * 100 / total), 100)
                             wx.CallAfter(progress_dlg.Update, pct, f"Downloaded {downloaded // 1024} KB of {total // 1024} KB")
+            # Integrity check. Refuse to apply an update whose hash we cannot
+            # verify or whose hash does not match the published SHA256SUMS.
+            if not expected_sha256:
+                try: os.remove(dest)
+                except Exception: pass
+                wx.CallAfter(callback, False, "Release is missing a SHA256SUMS asset — refusing to install an unverifiable update.")
+                return
+            actual = _file_sha256(dest)
+            if actual.lower() != expected_sha256.lower():
+                try: os.remove(dest)
+                except Exception: pass
+                wx.CallAfter(callback, False, f"Update integrity check failed (expected {expected_sha256}, got {actual}). Refusing to install.")
+                return
             wx.CallAfter(callback, True, None)
         except Exception as e:
             wx.CallAfter(callback, False, str(e))
@@ -543,18 +587,40 @@ class StatusDialog(wx.Dialog):
             self.status_text.SetValue(sel); self.sizer.Hide(self.custom_box); self.panel.Layout()
             self.SetSize((350, 150))
 
+class InsecureServerError(Exception):
+    """Raised when the server cannot offer TLS and the client has not opted in to plaintext."""
+
 def create_secure_socket(timeout=None):
     sock = socket.create_connection(ADDR, timeout=timeout)
     if SERVER_CONFIG['cafile'] and os.path.exists(SERVER_CONFIG['cafile']):
         context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=SERVER_CONFIG['cafile'])
-    else: context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
-    try: return context.wrap_socket(sock, server_hostname=SERVER_CONFIG['host'])
-    except ssl.SSLCertVerificationError:
-        sock.close(); sock = socket.create_connection(ADDR, timeout=timeout)
-        context = ssl.create_default_context(); context.check_hostname = False; context.verify_mode = ssl.CERT_NONE
+    else:
+        context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+    try:
         return context.wrap_socket(sock, server_hostname=SERVER_CONFIG['host'])
-    except (ssl.SSLError, OSError):
-        sock.close(); return socket.create_connection(ADDR, timeout=timeout)
+    except ssl.SSLCertVerificationError as e:
+        # Hard fail. A network attacker presenting a bogus cert MUST NOT result
+        # in a silent CERT_NONE fallback — that nullifies the whole point of TLS.
+        try: sock.close()
+        except Exception: pass
+        raise InsecureServerError(
+            f"Server certificate could not be verified ({e}). "
+            "Refusing to connect. If this is a self-hosted server, set its [server] cafile "
+            "in client.conf to the issuing CA, or fix the server's certificate."
+        ) from e
+    except (ssl.SSLError, OSError) as e:
+        # The server didn't speak TLS at all. Only allow this when the user has
+        # explicitly opted in via allow_insecure=true in client.conf.
+        try: sock.close()
+        except Exception: pass
+        if not SERVER_CONFIG.get('allow_insecure', False):
+            raise InsecureServerError(
+                f"Server is not offering TLS ({e}). "
+                "Refusing to send credentials over an unencrypted connection. "
+                "Set allow_insecure=true under [server] in client.conf if this is "
+                "intentional (LAN/dev only)."
+            ) from e
+        return socket.create_connection(ADDR, timeout=timeout)
 
 # Keepalive settings (seconds)
 IDLE_KEEPALIVE_SECONDS = 15 * 60  # 15 minutes
@@ -915,17 +981,31 @@ class ClientApp(wx.App):
         docs_path = os.path.join(os.path.expanduser('~'), 'Documents')
         save_dir = os.path.join(docs_path, 'ThriveMessenger', 'files')
         os.makedirs(save_dir, exist_ok=True)
+        save_dir_real = os.path.realpath(save_dir)
         saved = []
         for finfo in files:
             filename = finfo["filename"]; data = finfo["data"]
             try:
-                save_path = os.path.join(save_dir, filename)
+                # Hard-strip any path components, drive letters, or NTFS ADS markers
+                # the server might let through. os.path.join with a drive-rooted name
+                # on Windows discards save_dir entirely, so basename + colon check is
+                # essential, not paranoid.
+                if not isinstance(filename, str) or not filename:
+                    raise ValueError("Empty filename.")
+                safe_name = os.path.basename(filename.replace('\\', '/').rsplit('/', 1)[-1])
+                if not safe_name or ':' in safe_name or safe_name in ('.', '..'):
+                    raise ValueError(f"Refused suspicious filename: {filename!r}")
+                save_path = os.path.join(save_dir, safe_name)
                 if os.path.exists(save_path):
-                    name, ext = os.path.splitext(filename)
+                    name, ext = os.path.splitext(safe_name)
                     counter = 1
                     while os.path.exists(save_path):
                         save_path = os.path.join(save_dir, f"{name} ({counter}){ext}")
                         counter += 1
+                # Final belt-and-braces: confirm the resolved write target really
+                # lives under save_dir before opening it.
+                if os.path.commonpath([save_dir_real, os.path.realpath(os.path.dirname(save_path) or save_dir)]) != save_dir_real:
+                    raise ValueError(f"Refused to write outside files directory: {filename!r}")
                 with open(save_path, 'wb') as f: f.write(base64.b64decode(data))
                 saved.append(os.path.basename(save_path))
             except Exception as e:
@@ -1606,11 +1686,27 @@ class MainFrame(wx.Frame):
         use_installer = is_installer_install()
         target_name = "thrive_messenger_installer.exe" if use_installer else "thrive_messenger.zip"
         asset_url = None
+        checksums_url = None
         for a in assets:
             if a["name"] == target_name:
-                asset_url = a["browser_download_url"]; break
+                asset_url = a["browser_download_url"]
+            elif a["name"] == "SHA256SUMS":
+                checksums_url = a["browser_download_url"]
         if not asset_url:
             wx.MessageBox(f"Could not find {target_name} in release assets.", "Update Error", wx.ICON_ERROR); return
+        if not checksums_url:
+            wx.MessageBox(
+                "This release does not publish a SHA256SUMS asset, so the update cannot be verified. "
+                "Refusing to install. Please ask the release author to publish signed checksums.",
+                "Update Refused", wx.ICON_ERROR); return
+        try:
+            expected_sha = _fetch_expected_sha256(checksums_url, target_name)
+        except Exception as e:
+            wx.MessageBox(f"Failed to fetch SHA256SUMS:\n{e}", "Update Error", wx.ICON_ERROR); return
+        if not expected_sha:
+            wx.MessageBox(
+                f"SHA256SUMS does not contain an entry for {target_name}. Refusing to install.",
+                "Update Refused", wx.ICON_ERROR); return
         ext = ".exe" if use_installer else ".zip"
         dest = os.path.join(tempfile.gettempdir(), f"thrive_update{ext}")
         progress = wx.ProgressDialog("Downloading Update", "Starting download...", maximum=100, parent=self,
@@ -1632,7 +1728,7 @@ class MainFrame(wx.Frame):
                 app.ExitMainLoop()
             else:
                 wx.MessageBox(f"Download failed:\n{error}", "Update Error", wx.ICON_ERROR)
-        download_update(asset_url, dest, progress, _done)
+        download_update(asset_url, dest, progress, _done, expected_sha256=expected_sha)
     def on_add_contact_failed(self, reason): wx.MessageBox(reason, "Add Contact Failed", wx.ICON_ERROR)
     def on_add_contact_success(self, contact_data):
         c = contact_data; self.contact_states[c["user"]] = c["blocked"]
