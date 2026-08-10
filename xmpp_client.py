@@ -7,12 +7,13 @@ via caller-provided callbacks (typically wrapped in wx.CallAfter).
 """
 
 import asyncio
-import io
 import os
 import re
+import tempfile
 import urllib.parse
 import urllib.request
-from pathlib import Path
+
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 import threading
 import time
 import logging
@@ -31,6 +32,13 @@ from slixmpp.xmlstream.matcher import MatchXPath
 import omemo_plugin  # noqa: F401 — registers XEP_0384Impl with slixmpp
 
 log = logging.getLogger(__name__)
+
+# Bytes moved per read/write while encrypting or decrypting.  Memory use is
+# a small multiple of this, not of the file size.
+CRYPTO_CHUNK_SIZE = 1024 * 1024
+
+# XEP-0454 appends a 16-byte AES-GCM authentication tag to the ciphertext.
+_GCM_TAG_BYTES = 16
 
 
 class _CredentialRedactingFilter(logging.Filter):
@@ -89,6 +97,97 @@ class _CredentialRedactingFilter(logging.Filter):
         return True
 
 
+def encrypt_to_tempfile(src_path, chunk_size=CRYPTO_CHUNK_SIZE):
+    """Encrypt *src_path* to a temporary file, XEP-0454 style.
+
+    Returns ``(ciphertext_path, fragment)`` where fragment is the 88 hex
+    chars (12-byte IV then 32-byte key) that go in the aesgcm:// URL.
+
+    Streams in fixed-size chunks, so a 2 GB file costs the same memory as a
+    2 MB one.  slixmpp's XEP_0454.encrypt builds the entire ciphertext as a
+    bytes object and then copies it into a BytesIO, which is why it cannot
+    be used for anything close to the server's size limit.
+
+    The wire format is identical to slixmpp's: ciphertext followed by the
+    16-byte GCM tag, so Conversations, Gajim, Dino and Monal read it.
+    """
+    iv = os.urandom(12)
+    key = os.urandom(32)
+    encryptor = Cipher(algorithms.AES(key), modes.GCM(iv)).encryptor()
+
+    fd, cipher_path = tempfile.mkstemp(prefix="thrive-enc-")
+    try:
+        with os.fdopen(fd, "wb") as out, open(src_path, "rb") as src:
+            while True:
+                buf = src.read(chunk_size)
+                if not buf:
+                    break
+                out.write(encryptor.update(buf))
+            out.write(encryptor.finalize())
+            out.write(encryptor.tag)
+    except BaseException:
+        _quiet_remove(cipher_path)
+        raise
+
+    return cipher_path, iv.hex() + key.hex()
+
+
+class _GcmStreamDecryptor:
+    """Push chunks in, get decrypted bytes written out.
+
+    XEP-0454 puts the 16-byte GCM tag at the end of the stream, so a rolling
+    window holds the last 16 bytes back instead of buffering everything to
+    find it.  GCM is only authenticated by finalize_with_tag, which raises
+    InvalidTag if anything was altered -- so callers must not expose the
+    output until finish() returns.
+    """
+
+    def __init__(self, out_file, fragment):
+        if len(fragment) != 88:
+            raise ValueError(
+                "Encrypted file link is malformed (bad key length).")
+        iv = bytes.fromhex(fragment[:24])
+        key = bytes.fromhex(fragment[24:])
+        self._decryptor = Cipher(algorithms.AES(key), modes.GCM(iv)).decryptor()
+        self._out = out_file
+        self._tail = b""
+
+    def feed(self, chunk):
+        data = self._tail + chunk
+        if len(data) > _GCM_TAG_BYTES:
+            self._out.write(self._decryptor.update(data[:-_GCM_TAG_BYTES]))
+            self._tail = data[-_GCM_TAG_BYTES:]
+        else:
+            self._tail = data
+
+    def finish(self):
+        if len(self._tail) != _GCM_TAG_BYTES:
+            raise ValueError("Encrypted file is truncated.")
+        self._out.write(self._decryptor.finalize_with_tag(self._tail))
+
+
+def decrypt_stream(read_chunk, out_file, fragment, chunk_size=CRYPTO_CHUNK_SIZE):
+    """Decrypt a XEP-0454 stream into *out_file*.
+
+    *read_chunk* is a callable returning up to n bytes, or b"" at the end --
+    a file object's ``.read`` or an equivalent over a network response.
+    """
+    decryptor = _GcmStreamDecryptor(out_file, fragment)
+    while True:
+        buf = read_chunk(chunk_size)
+        if not buf:
+            break
+        decryptor.feed(buf)
+    decryptor.finish()
+
+
+def _quiet_remove(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
 def _human_size(num):
     """Format a byte count for a message a user will read."""
     for unit in ("B", "KB", "MB", "GB"):
@@ -123,21 +222,22 @@ def download_file(url, save_path, timeout=300):
     # aesgcm://host/path#<24 hex iv><64 hex key>
     parsed = urllib.parse.urlparse(url)
     fragment = parsed.fragment
-    if len(fragment) != 88:
-        raise ValueError(
-            "Encrypted file link is malformed (bad key length); "
-            "the sender's client may be faulty."
-        )
     https_url = urllib.parse.urlunparse(
         ("https",) + tuple(parsed[1:5]) + ("",))
 
-    with urllib.request.urlopen(https_url, timeout=timeout) as resp:
-        ciphertext = resp.read()
-
-    plaintext = XEP_0454.decrypt(io.BytesIO(ciphertext), fragment)
-
-    with open(save_path, "wb") as out:
-        out.write(plaintext)
+    # Decrypt into a temp file alongside the destination, then move it into
+    # place only once the tag verifies.  GCM cannot authenticate until the
+    # end, so the destination must never hold bytes we have not checked.
+    fd, part_path = tempfile.mkstemp(
+        prefix=".thrive-part-", dir=os.path.dirname(save_path) or None)
+    try:
+        with os.fdopen(fd, "wb") as out:
+            with urllib.request.urlopen(https_url, timeout=timeout) as resp:
+                decrypt_stream(resp.read, out, fragment)
+        os.replace(part_path, save_path)
+    except BaseException:
+        _quiet_remove(part_path)
+        raise
     return save_path
 
 
@@ -191,14 +291,6 @@ _STATUS_TO_SHOW = {
     "fixing my PC": "away",
     "battery about to die": "away",
 }
-
-# Largest file we will encrypt for upload (XEP-0454).  slixmpp's AES-GCM
-# helpers build the whole ciphertext in memory and then copy it into a
-# BytesIO, so peak usage is roughly twice the file size.  Above this we
-# refuse rather than quietly falling back to an unencrypted upload -- a
-# silent downgrade is the one outcome a user cannot detect.
-MAX_ENCRYPTED_UPLOAD = int(
-    os.environ.get("THRIVE_MAX_ENCRYPTED_UPLOAD", 512 * 1024 * 1024))
 
 # Reverse map: XMPP show value -> Thrive status, for contacts that publish a
 # show but no status text.  "" is a bare <presence/>, i.e. plain available.
@@ -1015,29 +1107,45 @@ class XMPPClient:
             # and IV ride in the URL fragment, which HTTP never sends to a
             # server, and the URL itself travels inside the OMEMO-encrypted
             # message below.
-            upload = self._client.plugin["xep_0454"]
+            upload = self._client.plugin["xep_0363"]
             for fp in file_paths:
                 filename = os.path.basename(fp)
                 size = os.path.getsize(fp)
                 content_type = self._guess_content_type(filename)
 
-                if size > MAX_ENCRYPTED_UPLOAD:
-                    raise ValueError(
-                        f"{filename} is {_human_size(size)}. Encrypted "
-                        f"transfers are limited to "
-                        f"{_human_size(MAX_ENCRYPTED_UPLOAD)}."
-                    )
+                # Encrypt to a temp file first, then hand that file to
+                # xep_0363 so aiohttp streams it off disk.  Going through
+                # xep_0454.upload_file instead would hold the whole
+                # ciphertext in memory twice over.
+                cipher_path, fragment = await asyncio.to_thread(
+                    encrypt_to_tempfile, fp)
+                try:
+                    # A random stored name keeps the user's filename off the
+                    # server; the extension is kept so other clients can tell
+                    # what they received, as XEP-0454 specifies.
+                    stored_name = os.urandom(12).hex()
+                    ext = os.path.splitext(filename)[1]
+                    if ext:
+                        stored_name += XEP_0454.map_extensions(ext)
 
-                # upload_file discovers the service, checks the size against
-                # the limit it advertises, requests the slot and does the PUT.
-                # request_slot alone cannot be used here: it takes the service
-                # JID as its first argument, which only discovery can supply.
-                with open(fp, "rb") as f:
-                    get_url = await upload.upload_file(
-                        Path(fp),
-                        content_type=content_type,
-                        input_file=f,
-                    )
+                    # upload_file discovers the service, checks the size
+                    # against the limit it advertises, requests the slot and
+                    # does the PUT.  request_slot alone cannot be used here:
+                    # its first argument is the service JID, which only
+                    # discovery can supply.
+                    with open(cipher_path, "rb") as enc:
+                        https_url = await upload.upload_file(
+                            filename=stored_name,
+                            size=os.path.getsize(cipher_path),
+                            # Declaring the real type would tell the server
+                            # what it is holding, which defeats the point.
+                            content_type="application/octet-stream",
+                            input_file=enc,
+                        )
+                finally:
+                    _quiet_remove(cipher_path)
+
+                get_url = XEP_0454.format_url(str(https_url), fragment)
 
                 uploaded.append({
                     "filename": filename,
@@ -1127,25 +1235,12 @@ class XMPPClient:
                 fetch_url = urllib.parse.urlunparse(
                     ("https",) + tuple(parsed[1:5]) + ("",))
 
-            async with aiohttp.ClientSession() as session:
-                async with session.get(fetch_url) as resp:
-                    if resp.status != 200:
-                        log.warning("Download failed (%d): %s", resp.status, fetch_url)
-                        return None, f"Download failed ({resp.status})"
-                    data = await resp.read()
-
-            if encrypted:
-                # Fails loudly if the tag does not verify, rather than
-                # writing tampered bytes to the user's disk.
-                data = XEP_0454.decrypt(io.BytesIO(data), fragment)
-
             if not filename:
-                # Try to extract from URL or Content-Disposition.  For an
-                # encrypted upload this is the random name xep_0454 chose,
-                # so callers should pass the real one from the message.
-                from urllib.parse import urlparse, unquote
-                path = urlparse(fetch_url).path
-                filename = unquote(os.path.basename(path)) or "download"
+                # For an encrypted upload the URL holds the random stored
+                # name, so callers should pass the real one from the message.
+                path = urllib.parse.urlparse(fetch_url).path
+                filename = urllib.parse.unquote(
+                    os.path.basename(path)) or "download"
 
             os.makedirs(save_dir, exist_ok=True)
             save_path = os.path.join(save_dir, filename)
@@ -1158,8 +1253,32 @@ class XMPPClient:
                     save_path = os.path.join(save_dir, f"{name} ({counter}){ext}")
                     counter += 1
 
-            with open(save_path, "wb") as f:
-                f.write(data)
+            # Stream to a temp file beside the destination and move it into
+            # place at the end, so nothing unverified is ever visible there.
+            fd, part_path = tempfile.mkstemp(
+                prefix=".thrive-part-", dir=save_dir)
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(fetch_url) as resp:
+                        if resp.status != 200:
+                            log.warning(
+                                "Download failed (%d): %s", resp.status, fetch_url)
+                            return None, f"Download failed ({resp.status})"
+                        with os.fdopen(fd, "wb") as out:
+                            if encrypted:
+                                decryptor = _GcmStreamDecryptor(out, fragment)
+                                async for chunk in resp.content.iter_chunked(
+                                        CRYPTO_CHUNK_SIZE):
+                                    decryptor.feed(chunk)
+                                decryptor.finish()
+                            else:
+                                async for chunk in resp.content.iter_chunked(
+                                        CRYPTO_CHUNK_SIZE):
+                                    out.write(chunk)
+                os.replace(part_path, save_path)
+            except BaseException:
+                _quiet_remove(part_path)
+                raise
 
             return save_path, None
         except Exception as exc:
