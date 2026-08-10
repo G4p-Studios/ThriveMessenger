@@ -204,6 +204,23 @@ def is_encrypted_url(url):
     return str(url).startswith("aesgcm://")
 
 
+def _looks_like_file_url(value):
+    """True if *value* is a lone URL pointing at a shared file."""
+    text = str(value).strip()
+    if " " in text or "\t" in text:
+        return False
+    if is_encrypted_url(text):
+        return True
+    return (text.startswith("https://") or text.startswith("http://")) \
+        and "/file_share/" in text
+
+
+def _filename_from_url(url):
+    """Best-effort filename for a URL that carries no metadata."""
+    path = urllib.parse.urlparse(str(url)).path
+    return urllib.parse.unquote(os.path.basename(path)) or "download"
+
+
 def download_file(url, save_path, timeout=300):
     """Download *url* to *save_path*, decrypting XEP-0454 aesgcm:// URIs.
 
@@ -1235,39 +1252,14 @@ class XMPPClient:
                     "content_type": content_type,
                 })
 
-            # Send a message with file metadata using OOB (XEP-0066)
-            # for the first URL plus a custom element for multi-file.
+            # Only the body survives OMEMO.  slixmpp_omemo has no SCE
+            # implementation ("Here I would prepare the plaintext for
+            # omemo:2 using my SCE plugin ... IF I HAD ONE!!!"), so it always
+            # uses oldmemo, which encrypts the body and discards every other
+            # element.  The URLs therefore go in the body, one per line, and
+            # nothing that matters may live in a sibling element.
             msg = self._client.make_message(mto=to_jid, mtype="chat")
-
-            # Human-readable body as fallback.
-            if len(uploaded) == 1:
-                msg["body"] = uploaded[0]["url"]
-            else:
-                lines = [f['filename'] + ": " + f['url'] for f in uploaded]
-                msg["body"] = "\n".join(lines)
-
-            # OOB for the first file (standard interop).
-            oob = slixmpp.ET.SubElement(
-                msg.xml, "{jabber:x:oob}x"
-            )
-            # XEP-0066 puts these in jabber:x:oob.  Bare names serialise as
-            # xmlns="", which no other client recognises -- the attachment
-            # simply does not appear for anyone outside Thrive.
-            slixmpp.ET.SubElement(
-                oob, "{jabber:x:oob}url").text = uploaded[0]["url"]
-            slixmpp.ET.SubElement(
-                oob, "{jabber:x:oob}desc").text = uploaded[0]["filename"]
-
-            # Custom element with full file list for Thrive clients.
-            files_el = slixmpp.ET.SubElement(
-                msg.xml, "{urn:thrive:files}files"
-            )
-            for f in uploaded:
-                file_el = slixmpp.ET.SubElement(files_el, "file")
-                slixmpp.ET.SubElement(file_el, "name").text = f["filename"]
-                slixmpp.ET.SubElement(file_el, "size").text = str(f["size"])
-                slixmpp.ET.SubElement(file_el, "url").text = f["url"]
-                slixmpp.ET.SubElement(file_el, "content-type").text = f["content_type"]
+            msg["body"] = "\n".join(f["url"] for f in uploaded)
 
             # The aesgcm:// URI carries the file's decryption key in its
             # fragment, so this message MUST be encrypted.  Sending it in
@@ -1283,6 +1275,27 @@ class XMPPClient:
                     "sending it unencrypted would expose the file's "
                     "decryption key to the server."
                 ) from exc
+
+            # Names and sizes ride outside the encrypted body, on the
+            # already-encrypted stanza -- decrypt_message copies the stanza
+            # and only swaps the body, so these reach the recipient intact.
+            # Deliberately no <url> here: that would put the key back in the
+            # clear.  The server learns filenames and sizes, as it did before
+            # any of this was encrypted, but never the contents or the key.
+            files_el = slixmpp.ET.SubElement(
+                encrypted_msg.xml, "{urn:thrive:files}files"
+            )
+            for f in uploaded:
+                file_el = slixmpp.ET.SubElement(
+                    files_el, "{urn:thrive:files}file")
+                slixmpp.ET.SubElement(
+                    file_el, "{urn:thrive:files}name").text = f["filename"]
+                slixmpp.ET.SubElement(
+                    file_el, "{urn:thrive:files}size").text = str(f["size"])
+                slixmpp.ET.SubElement(
+                    file_el, "{urn:thrive:files}content-type"
+                ).text = f["content_type"]
+
             encrypted_msg.send()
 
             if self.on_file_uploaded:
@@ -1539,32 +1552,55 @@ class XMPPClient:
         from_user = from_jid.user  # local part before @
         timestamp = datetime.now(timezone.utc).isoformat()
 
+        body = msg["body"]
+        # URLs live in the body because that is all OMEMO preserves; the
+        # metadata element carries no <url>.
+        urls = [line.strip() for line in str(body or "").splitlines()
+                if line.strip()]
+
         # Check for Thrive file transfer message.
         files_el = msg.xml.find("{urn:thrive:files}files")
         if files_el is not None:
             files = []
-            # Senders up to now emitted these children with no namespace
-            # (xmlns=""), which is wrong but is what is on the wire.  Accept
-            # both so the sender can be corrected once clients have updated.
+            # Older senders emitted these children with no namespace
+            # (xmlns="") and included the URL inline; accept both shapes.
             NS = "{urn:thrive:files}"
 
             def text(el, tag):
                 found = el.findtext(NS + tag)
                 return found if found is not None else el.findtext(tag, "")
 
-            for file_el in list(files_el.findall(NS + "file")) + \
-                    list(files_el.findall("file")):
+            entries = list(files_el.findall(NS + "file")) + \
+                list(files_el.findall("file"))
+            for index, file_el in enumerate(entries):
+                url = text(file_el, "url")
+                if not url and index < len(urls):
+                    url = urls[index]
                 files.append({
                     "filename": text(file_el, "name"),
                     "size": int(text(file_el, "size") or "0"),
-                    "url": text(file_el, "url"),
+                    "url": url,
                     "content_type": text(file_el, "content-type"),
                 })
             if files and self.on_file_message:
                 self.on_file_message(from_user, files)
             return  # Don't treat as a normal text message.
 
-        body = msg["body"]
+        # No metadata element: a bare file URL is still a file transfer.
+        # This is what other clients send, and what ours sends if the
+        # metadata is ever lost, so offer it rather than printing a link.
+        if urls and all(_looks_like_file_url(u) for u in urls):
+            files = [{
+                "filename": _filename_from_url(u),
+                "size": 0,
+                "url": u,
+                "content_type": self._guess_content_type(
+                    _filename_from_url(u)),
+            } for u in urls]
+            if self.on_file_message:
+                self.on_file_message(from_user, files)
+                return
+
         if not body:
             return
 
