@@ -416,11 +416,12 @@ class XMPPClient:
             done.wait(timeout=timeout)
         else:
             # Use a one-shot connection for pre-login verification.
-            return self._oneshot_iq_call(
+            ok, payload = self._oneshot_iq_call(
                 "urn:thrive:verify", "verify",
                 {"username": username, "code": code},
                 timeout=timeout
             )
+            return (True, "") if ok else (False, payload)
         if not done.is_set():
             return False, "Verification timed out."
         return (True, "") if result["success"] else (False, result["reason"])
@@ -428,24 +429,42 @@ class XMPPClient:
     def request_password_reset(self, identifier, timeout=15):
         """Request a password reset code (custom IQ).
 
+        Succeeds only when a code is actually waiting in the user's inbox,
+        so the caller never sends someone off to find a code that was never
+        generated.
+
         Returns (True, username_hint) on success, (False, reason) on failure.
         """
-        return self._oneshot_iq_call(
+        ok, payload = self._oneshot_iq_call(
             "urn:thrive:reset", "request",
             {"identifier": identifier},
             timeout=timeout
         )
+        if not ok:
+            return False, payload
+
+        # Servers predating the status element only reply with <user>.
+        status = payload.get("status") or (
+            "sent" if payload.get("user") else "unavailable"
+        )
+        if status == "unavailable":
+            return False, (
+                "No reset code could be sent. Either that account does not "
+                "exist, or it has no email address on record."
+            )
+        return True, payload.get("user", "")
 
     def reset_password(self, username, code, new_password, timeout=15):
         """Confirm a password reset with code and new password (custom IQ).
 
         Returns (True, "") on success, (False, reason) on failure.
         """
-        return self._oneshot_iq_call(
+        ok, payload = self._oneshot_iq_call(
             "urn:thrive:reset", "confirm",
             {"username": username, "code": code, "password": new_password},
             timeout=timeout
         )
+        return (True, "") if ok else (False, payload)
 
     def change_password(self, new_password, timeout=15):
         """Change password for the currently logged-in user (XEP-0077).
@@ -1210,12 +1229,12 @@ class XMPPClient:
         one.  The server signals support by advertising ``urn:thrive:preauth``
         in its stream features; we never attempt to log in on this stream.
 
-        Returns (True, response_text) or (False, reason).
+        Returns (True, {child_tag: text}) or (False, reason).
         """
         jid = f"anon@{self._domain}"
         host, port, domain = self._server_host, self._server_port, self._domain
 
-        result = {"success": False, "reason": "", "text": ""}
+        result = {"success": False, "reason": "", "fields": {}}
         done = threading.Event()
         loop = asyncio.new_event_loop()
 
@@ -1258,11 +1277,10 @@ class XMPPClient:
                         child.text = str(val)
                     resp = await iq.send(timeout=max(timeout - 2, 1))
                     result["success"] = True
-                    # Try to extract a text response.
+                    # Collect the reply's children by local tag name.
                     for child in resp.xml:
-                        if child.text:
-                            result["text"] = child.text
-                            break
+                        tag = child.tag.split("}")[-1]
+                        result["fields"][tag] = child.text or ""
                 except IqError as err:
                     result["reason"] = err.iq["error"].get("text", "Request failed.")
                 except IqTimeout:
@@ -1362,5 +1380,5 @@ class XMPPClient:
         thread.join(timeout=5)
 
         if result["success"]:
-            return True, result["text"]
+            return True, result["fields"]
         return False, result["reason"]

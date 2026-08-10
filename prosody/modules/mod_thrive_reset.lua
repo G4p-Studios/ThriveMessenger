@@ -9,14 +9,26 @@
 -- SMTP is configured.
 --
 -- Configuration (prosody.cfg.lua):
---   thrive_smtp_server   = "smtp.example.com"
---   thrive_smtp_port     = 587
---   thrive_smtp_user     = "noreply@example.com"
---   thrive_smtp_password = "secret"
---   thrive_smtp_from     = "noreply@example.com"  -- defaults to smtp_user
+--   thrive_mail_transport = "sendmail"  -- "sendmail" (default) or "socket"
+--   thrive_sendmail      = "/usr/bin/msmtp"       -- sendmail transport
+--   thrive_smtp_server   = "smtp.example.com"     -- socket transport only
+--   thrive_smtp_port     = 587                    -- socket transport only
+--   thrive_smtp_user     = "noreply@example.com"  -- socket transport only
+--   thrive_smtp_password = "secret"               -- socket transport only
+--   thrive_smtp_from     = "noreply@example.com"  -- envelope + From: header
 --   thrive_code_expires  = 300   -- seconds (default 5 minutes)
 --   thrive_reset_cooldown = 60   -- min seconds between reset emails per user
 --   thrive_db_path       = "/var/lib/prosody/thrive.db"
+--
+-- Requires "additional_registration_fields = { \"email\" }" so that
+-- mod_register_ibr keeps the address clients send at registration; without
+-- it no account has an email on record and nothing can be sent.
+--
+-- On transports: luasocket's socket.smtp speaks plaintext SMTP only -- it
+-- has no STARTTLS support -- so it cannot reach submission ports that
+-- require encryption (587 on essentially every provider).  The default
+-- "sendmail" transport pipes the message to msmtp or similar, which does
+-- STARTTLS properly and keeps credentials out of this config file.
 
 local st = require "util.stanza";
 local usermanager = require "core.usermanager";
@@ -28,6 +40,8 @@ local log = module._log;
 -- Configuration
 -- ---------------------------------------------------------------------------
 
+local mail_transport = module:get_option_string("thrive_mail_transport", "sendmail");
+local sendmail_path = module:get_option_string("thrive_sendmail", "/usr/bin/msmtp");
 local smtp_server   = module:get_option_string("thrive_smtp_server", "");
 local smtp_port     = module:get_option_number("thrive_smtp_port", 587);
 local smtp_user     = module:get_option_string("thrive_smtp_user", "");
@@ -37,9 +51,20 @@ local code_expires  = module:get_option_number("thrive_code_expires", 300);
 local reset_cooldown = module:get_option_number("thrive_reset_cooldown", 60);
 local db_path       = module:get_option_string("thrive_db_path", "thrive.db");
 
-local smtp_enabled = smtp_server ~= "" and smtp_user ~= "";
+local smtp_enabled;
+if mail_transport == "sendmail" then
+    -- Credentials live in the mailer's own config, so all we need is a
+    -- usable From: address.
+    smtp_enabled = smtp_from ~= "";
+else
+    smtp_enabled = smtp_server ~= "" and smtp_user ~= "";
+end
 
 local host = module.host;
+
+-- Extra registration fields are stored here by mod_register_ibr; it does
+-- not pass them on the user-registered event.
+local account_details = module:open_store("account_details");
 
 -- ---------------------------------------------------------------------------
 -- Database (SQLite via LuaDBI)
@@ -115,15 +140,50 @@ local function generate_code()
     return table.concat(hex);
 end
 
---- Send an email via SMTP using the socket library.
--- Uses STARTTLS when available.  Returns true on success.
-local function send_email(to, subject, body)
-    if not smtp_enabled then return false; end
+--- Quote a string for safe use as a single shell argument.
+local function shellquote(s)
+    local quoted = tostring(s):gsub("'", "'\\''");
+    return "'" .. quoted .. "'";
+end
 
-    -- Use Lua socket + SMTP (luasocket).
+--- Send via a sendmail-compatible binary (msmtp, sendmail, ssmtp).
+-- This is the transport that works with submission ports requiring
+-- STARTTLS, which socket.smtp below cannot do.  The message is piped to
+-- the mailer's stdin, so nothing sensitive touches a temp file.
+local function send_via_sendmail(to, subject, body)
+    -- "timeout" bounds the call: io.popen blocks Prosody's event loop.
+    local cmd = string.format(
+        "timeout 20 %s -f %s -- %s 2>&1",
+        sendmail_path, shellquote(smtp_from), shellquote(to)
+    );
+
+    local pipe, popen_err = io.popen(cmd, "w");
+    if not pipe then
+        log("warn", "Could not run %s: %s", sendmail_path, tostring(popen_err));
+        return false;
+    end
+
+    pipe:write("From: ", smtp_from, "\r\n");
+    pipe:write("To: ", to, "\r\n");
+    pipe:write("Subject: ", subject, "\r\n");
+    pipe:write("Content-Type: text/plain; charset=utf-8\r\n");
+    pipe:write("\r\n");
+    pipe:write(body, "\r\n");
+
+    local ok, exit_kind, code = pipe:close();
+    if not ok then
+        log("warn", "Mailer %s failed for %s (%s %s)",
+            sendmail_path, to, tostring(exit_kind), tostring(code));
+        return false;
+    end
+    return true;
+end
+
+--- Send via luasocket's SMTP client.
+-- Plaintext only -- luasocket has no STARTTLS support -- so this suits a
+-- local relay on port 25 and little else.  Kept for that case.
+local function send_via_socket(to, subject, body)
     local smtp_lib = require "socket.smtp";
-    local mime = require "mime";
-    local ltn12 = require "ltn12";
 
     local message = {
         headers = {
@@ -151,6 +211,18 @@ local function send_email(to, subject, body)
         return false;
     end
     return true;
+end
+
+--- Send an email.  Returns true only if it was actually handed off.
+local function send_email(to, subject, body)
+    if not smtp_enabled then
+        log("warn", "Mail not configured; dropping %q to %s", subject, to);
+        return false;
+    end
+    if mail_transport == "sendmail" then
+        return send_via_sendmail(to, subject, body);
+    end
+    return send_via_socket(to, subject, body);
 end
 
 --- Human-readable expiration string.
@@ -317,6 +389,11 @@ local function handle_reset(event)
             end
         end
 
+        -- "unavailable" unless a code is actually waiting in the user's
+        -- inbox.  Reporting success when no mail went out sends people off
+        -- to hunt for a code that was never generated.
+        local status = "unavailable";
+
         if target_user and target_email then
             -- This endpoint is reachable without logging in, so throttle it:
             -- an outstanding code stays valid instead of triggering more mail.
@@ -328,6 +405,7 @@ local function handle_reset(event)
             if throttled then
                 log("debug", "Reset code for %s requested again within %d seconds; not resending",
                     target_user, reset_cooldown);
+                status = "throttled";
             else
                 local code = generate_code();
                 local now = os.time();
@@ -336,18 +414,31 @@ local function handle_reset(event)
                 );
                 ups:execute(target_user, code, now);
 
-                send_email(
+                if send_email(
                     target_email,
                     "Thrive Messenger - Password Reset",
                     "Your password reset code is: " .. code ..
                     "\n\nThis code will expire in " .. expire_human() .. "."
-                );
+                ) then
+                    status = "sent";
+                else
+                    -- Drop the code we just stored; it is unreachable, and
+                    -- leaving it would throttle the next honest attempt.
+                    local del = conn:prepare("DELETE FROM thrive_reset WHERE username = ?");
+                    del:execute(target_user);
+                    log("error", "Reset code for %s could not be mailed to %s",
+                        target_user, target_email);
+                end
             end
+        elseif target_user then
+            log("info", "Reset requested for %s but no email is on record", target_user);
         end
 
-        -- Always reply OK to prevent user enumeration.
         local reply = st.reply(stanza);
-        if target_user then
+        reply:tag("status"):text(status):up();
+        -- The username hint is only useful when the flow can continue, and
+        -- withholding it otherwise narrows what this endpoint discloses.
+        if status ~= "unavailable" then
             reply:tag("user"):text(target_user):up();
         end
         event.origin.send(reply);
@@ -422,10 +513,20 @@ module:hook("user-registered", function(event)
 
     local username = event.username;
     local session  = event.session;
-    local email    = event.email or "";
+
+    -- mod_register_ibr fires this event with only username/host/source/
+    -- session -- never the email.  The address a client sent at
+    -- registration lands in the account_details store instead, and only if
+    -- "email" is listed in additional_registration_fields.
+    local email = event.email;
+    if not email or email == "" then
+        local details = account_details:get(username);
+        email = details and details.email or "";
+    end
 
     if email == "" then
         -- No email provided — skip verification, account is immediately usable.
+        log("debug", "No email on record for %s; skipping verification", username);
         return;
     end
 

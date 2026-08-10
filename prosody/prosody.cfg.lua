@@ -93,13 +93,21 @@ registration_watchers = {}  -- Disable admin notifications for new registrations
 -- registration_throttle_period = 60       -- Seconds between registrations
 -- registration_throttle_max = 3           -- Max registrations per period
 
+---------- Registration ----------
+-- Required for password reset: without this, mod_register_ibr discards the
+-- email clients send at registration, no account has an address on record,
+-- and no verification or reset code can ever be delivered.
+additional_registration_fields = { "email" }
+
 ---------- Thrive: Email Verification & Password Reset ----------
-thrive_smtp_server   = "smtp-auth.mythic-beasts.com"
-thrive_smtp_port     = 587
-thrive_smtp_user     = "tmsg@seedy.cc"
-thrive_smtp_password = ""  -- Set via environment or secrets management
+-- Mail goes out via msmtp.  luasocket's SMTP client cannot do STARTTLS, so
+-- it cannot use port 587; msmtp can, and keeps the password in
+-- /etc/msmtprc (chmod 600) rather than in this world-readable file.
+thrive_mail_transport = "sendmail"
+thrive_sendmail      = "/usr/bin/msmtp"
 thrive_smtp_from     = "tmsg@seedy.cc"
 thrive_code_expires  = 3600  -- Seconds before codes expire (1 hour, matches old server)
+thrive_reset_cooldown = 60   -- Min seconds between reset emails per user
 thrive_db_path       = "/var/lib/prosody/thrive.db"
 
 ---------- Thrive: Auth (legacy argon2 migration) ----------
