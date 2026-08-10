@@ -1188,20 +1188,21 @@ class XMPPClient:
                 slixmpp.ET.SubElement(file_el, "url").text = f["url"]
                 slixmpp.ET.SubElement(file_el, "content-type").text = f["content_type"]
 
-            # Try to encrypt the file message with OMEMO.
+            # The aesgcm:// URI carries the file's decryption key in its
+            # fragment, so this message MUST be encrypted.  Sending it in
+            # the clear would hand the server both the ciphertext and the
+            # key, making the file encryption worthless -- so a failure here
+            # aborts the transfer rather than falling back to plaintext.
             try:
-                xep_0384 = self._client.plugin["xep_0384"]
-                messages, _errors = await xep_0384.encrypt_message(
-                    msg, {slixmpp.JID(to_jid)}
-                )
-                for namespace, encrypted_msg in messages.items():
-                    encrypted_msg["eme"]["namespace"] = namespace
-                    encrypted_msg["eme"]["name"] = self._client.plugin["xep_0380"].mechanisms.get(namespace, "OMEMO")
-                    encrypted_msg.send()
-            except Exception:
-                # Fallback: send unencrypted.
-                log.info("OMEMO encryption unavailable for file message, sending plaintext.")
-                msg.send()
+                encrypted_msg = await self._encrypt_with_omemo(msg, to_jid)
+            except Exception as exc:
+                log.error("Refusing to send file link unencrypted: %s", exc)
+                raise RuntimeError(
+                    "Could not encrypt the message for this contact, and "
+                    "sending it unencrypted would expose the file's "
+                    "decryption key to the server."
+                ) from exc
+            encrypted_msg.send()
 
             if self.on_file_uploaded:
                 self.on_file_uploaded(to_username, uploaded)
@@ -1289,27 +1290,55 @@ class XMPPClient:
     # OMEMO encrypt / decrypt
     # ------------------------------------------------------------------
 
+    async def _encrypt_with_omemo(self, msg, to_jid):
+        """Return *msg* encrypted for *to_jid*.
+
+        slixmpp_omemo returns a single stanza with an OMEMO element per
+        version, not a mapping.  The previous code called .items() on it,
+        which a Message does not have, so every send raised AttributeError
+        and fell through to the plaintext path -- silently, because the
+        fallback caught the error.  Nothing this client ever sent was
+        encrypted.  Raising here keeps that failure visible to the caller.
+        """
+        xep_0384 = self._client.plugin["xep_0384"]
+        encrypted_msg, encryption_errors = await xep_0384.encrypt_message(
+            msg, {slixmpp.JID(to_jid)}
+        )
+
+        if encryption_errors:
+            log.info("OMEMO non-critical encryption errors: %s", encryption_errors)
+
+        if encrypted_msg is None:
+            raise RuntimeError(
+                "OMEMO produced no message for this recipient "
+                "(they may have published no device keys)."
+            )
+
+        # EME tells clients that cannot decrypt what was used.  It is only
+        # a hint, and only meaningful when a single version is present, so
+        # never let it stop a message that is otherwise ready to send.
+        try:
+            mechanisms = self._client.plugin["xep_0380"].mechanisms
+            present = [ns for ns in mechanisms
+                       if encrypted_msg.xml.find(f"{{{ns}}}encrypted") is not None]
+            if len(present) == 1:
+                encrypted_msg["eme"]["namespace"] = present[0]
+                encrypted_msg["eme"]["name"] = mechanisms.get(present[0], "OMEMO")
+        except Exception as exc:
+            log.debug("Could not set EME hint: %s", exc)
+
+        return encrypted_msg
+
     async def _async_send_encrypted(self, to_username, body):
         """Encrypt and send a message via OMEMO."""
         to_jid = f"{to_username}@{self._domain}"
         try:
-            xep_0384 = self._client.plugin["xep_0384"]
-
             msg = self._client.make_message(mto=to_jid, mtype="chat")
             msg["body"] = body
 
-            messages, encryption_errors = await xep_0384.encrypt_message(
-                msg, {slixmpp.JID(to_jid)}
-            )
-
-            if encryption_errors:
-                log.info("OMEMO non-critical encryption errors: %s", encryption_errors)
-
-            for namespace, encrypted_msg in messages.items():
-                encrypted_msg["eme"]["namespace"] = namespace
-                encrypted_msg["eme"]["name"] = self._client.plugin["xep_0380"].mechanisms.get(namespace, "OMEMO")
-                encrypted_msg["request_receipt"] = True
-                encrypted_msg.send()
+            encrypted_msg = await self._encrypt_with_omemo(msg, to_jid)
+            encrypted_msg["request_receipt"] = True
+            encrypted_msg.send()
 
         except Exception as exc:
             log.warning("OMEMO encryption failed, sending plaintext: %s", exc)
