@@ -407,6 +407,8 @@ class XMPPClient:
         self._connect_error: str | None = None
         self._username: str = ""
         self._intentional_disconnect = False
+        # Contacts whose OMEMO device list we have force-fetched this session.
+        self._omemo_refreshed: set[str] = set()
 
         # ---- Callbacks (set by the UI before calling connect) ----
         # All callbacks are invoked from the asyncio thread, so the UI
@@ -1380,8 +1382,24 @@ class XMPPClient:
         encrypted.  Raising here keeps that failure visible to the caller.
         """
         xep_0384 = self._client.plugin["xep_0384"]
+        jid = slixmpp.JID(to_jid)
+
+        # encrypt_message refreshes device lists itself, but skips the
+        # download whenever the roster says "both", trusting PEP to have
+        # pushed them.  If those notifications never arrived the cache is
+        # empty and encryption fails with "does not have a single active and
+        # trusted device".  Force the fetch once per contact per session so
+        # a first message does not depend on PEP having worked.
+        if jid.bare not in self._omemo_refreshed:
+            try:
+                await xep_0384.refresh_device_lists({jid}, force_download=True)
+                self._omemo_refreshed.add(jid.bare)
+            except Exception as exc:
+                log.warning("Could not refresh device list for %s: %s",
+                            jid.bare, exc)
+
         encrypted_msg, encryption_errors = await xep_0384.encrypt_message(
-            msg, {slixmpp.JID(to_jid)}
+            msg, {jid}
         )
 
         if encryption_errors:
@@ -1439,6 +1457,12 @@ class XMPPClient:
         if msg["type"] not in ("chat", "normal"):
             return
 
+        # Archive results are wrappers around a forwarded stanza and are
+        # handled by the MAM query; trying to decrypt the wrapper only
+        # produces "No supported encrypted content found in stanza".
+        if msg.xml.find("{urn:xmpp:mam:2}result") is not None:
+            return
+
         try:
             xep_0384 = self._client.plugin["xep_0384"]
             namespace = xep_0384.is_encrypted(msg)
@@ -1451,8 +1475,11 @@ class XMPPClient:
                     # Process the decrypted stanza through the normal handler.
                     self._on_message(decrypted_msg)
                 except Exception as exc:
+                    # Deliver what we have rather than dropping the message
+                    # silently; a stanza we cannot decrypt may still carry a
+                    # readable body or a file payload.
                     log.warning("OMEMO decryption failed: %s: %s", type(exc).__name__, exc)
-                    return
+                    self._on_message(msg)
             else:
                 # Plaintext message — process normally.
                 self._on_message(msg)
@@ -1468,6 +1495,18 @@ class XMPPClient:
     async def _on_session_start(self, event):
         """Authenticated and session established."""
         try:
+            # Compute entity caps before the first presence goes out.  The
+            # caps filter only attaches <c/> once a verstring is cached, and
+            # sending presence immediately races that -- the presence then
+            # carries no caps, the server never learns we want PEP
+            # notifications for the OMEMO device list nodes, and no contact's
+            # device list ever arrives.  Without those, nothing can be
+            # encrypted to anyone.
+            try:
+                await self._client.plugin["xep_0115"].update_caps(broadcast=False)
+            except Exception as exc:
+                log.warning("Could not publish entity caps: %s", exc)
+
             self._client.send_presence()
             await self._client.get_roster()
         except IqError as err:
