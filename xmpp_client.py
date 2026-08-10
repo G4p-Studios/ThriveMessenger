@@ -7,8 +7,12 @@ via caller-provided callbacks (typically wrapped in wx.CallAfter).
 """
 
 import asyncio
+import io
 import os
 import re
+import urllib.parse
+import urllib.request
+from pathlib import Path
 import threading
 import time
 import logging
@@ -18,6 +22,7 @@ import aiohttp
 import slixmpp
 from slixmpp.exceptions import IqError, IqTimeout
 from slixmpp.plugins.xep_0363 import UploadServiceNotFound
+from slixmpp.plugins.xep_0454 import XEP_0454
 from slixmpp.stanza import StreamFeatures
 from slixmpp.xmlstream import ElementBase, register_stanza_plugin
 from slixmpp.xmlstream.handler import CoroutineCallback
@@ -84,6 +89,58 @@ class _CredentialRedactingFilter(logging.Filter):
         return True
 
 
+def _human_size(num):
+    """Format a byte count for a message a user will read."""
+    for unit in ("B", "KB", "MB", "GB"):
+        if abs(num) < 1024 or unit == "GB":
+            return f"{num:.0f} {unit}" if unit == "B" else f"{num:.1f} {unit}"
+        num /= 1024
+    return f"{num:.1f} GB"
+
+
+def is_encrypted_url(url):
+    """True if *url* is an XEP-0454 aesgcm:// URI."""
+    return str(url).startswith("aesgcm://")
+
+
+def download_file(url, save_path, timeout=300):
+    """Download *url* to *save_path*, decrypting XEP-0454 aesgcm:// URIs.
+
+    Blocking, for callers already on a worker thread.  Plain https:// URLs
+    are fetched unchanged so files from older Thrive builds and from other
+    XMPP clients still arrive.
+
+    The decryption is deliberately not streamed: AES-GCM is only
+    authenticated once the tag at the end has been checked, so writing
+    plaintext to disk before then would hand the user bytes an attacker
+    could have tampered with.
+    """
+    url = str(url)
+    if not is_encrypted_url(url):
+        urllib.request.urlretrieve(url, save_path)
+        return save_path
+
+    # aesgcm://host/path#<24 hex iv><64 hex key>
+    parsed = urllib.parse.urlparse(url)
+    fragment = parsed.fragment
+    if len(fragment) != 88:
+        raise ValueError(
+            "Encrypted file link is malformed (bad key length); "
+            "the sender's client may be faulty."
+        )
+    https_url = urllib.parse.urlunparse(
+        ("https",) + tuple(parsed[1:5]) + ("",))
+
+    with urllib.request.urlopen(https_url, timeout=timeout) as resp:
+        ciphertext = resp.read()
+
+    plaintext = XEP_0454.decrypt(io.BytesIO(ciphertext), fragment)
+
+    with open(save_path, "wb") as out:
+        out.write(plaintext)
+    return save_path
+
+
 def _install_stanza_redaction():
     """Attach the redactor wherever raw stanzas are logged.
 
@@ -134,6 +191,14 @@ _STATUS_TO_SHOW = {
     "fixing my PC": "away",
     "battery about to die": "away",
 }
+
+# Largest file we will encrypt for upload (XEP-0454).  slixmpp's AES-GCM
+# helpers build the whole ciphertext in memory and then copy it into a
+# BytesIO, so peak usage is roughly twice the file size.  Above this we
+# refuse rather than quietly falling back to an unencrypted upload -- a
+# silent downgrade is the one outcome a user cannot detect.
+MAX_ENCRYPTED_UPLOAD = int(
+    os.environ.get("THRIVE_MAX_ENCRYPTED_UPLOAD", 512 * 1024 * 1024))
 
 # Reverse map: XMPP show value -> Thrive status, for contacts that publish a
 # show but no status text.  "" is a bare <presence/>, i.e. plain available.
@@ -668,6 +733,7 @@ class XMPPClient:
             })
             self._client.register_plugin("xep_0313")  # Message Archive Management
             self._client.register_plugin("xep_0363")  # HTTP File Upload
+            self._client.register_plugin("xep_0454")  # OMEMO Media Sharing
             self._client.register_plugin("xep_0380")  # Explicit Message Encryption
 
             # OMEMO (XEP-0384) — per-user key storage.
@@ -944,11 +1010,23 @@ class XMPPClient:
         to_jid = f"{to_username}@{self._domain}"
         uploaded = []
         try:
-            upload = self._client.plugin["xep_0363"]
+            # xep_0454 encrypts with AES-256-GCM and hands the ciphertext to
+            # xep_0363, so the server stores bytes it cannot read.  The key
+            # and IV ride in the URL fragment, which HTTP never sends to a
+            # server, and the URL itself travels inside the OMEMO-encrypted
+            # message below.
+            upload = self._client.plugin["xep_0454"]
             for fp in file_paths:
                 filename = os.path.basename(fp)
                 size = os.path.getsize(fp)
                 content_type = self._guess_content_type(filename)
+
+                if size > MAX_ENCRYPTED_UPLOAD:
+                    raise ValueError(
+                        f"{filename} is {_human_size(size)}. Encrypted "
+                        f"transfers are limited to "
+                        f"{_human_size(MAX_ENCRYPTED_UPLOAD)}."
+                    )
 
                 # upload_file discovers the service, checks the size against
                 # the limit it advertises, requests the slot and does the PUT.
@@ -956,8 +1034,7 @@ class XMPPClient:
                 # JID as its first argument, which only discovery can supply.
                 with open(fp, "rb") as f:
                     get_url = await upload.upload_file(
-                        filename=fp,
-                        size=size,
+                        Path(fp),
                         content_type=content_type,
                         input_file=f,
                     )
@@ -1036,19 +1113,38 @@ class XMPPClient:
                     to_username, str(exc) or exc.__class__.__name__)
 
     async def _async_download_file(self, url, save_dir, filename=None):
-        """Download a file and save it to disk."""
+        """Download a file and save it to disk, decrypting aesgcm:// URIs."""
         try:
+            url = str(url)
+            encrypted = is_encrypted_url(url)
+            fragment = ""
+            fetch_url = url
+            if encrypted:
+                parsed = urllib.parse.urlparse(url)
+                fragment = parsed.fragment
+                if len(fragment) != 88:
+                    return None, "Encrypted file link is malformed."
+                fetch_url = urllib.parse.urlunparse(
+                    ("https",) + tuple(parsed[1:5]) + ("",))
+
             async with aiohttp.ClientSession() as session:
-                async with session.get(url) as resp:
+                async with session.get(fetch_url) as resp:
                     if resp.status != 200:
-                        log.warning("Download failed (%d): %s", resp.status, url)
+                        log.warning("Download failed (%d): %s", resp.status, fetch_url)
                         return None, f"Download failed ({resp.status})"
                     data = await resp.read()
 
+            if encrypted:
+                # Fails loudly if the tag does not verify, rather than
+                # writing tampered bytes to the user's disk.
+                data = XEP_0454.decrypt(io.BytesIO(data), fragment)
+
             if not filename:
-                # Try to extract from URL or Content-Disposition.
+                # Try to extract from URL or Content-Disposition.  For an
+                # encrypted upload this is the random name xep_0454 chose,
+                # so callers should pass the real one from the message.
                 from urllib.parse import urlparse, unquote
-                path = urlparse(url).path
+                path = urlparse(fetch_url).path
                 filename = unquote(os.path.basename(path)) or "download"
 
             os.makedirs(save_dir, exist_ok=True)

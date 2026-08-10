@@ -1,6 +1,6 @@
 import wx, socket, json, threading, datetime, wx.adv, configparser, ssl, sys, os, base64, uuid, subprocess, tempfile, re, time
 import keyring
-from xmpp_client import XMPPClient
+from xmpp_client import XMPPClient, download_file, is_encrypted_url
 
 try:
     from accessible_output2.outputs.auto import Auto as _AO2Auto
@@ -883,13 +883,21 @@ class ClientApp(wx.App):
         """Handle an incoming file transfer message (HTTP Upload URLs)."""
         self.play_sound("file_receive.wav")
         parent = self.frame.get_chat(sender) or self.frame
+        # Whether the transfer is end-to-end encrypted is a security fact the
+        # user is entitled to before accepting, so state it either way.
+        if files and all(is_encrypted_url(f.get("url", "")) for f in files):
+            security = "\n\nThese are end-to-end encrypted; the server cannot read them." \
+                if len(files) > 1 else \
+                "\n\nThis is end-to-end encrypted; the server cannot read it."
+        else:
+            security = "\n\nWarning: not encrypted. The server can read the contents."
         if len(files) == 1:
             f = files[0]
-            prompt = f"{sender} wants to send you a file:\n\n{f['filename']} ({format_size(f.get('size', 0))})\n\nDo you want to accept?"
+            prompt = f"{sender} wants to send you a file:\n\n{f['filename']} ({format_size(f.get('size', 0))}){security}\n\nDo you want to accept?"
         else:
             total_size = sum(f.get("size", 0) for f in files)
             file_list = "\n".join(f"  {f['filename']} ({format_size(f.get('size', 0))})" for f in files)
-            prompt = f"{sender} wants to send you {len(files)} files ({format_size(total_size)} total):\n\n{file_list}\n\nDo you want to accept?"
+            prompt = f"{sender} wants to send you {len(files)} files ({format_size(total_size)} total):\n\n{file_list}{security}\n\nDo you want to accept?"
         result = wx.MessageBox(prompt, "File Transfer Request", wx.YES_NO | wx.ICON_QUESTION, parent)
         if result == wx.YES:
             chat = self.frame.get_chat(sender)
@@ -906,7 +914,6 @@ class ClientApp(wx.App):
                     filename = f.get("filename", "download")
                     if not url: continue
                     try:
-                        import urllib.request
                         os.makedirs(save_dir, exist_ok=True)
                         save_path = os.path.join(save_dir, filename)
                         if os.path.exists(save_path):
@@ -915,7 +922,9 @@ class ClientApp(wx.App):
                             while os.path.exists(save_path):
                                 save_path = os.path.join(save_dir, f"{name} ({counter}){ext}")
                                 counter += 1
-                        urllib.request.urlretrieve(url, save_path)
+                        # Decrypts aesgcm:// links; plain https:// pass through,
+                        # so files from older builds still arrive.
+                        download_file(url, save_path)
                         saved.append(os.path.basename(save_path))
                     except Exception as e:
                         wx.CallAfter(self._on_file_download_error, sender, filename, e)
