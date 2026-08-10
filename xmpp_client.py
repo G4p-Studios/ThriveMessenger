@@ -127,9 +127,16 @@ class XMPPClient:
         self._connected_event.clear()
         self._connect_error = None
 
-        # Enable slixmpp debug logging to diagnose connection issues.
-        logging.basicConfig(level=logging.DEBUG, format="%(name)s %(levelname)s: %(message)s")
-        logging.getLogger("slixmpp").setLevel(logging.DEBUG)
+        # Stream-level debug logging prints every stanza, including the SASL
+        # PLAIN <auth/> element -- which is the user's password in base64.
+        # Never on by default: it lands in the console and in anything the
+        # user copies out of it.  Opt in with THRIVE_XMPP_DEBUG=1.
+        if os.environ.get("THRIVE_XMPP_DEBUG"):
+            logging.basicConfig(
+                level=logging.DEBUG, format="%(name)s %(levelname)s: %(message)s")
+            logging.getLogger("slixmpp").setLevel(logging.DEBUG)
+            log.warning(
+                "XMPP debug logging is on; output contains your password.")
 
         # Start the asyncio loop in a background thread.
         self._loop = asyncio.new_event_loop()
@@ -543,8 +550,26 @@ class XMPPClient:
 
     def _run_loop(self):
         """Target for the background thread — runs the asyncio event loop."""
-        asyncio.set_event_loop(self._loop)
-        self._loop.run_forever()
+        loop = self._loop
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_forever()
+        finally:
+            # Cancel what slixmpp and OMEMO left running (keepalives, key
+            # rotation) before closing.  Without this, shutdown prints
+            # "Task was destroyed but it is pending" and an "Event loop is
+            # closed" traceback from XMLStream.__del__.
+            try:
+                pending = asyncio.all_tasks(loop)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    loop.run_until_complete(
+                        asyncio.gather(*pending, return_exceptions=True))
+            except Exception as exc:
+                log.debug("Error draining tasks at shutdown: %s", exc)
+            finally:
+                loop.close()
 
     async def _async_connect(self):
         """Create the client and connect (called on the asyncio loop).
