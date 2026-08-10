@@ -7,8 +7,10 @@ via caller-provided callbacks (typically wrapped in wx.CallAfter).
 """
 
 import asyncio
+import logging.handlers
 import os
 import re
+import sys
 import tempfile
 import urllib.parse
 import urllib.request
@@ -241,6 +243,88 @@ def download_file(url, save_path, timeout=300):
     return save_path
 
 
+LOG_FILENAME = "tmsg.log"
+LOG_MAX_BYTES = 5 * 1024 * 1024
+LOG_BACKUP_COUNT = 3
+
+
+def default_log_dir():
+    """Directory of the running executable, or of this file when run from source."""
+    if getattr(sys, "frozen", False) or "__compiled__" in globals():
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def setup_logging(log_dir=None, debug=None):
+    """Write logs to tmsg.log next to the executable.
+
+    Rotates at 5 MB, keeping three older files, because stanza-level debug
+    output grows quickly.
+
+    An installed copy usually lives under Program Files, which standard
+    users cannot write to, so if that fails we fall back to the per-user
+    application data directory rather than losing logging altogether.
+
+    Returns the path actually in use, or None if no file could be opened.
+    """
+    if debug is None:
+        debug = bool(os.environ.get("THRIVE_XMPP_DEBUG"))
+
+    candidates = [log_dir or default_log_dir()]
+    fallback = os.path.join(
+        os.environ.get("LOCALAPPDATA")
+        or os.path.expanduser("~/.local/share"),
+        "ThriveMessenger",
+    )
+    if fallback not in candidates:
+        candidates.append(fallback)
+
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG if debug else logging.INFO)
+
+    # Replace a handler from an earlier call rather than doubling up.
+    for existing in list(root.handlers):
+        if getattr(existing, "_thrive_log", False):
+            root.removeHandler(existing)
+            existing.close()
+
+    for directory in candidates:
+        path = os.path.join(directory, LOG_FILENAME)
+        try:
+            os.makedirs(directory, exist_ok=True)
+            handler = logging.handlers.RotatingFileHandler(
+                path, maxBytes=LOG_MAX_BYTES,
+                backupCount=LOG_BACKUP_COUNT, encoding="utf-8",
+            )
+        except Exception as exc:
+            # Deliberately broad: this runs during application start-up, so
+            # failing to open a log file must never stop the app.
+            log.debug("Cannot log to %s: %s", path, exc)
+            continue
+
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)-7s %(name)s: %(message)s"))
+        handler.setLevel(logging.DEBUG if debug else logging.INFO)
+        handler._thrive_log = True
+        root.addHandler(handler)
+
+        # Stanza-level logging is the firehose, and the only reason to want
+        # debug at all -- but it is redacted on the way out, see
+        # _CredentialRedactingFilter.
+        logging.getLogger("slixmpp").setLevel(
+            logging.DEBUG if debug else logging.WARNING)
+
+        log.info("Logging to %s (level=%s)", path,
+                 "DEBUG" if debug else "INFO")
+        if debug:
+            log.info("Debug logging is on. Stanzas are recorded with "
+                     "passwords, codes and file keys redacted.")
+        return path
+
+    log.warning("Could not open %s in any candidate directory.", LOG_FILENAME)
+    return None
+
+
 def _install_stanza_redaction():
     """Attach the redactor wherever raw stanzas are logged.
 
@@ -359,16 +443,11 @@ class XMPPClient:
         self._connected_event.clear()
         self._connect_error = None
 
-        # Stream-level debug logging prints every stanza, including the SASL
-        # PLAIN <auth/> element -- which is the user's password in base64.
-        # Never on by default: it lands in the console and in anything the
-        # user copies out of it.  Opt in with THRIVE_XMPP_DEBUG=1.
-        if os.environ.get("THRIVE_XMPP_DEBUG"):
-            logging.basicConfig(
-                level=logging.DEBUG, format="%(name)s %(levelname)s: %(message)s")
-            logging.getLogger("slixmpp").setLevel(logging.DEBUG)
-            log.warning(
-                "XMPP debug logging is on; output contains your password.")
+        # Logging destination and level are the application's business, set
+        # up once by setup_logging().  If nothing has configured logging by
+        # now, do it here so a connection is never silently untraceable.
+        if not logging.getLogger().handlers:
+            setup_logging()
 
         # Start the asyncio loop in a background thread.
         self._loop = asyncio.new_event_loop()

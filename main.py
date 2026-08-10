@@ -1,6 +1,8 @@
 import wx, socket, json, threading, datetime, wx.adv, configparser, ssl, sys, os, base64, uuid, subprocess, tempfile, re, time
 import keyring
-from xmpp_client import XMPPClient, download_file, is_encrypted_url
+from xmpp_client import (
+    XMPPClient, download_file, is_encrypted_url, setup_logging,
+)
 
 try:
     from accessible_output2.outputs.auto import Auto as _AO2Auto
@@ -356,6 +358,10 @@ def get_program_dir():
 
 def is_installer_install():
     return os.path.exists(os.path.join(get_program_dir(), 'unins000.exe'))
+
+# Logging goes to tmsg.log beside the executable.  Set up here, before any
+# XMPP work, so startup problems land in the file too.
+LOG_PATH = setup_logging(get_program_dir())
 
 def check_for_update(callback):
     def _check():

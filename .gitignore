@@ -5,3 +5,7 @@ dist/
 dist-macos/
 *.spec
 assets/videos/.narration_work/
+
+# Runtime log written beside the executable (repo root when run from source).
+tmsg.log
+tmsg.log.*
