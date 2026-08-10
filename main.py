@@ -794,10 +794,14 @@ class ClientApp(wx.App):
         """Convert XMPP roster to the contact_list format MainFrame expects."""
         contact_list = []
         for c in contacts:
+            # Trust the presence the roster carries.  Hardcoding offline here
+            # discarded the state of contacts who were already online when we
+            # logged in -- their presence arrives during session start, before
+            # these callbacks exist, so no later event ever corrects it.
             contact_list.append({
                 "user": c["user"],
-                "online": False,  # Will be updated by presence events
-                "status_text": "offline",
+                "online": c.get("online", False),
+                "status_text": c.get("status_text", "offline"),
                 "blocked": 0,
             })
         self.frame.load_contacts(contact_list)

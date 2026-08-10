@@ -59,6 +59,16 @@ _STATUS_TO_SHOW = {
     "battery about to die": "away",
 }
 
+# Reverse map: XMPP show value -> Thrive status, for contacts that publish a
+# show but no status text.  "" is a bare <presence/>, i.e. plain available.
+_SHOW_TO_STATUS = {
+    "": "online",
+    "chat": "online",
+    "away": "away",
+    "xa": "away",
+    "dnd": "busy",
+}
+
 
 class XMPPClient:
     """Thin wrapper around slixmpp.ClientXMPP.
@@ -141,13 +151,24 @@ class XMPPClient:
             return False, "Connection timed out."
         return True, ""
 
-    def disconnect(self):
-        """Gracefully disconnect."""
+    def disconnect(self, timeout=5):
+        """Gracefully disconnect, waiting for the stream to actually close.
+
+        The wait is the point: without it the loop was torn down in the next
+        breath, so the unavailable presence and stream close never went out.
+        The server kept the session until the TCP connection died with the
+        process, which left a stale resource online after every logout and
+        meant contacts saw us online long after we had gone.
+        """
         self._intentional_disconnect = True
-        if self._client:
-            asyncio.run_coroutine_threadsafe(
+        if self._client and self._loop:
+            future = asyncio.run_coroutine_threadsafe(
                 self._async_disconnect(), self._loop
             )
+            try:
+                future.result(timeout=timeout)
+            except Exception as exc:
+                log.warning("Graceful disconnect failed: %s", exc)
         self._shutdown_loop()
 
     def send_message(self, to_username, body):
@@ -599,7 +620,13 @@ class XMPPClient:
             self._connected_event.set()
 
     async def _async_disconnect(self):
-        self._client.disconnect()
+        # Tell contacts we are going before closing, then await the close so
+        # the caller can shut the loop down without cutting it short.
+        try:
+            self._client.send_presence(ptype="unavailable")
+        except Exception as exc:
+            log.debug("Could not send unavailable presence: %s", exc)
+        await self._client.disconnect()
 
     async def _async_add_contact(self, jid):
         try:
@@ -1077,15 +1104,19 @@ class XMPPClient:
         if from_user == self._username:
             return  # Ignore own presence reflections.
 
-        show = presence["show"] or "chat"  # "chat" means available
-        status_text = presence["status"] or ""
-
-        # Map XMPP show to Thrive status.
-        online = show in ("", "chat", "away", "xa", "dnd")
-        if not status_text:
-            show_map = {"": "online", "chat": "online", "away": "away",
-                        "xa": "away", "dnd": "busy"}
-            status_text = show_map.get(show, "online")
+        # slixmpp raises changed_status for unavailable presence too, and a
+        # bare <presence type="unavailable"/> carries no show -- so reading
+        # only the show would report a contact who just went offline as
+        # online.  got_offline is no substitute: it fires only once the
+        # contact's *last* resource goes away.
+        if presence["type"] == "unavailable":
+            online, status_text = self._presence_of(
+                self._client.client_roster[presence["from"].bare])
+        else:
+            online = True
+            status_text = presence["status"] or ""
+            if not status_text:
+                status_text = _SHOW_TO_STATUS.get(presence["show"] or "", "online")
 
         if self.on_presence:
             self.on_presence(from_user, online, status_text)
@@ -1238,6 +1269,27 @@ class XMPPClient:
     # Helpers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _presence_of(item):
+        """Reduce a roster item's live resources to (online, status_text).
+
+        slixmpp tracks each contact's resources as presence arrives, so this
+        reflects who is actually online right now.  Reading it here matters
+        because presence for contacts who were *already* online arrives in
+        the probe replies at session start -- before the UI has registered
+        its callbacks -- so those events are gone by the time anyone is
+        listening.  The roster delivery is what carries that state instead.
+        """
+        resources = getattr(item, "resources", None) or {}
+        if not resources:
+            return False, "offline"
+        # Highest priority wins, the same way a server picks a resource.
+        best = max(resources.values(), key=lambda r: r.get("priority") or 0)
+        status_text = best.get("status") or ""
+        if not status_text:
+            status_text = _SHOW_TO_STATUS.get(best.get("show") or "", "online")
+        return True, status_text
+
     def _deliver_roster(self):
         """Extract roster into a simple list and fire the callback."""
         if not self.on_roster_loaded or not self._client:
@@ -1250,10 +1302,13 @@ class XMPPClient:
             user = slixmpp.JID(jid).user
             sub = roster[jid]["subscription"]
             name = roster[jid]["name"] or user
+            online, status_text = self._presence_of(roster[jid])
             contacts.append({
                 "user": user,
                 "name": name,
                 "subscription": sub,
+                "online": online,
+                "status_text": status_text,
             })
         self.on_roster_loaded(contacts)
 
