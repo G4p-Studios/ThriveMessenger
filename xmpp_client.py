@@ -8,6 +8,7 @@ via caller-provided callbacks (typically wrapped in wx.CallAfter).
 
 import asyncio
 import os
+import re
 import threading
 import time
 import logging
@@ -25,6 +26,80 @@ from slixmpp.xmlstream.matcher import MatchXPath
 import omemo_plugin  # noqa: F401 — registers XEP_0384Impl with slixmpp
 
 log = logging.getLogger(__name__)
+
+
+class _CredentialRedactingFilter(logging.Filter):
+    """Strip secrets out of slixmpp's raw stanza logging.
+
+    slixmpp logs whole stanzas at DEBUG ("SEND: ...", "RECV: ..."), and
+    several of them carry credentials in the clear:
+
+    * the SASL ``<auth/>`` payload is base64 of ``\\0user\\0password``
+    * in-band registration and password reset send ``<password>``
+    * verify and reset send the emailed one-time ``<code>``
+    * HTTP upload slots carry a bearer token in an Authorization header
+
+    Anyone turning debug logging on is usually about to paste the output
+    into a bug report, so redact at the source rather than trusting the
+    log to stay private.
+    """
+
+    _SASL_NS = "urn:ietf:params:xml:ns:xmpp-sasl"
+
+    # Each pattern keeps the opening tag and drops the element's text.
+    _PATTERNS = (
+        # SASL handshake: auth/response/challenge/success payloads.
+        re.compile(
+            r"(<(?:auth|response|challenge|success)\b[^>]*"
+            + re.escape(_SASL_NS)
+            + r"[^>]*>)[^<]+(?=</)",
+            re.IGNORECASE,
+        ),
+        # Passwords: jabber:iq:register, urn:thrive:reset.
+        re.compile(r"(<password\b[^>]*>)[^<]+(?=</)", re.IGNORECASE),
+        # One-time codes: urn:thrive:verify, urn:thrive:reset.
+        re.compile(r"(<code\b[^>]*>)[^<]+(?=</)", re.IGNORECASE),
+        # XEP-0363 upload slot bearer tokens.
+        re.compile(
+            r"(<header\b[^>]*name=['\"]Authorization['\"][^>]*>)[^<]+(?=</)",
+            re.IGNORECASE,
+        ),
+    )
+
+    @classmethod
+    def scrub(cls, value):
+        """Redact secrets in *value*, which may be a stanza or a string."""
+        text = value if isinstance(value, str) else str(value)
+        for pattern in cls._PATTERNS:
+            text = pattern.sub(r"\1[redacted]", text)
+        return text
+
+    def filter(self, record):
+        if isinstance(record.args, tuple):
+            record.args = tuple(self.scrub(a) for a in record.args)
+        elif record.args:
+            record.args = self.scrub(record.args)
+        if isinstance(record.msg, str) and "<" in record.msg:
+            record.msg = self.scrub(record.msg)
+        return True
+
+
+def _install_stanza_redaction():
+    """Attach the redactor wherever raw stanzas are logged.
+
+    Filters on a logger run in Logger.handle() before records propagate to
+    ancestor handlers, so attaching here covers every handler downstream --
+    including one the application installs later, or slixmpp debug logging
+    switched on by something other than connect().
+    """
+    for name in ("slixmpp.xmlstream.xmlstream", "slixmpp"):
+        logger = logging.getLogger(name)
+        if not any(isinstance(f, _CredentialRedactingFilter)
+                   for f in logger.filters):
+            logger.addFilter(_CredentialRedactingFilter())
+
+
+_install_stanza_redaction()
 
 # Stream feature mod_thrive_reset advertises to unauthenticated sessions.
 # Its presence means the server will answer verify/reset IQs before login.
