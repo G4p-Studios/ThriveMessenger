@@ -567,6 +567,10 @@ class XMPPClient:
             ))
             self._client.add_event_handler("changed_status", self._on_presence_changed)
             self._client.add_event_handler("got_offline", self._on_got_offline)
+            self._client.add_event_handler(
+                "roster_subscription_request", self._on_subscription_request)
+            self._client.add_event_handler(
+                "roster_subscription_authorized", self._on_subscription_authorized)
             self._client.add_event_handler("disconnected", self._on_disconnected)
             self._client.add_event_handler("connection_failed", self._on_connection_failed)
             self._client.add_event_handler("failed_auth", self._on_failed_auth)
@@ -1022,6 +1026,8 @@ class XMPPClient:
         # Signal the blocking connect() call.
         self._connected_event.set()
 
+        self._reciprocate_subscriptions()
+
         # Deliver the initial roster to the UI.
         self._deliver_roster()
 
@@ -1093,6 +1099,55 @@ class XMPPClient:
 
         if self.on_presence:
             self.on_presence(from_user, False, "offline")
+
+    def _on_subscription_request(self, presence):
+        """Someone asked to see our presence -- approve and ask back.
+
+        slixmpp only auto-authorises subscriptions when running as a
+        component; for a client it just raises this event and expects the
+        application to answer.  Ignoring it means nobody is ever granted a
+        "from" subscription, so we stay permanently offline to everyone who
+        added us, however our own roster looks.
+        """
+        jid = presence["from"].bare
+        if jid == self._client.boundjid.bare:
+            return  # Ignore our own reflections.
+
+        # Grant them our presence.  The server pushes our current presence
+        # to them as part of handling this, so they see us straight away.
+        self._client.send_presence_subscription(pto=jid, ptype="subscribed")
+
+        # Ask for theirs unless we already have it, so the pair ends up
+        # mutually visible instead of one-way.
+        item = self._client.client_roster[jid]
+        if item["subscription"] not in ("to", "both"):
+            self._client.send_presence_subscription(pto=jid, ptype="subscribe")
+
+        log.info("Approved presence subscription from %s", jid)
+
+    def _on_subscription_authorized(self, presence):
+        """A contact approved us; refresh so the UI reflects the new state."""
+        log.info("Presence subscription authorised by %s", presence["from"].bare)
+        self._deliver_roster()
+
+    def _reciprocate_subscriptions(self):
+        """Ask back where a contact can see us but we cannot see them.
+
+        Repairs pairs left half-finished by builds that never answered
+        subscription requests.  A "from" entry means they see us and we do
+        not see them; asking back completes the pair, and since they already
+        added us the server usually approves it without prompting.
+        """
+        if not self._client:
+            return
+        roster = self._client.client_roster
+        for jid in list(roster):
+            if jid == self._client.boundjid.bare:
+                continue
+            item = roster[jid]
+            if item["subscription"] == "from" and not item["pending_out"]:
+                log.info("Asking %s for presence to complete a one-way pair", jid)
+                self._client.send_presence_subscription(pto=jid, ptype="subscribe")
 
     def _on_tcp_connected(self, event):
         """TCP connection established (before STARTTLS/auth)."""
