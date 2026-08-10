@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 import aiohttp
 import slixmpp
 from slixmpp.exceptions import IqError, IqTimeout
+from slixmpp.plugins.xep_0363 import UploadServiceNotFound
 from slixmpp.stanza import StreamFeatures
 from slixmpp.xmlstream import ElementBase, register_stanza_plugin
 from slixmpp.xmlstream.handler import CoroutineCallback
@@ -849,30 +850,17 @@ class XMPPClient:
                 size = os.path.getsize(fp)
                 content_type = self._guess_content_type(filename)
 
-                # Request upload slot.
-                slot = await upload.request_slot(
-                    filename=filename,
-                    size=size,
-                    content_type=content_type,
-                )
-                put_url = slot["put"]["url"]
-                get_url = slot["get"]["url"]
-                put_headers = slot["put"].get("headers", {})
-
-                # Upload via HTTP PUT.
-                headers = dict(put_headers)
-                headers["Content-Type"] = content_type
-                headers["Content-Length"] = str(size)
-
-                async with aiohttp.ClientSession() as session:
-                    with open(fp, "rb") as f:
-                        data = f.read()
-                    async with session.put(put_url, data=data, headers=headers) as resp:
-                        if resp.status not in (200, 201):
-                            text = await resp.text()
-                            raise Exception(
-                                f"Upload failed ({resp.status}): {text[:200]}"
-                            )
+                # upload_file discovers the service, checks the size against
+                # the limit it advertises, requests the slot and does the PUT.
+                # request_slot alone cannot be used here: it takes the service
+                # JID as its first argument, which only discovery can supply.
+                with open(fp, "rb") as f:
+                    get_url = await upload.upload_file(
+                        filename=fp,
+                        size=size,
+                        content_type=content_type,
+                        input_file=f,
+                    )
 
                 uploaded.append({
                     "filename": filename,
@@ -896,8 +884,13 @@ class XMPPClient:
             oob = slixmpp.ET.SubElement(
                 msg.xml, "{jabber:x:oob}x"
             )
-            slixmpp.ET.SubElement(oob, "url").text = uploaded[0]["url"]
-            slixmpp.ET.SubElement(oob, "desc").text = uploaded[0]["filename"]
+            # XEP-0066 puts these in jabber:x:oob.  Bare names serialise as
+            # xmlns="", which no other client recognises -- the attachment
+            # simply does not appear for anyone outside Thrive.
+            slixmpp.ET.SubElement(
+                oob, "{jabber:x:oob}url").text = uploaded[0]["url"]
+            slixmpp.ET.SubElement(
+                oob, "{jabber:x:oob}desc").text = uploaded[0]["filename"]
 
             # Custom element with full file list for Thrive clients.
             files_el = slixmpp.ET.SubElement(
@@ -928,10 +921,19 @@ class XMPPClient:
             if self.on_file_uploaded:
                 self.on_file_uploaded(to_username, uploaded)
 
+        except UploadServiceNotFound:
+            # Has no __str__, so reporting it raw gives an empty message.
+            log.warning("No HTTP upload service found on %s", self._domain)
+            if self.on_file_upload_error:
+                self.on_file_upload_error(
+                    to_username,
+                    "This server does not offer file uploads.",
+                )
         except Exception as exc:
             log.warning("File upload failed: %s", exc)
             if self.on_file_upload_error:
-                self.on_file_upload_error(to_username, str(exc))
+                self.on_file_upload_error(
+                    to_username, str(exc) or exc.__class__.__name__)
 
     async def _async_download_file(self, url, save_dir, filename=None):
         """Download a file and save it to disk."""
@@ -1079,12 +1081,22 @@ class XMPPClient:
         files_el = msg.xml.find("{urn:thrive:files}files")
         if files_el is not None:
             files = []
-            for file_el in files_el.findall("file"):
+            # Senders up to now emitted these children with no namespace
+            # (xmlns=""), which is wrong but is what is on the wire.  Accept
+            # both so the sender can be corrected once clients have updated.
+            NS = "{urn:thrive:files}"
+
+            def text(el, tag):
+                found = el.findtext(NS + tag)
+                return found if found is not None else el.findtext(tag, "")
+
+            for file_el in list(files_el.findall(NS + "file")) + \
+                    list(files_el.findall("file")):
                 files.append({
-                    "filename": file_el.findtext("name", ""),
-                    "size": int(file_el.findtext("size", "0")),
-                    "url": file_el.findtext("url", ""),
-                    "content_type": file_el.findtext("content-type", ""),
+                    "filename": text(file_el, "name"),
+                    "size": int(text(file_el, "size") or "0"),
+                    "url": text(file_el, "url"),
+                    "content_type": text(file_el, "content-type"),
                 })
             if files and self.on_file_message:
                 self.on_file_message(from_user, files)
