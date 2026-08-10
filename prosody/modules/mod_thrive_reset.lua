@@ -15,6 +15,7 @@
 --   thrive_smtp_password = "secret"
 --   thrive_smtp_from     = "noreply@example.com"  -- defaults to smtp_user
 --   thrive_code_expires  = 300   -- seconds (default 5 minutes)
+--   thrive_reset_cooldown = 60   -- min seconds between reset emails per user
 --   thrive_db_path       = "/var/lib/prosody/thrive.db"
 
 local st = require "util.stanza";
@@ -33,6 +34,7 @@ local smtp_user     = module:get_option_string("thrive_smtp_user", "");
 local smtp_password = module:get_option_string("thrive_smtp_password", "");
 local smtp_from     = module:get_option_string("thrive_smtp_from", smtp_user);
 local code_expires  = module:get_option_number("thrive_code_expires", 300);
+local reset_cooldown = module:get_option_number("thrive_reset_cooldown", 60);
 local db_path       = module:get_option_string("thrive_db_path", "thrive.db");
 
 local smtp_enabled = smtp_server ~= "" and smtp_user ~= "";
@@ -165,10 +167,50 @@ local function expire_human()
 end
 
 -- ---------------------------------------------------------------------------
+-- Pre-authentication support
+--
+-- Verify and reset both happen before the user can log in -- a password reset
+-- by definition has no usable password.  Prosody only routes stanzas to
+-- "iq/host" once a session is authenticated and resource-bound, so these two
+-- namespaces are also served on the unauthenticated "stanza/iq/..." events,
+-- the same mechanism mod_register_ibr uses for in-band registration.
+--
+-- Clients cannot guess whether a server supports this, so we advertise a
+-- stream feature to unauthenticated sessions.
+-- ---------------------------------------------------------------------------
+
+local PREAUTH_NS = "urn:thrive:preauth";
+local preauth_feature = st.stanza("preauth", { xmlns = PREAUTH_NS });
+
+module:hook("stream-features", function(event)
+    local session, features = event.origin, event.features;
+    -- Only to clients that have not logged in, and only over TLS: these
+    -- exchanges carry emailed codes and new passwords.
+    if session.type ~= "c2s_unauthed" or not session.secure then return; end
+    features:add_child(preauth_feature);
+end);
+
+--- Wrap a handler so it only serves unauthenticated sessions.
+-- The same handler is bound to "iq/host" for logged-in users; without this
+-- guard an authenticated stanza could be processed twice.
+local function preauth_only(handler)
+    return function(event)
+        local session = event.origin;
+        if session.type ~= "c2s_unauthed" then return; end
+        if not session.secure then
+            session.send(st.error_reply(event.stanza, "modify", "policy-violation",
+                "Encryption is required."));
+            return true;
+        end
+        return handler(event);
+    end
+end
+
+-- ---------------------------------------------------------------------------
 -- IQ handler: urn:thrive:verify
 -- ---------------------------------------------------------------------------
 
-module:hook("iq/host", function(event)
+local function handle_verify(event)
     local stanza = event.stanza;
     local verify = stanza:get_child("verify", "urn:thrive:verify");
     if not verify then return; end
@@ -225,13 +267,16 @@ module:hook("iq/host", function(event)
 
     event.origin.send(st.reply(stanza));
     return true;
-end);
+end
+
+module:hook("iq/host", handle_verify);
+module:hook("stanza/iq/urn:thrive:verify:verify", preauth_only(handle_verify));
 
 -- ---------------------------------------------------------------------------
 -- IQ handler: urn:thrive:reset  (request + confirm)
 -- ---------------------------------------------------------------------------
 
-module:hook("iq/host", function(event)
+local function handle_reset(event)
     local stanza = event.stanza;
 
     -- --- Request a reset code ---
@@ -273,19 +318,31 @@ module:hook("iq/host", function(event)
         end
 
         if target_user and target_email then
-            local code = generate_code();
-            local now = os.time();
-            local ups = conn:prepare(
-                "INSERT OR REPLACE INTO thrive_reset (username, code, created_at) VALUES (?, ?, ?)"
-            );
-            ups:execute(target_user, code, now);
+            -- This endpoint is reachable without logging in, so throttle it:
+            -- an outstanding code stays valid instead of triggering more mail.
+            local recent = conn:prepare("SELECT created_at FROM thrive_reset WHERE username = ?");
+            recent:execute(target_user);
+            local rrow = recent:fetch(true);
+            local throttled = rrow and (os.time() - rrow.created_at) < reset_cooldown;
 
-            send_email(
-                target_email,
-                "Thrive Messenger - Password Reset",
-                "Your password reset code is: " .. code ..
-                "\n\nThis code will expire in " .. expire_human() .. "."
-            );
+            if throttled then
+                log("debug", "Reset code for %s requested again within %d seconds; not resending",
+                    target_user, reset_cooldown);
+            else
+                local code = generate_code();
+                local now = os.time();
+                local ups = conn:prepare(
+                    "INSERT OR REPLACE INTO thrive_reset (username, code, created_at) VALUES (?, ?, ?)"
+                );
+                ups:execute(target_user, code, now);
+
+                send_email(
+                    target_email,
+                    "Thrive Messenger - Password Reset",
+                    "Your password reset code is: " .. code ..
+                    "\n\nThis code will expire in " .. expire_human() .. "."
+                );
+            end
         end
 
         -- Always reply OK to prevent user enumeration.
@@ -349,7 +406,11 @@ module:hook("iq/host", function(event)
         event.origin.send(st.reply(stanza));
         return true;
     end
-end);
+end
+
+module:hook("iq/host", handle_reset);
+module:hook("stanza/iq/urn:thrive:reset:request", preauth_only(handle_reset));
+module:hook("stanza/iq/urn:thrive:reset:confirm", preauth_only(handle_reset));
 
 -- ---------------------------------------------------------------------------
 -- Registration hook: require email verification when SMTP is enabled

@@ -16,12 +16,33 @@ from datetime import datetime, timezone
 import aiohttp
 import slixmpp
 from slixmpp.exceptions import IqError, IqTimeout
+from slixmpp.stanza import StreamFeatures
+from slixmpp.xmlstream import ElementBase, register_stanza_plugin
 from slixmpp.xmlstream.handler import CoroutineCallback
 from slixmpp.xmlstream.matcher import MatchXPath
 
 import omemo_plugin  # noqa: F401 — registers XEP_0384Impl with slixmpp
 
 log = logging.getLogger(__name__)
+
+# Stream feature mod_thrive_reset advertises to unauthenticated sessions.
+# Its presence means the server will answer verify/reset IQs before login.
+THRIVE_PREAUTH_NS = "urn:thrive:preauth"
+
+
+class ThrivePreauthFeature(ElementBase):
+    """<preauth xmlns="urn:thrive:preauth"/> inside <stream:features/>."""
+
+    name = "preauth"
+    namespace = THRIVE_PREAUTH_NS
+    plugin_attrib = "thrive_preauth"
+    interfaces = set()
+
+
+register_stanza_plugin(StreamFeatures, ThrivePreauthFeature)
+
+# Run after STARTTLS but before SASL (slixmpp orders mechanisms at 100).
+_PREAUTH_FEATURE_ORDER = 50
 
 # Map Thrive status names to XMPP presence show values.
 # XMPP show values: None (available/online), "away", "xa", "dnd", "chat"
@@ -370,13 +391,16 @@ class XMPPClient:
 
         async def _do_verify():
             try:
-                iq = self._make_oneshot_iq(username)
+                iq = self._client.make_iq_set(ito=self._domain)
                 query = slixmpp.ET.SubElement(
                     iq.xml, "{urn:thrive:verify}verify"
                 )
-                slixmpp.ET.SubElement(query, "username").text = username
-                slixmpp.ET.SubElement(query, "code").text = code
-                resp = await iq.send()
+                # Namespaced children — see _oneshot_iq_call for why.
+                slixmpp.ET.SubElement(
+                    query, "{urn:thrive:verify}username").text = username
+                slixmpp.ET.SubElement(
+                    query, "{urn:thrive:verify}code").text = code
+                await iq.send(timeout=max(timeout - 2, 1))
                 result["success"] = True
             except IqError as err:
                 result["reason"] = err.iq["error"].get("text", "Verification failed.")
@@ -1179,58 +1203,163 @@ class XMPPClient:
     def _oneshot_iq_call(self, namespace, element, fields, timeout=15):
         """Open a temporary connection, send a custom IQ, return result.
 
-        Used for pre-login operations (verify, password reset) that need
-        a server round-trip but don't require authentication.
+        Used for pre-login operations (verify, password reset) that need a
+        server round-trip but have no password to authenticate with.  The IQ
+        goes out during stream-feature negotiation -- after STARTTLS, before
+        SASL -- which is the only point an unauthenticated stream may send
+        one.  The server signals support by advertising ``urn:thrive:preauth``
+        in its stream features; we never attempt to log in on this stream.
 
         Returns (True, response_text) or (False, reason).
         """
         jid = f"anon@{self._domain}"
-        client = slixmpp.ClientXMPP(jid, "")
-        client.register_plugin("xep_0030")
+        host, port, domain = self._server_host, self._server_port, self._domain
 
         result = {"success": False, "reason": "", "text": ""}
         done = threading.Event()
-
-        async def _do():
-            try:
-                iq = client.make_iq_set(ito=self._domain)
-                query = slixmpp.ET.SubElement(
-                    iq.xml, f"{{{namespace}}}{element}"
-                )
-                for key, val in fields.items():
-                    slixmpp.ET.SubElement(query, key).text = str(val)
-                resp = await iq.send(timeout=timeout - 2)
-                result["success"] = True
-                # Try to extract a text response.
-                for child in resp.xml:
-                    if child.text:
-                        result["text"] = child.text
-                        break
-            except IqError as err:
-                result["reason"] = err.iq["error"].get("text", "Request failed.")
-            except IqTimeout:
-                result["reason"] = "Request timed out."
-            except Exception as exc:
-                result["reason"] = str(exc)
-            finally:
-                client.disconnect()
-                done.set()
-
         loop = asyncio.new_event_loop()
-        thread = threading.Thread(target=loop.run_forever, daemon=True)
-        thread.start()
 
-        try:
+        def _thread_fn():
+            asyncio.set_event_loop(loop)
+            # Build the client on this thread, after the loop is current, so
+            # slixmpp binds its futures to the loop we actually run below.
+            client = slixmpp.ClientXMPP(jid, "")
+            client.register_plugin("xep_0030")
+            # XMLStream.send() holds back every stanza until the session
+            # starts, passing through only bind/session/register IQs.  A
+            # custom pre-auth payload would be queued and never sent, so the
+            # IQ would just time out.  This stream carries one IQ and is then
+            # dropped, so bypassing the gate is safe here.
+            client._always_send_everything = True
+
+            def _finish(reason):
+                if not done.is_set():
+                    if not result["reason"]:
+                        result["reason"] = reason
+                    done.set()
+                loop.call_soon(loop.stop)
+
+            async def _do(_features):
+                """Stream-feature handler: send the IQ, then drop the stream."""
+                try:
+                    iq = client.make_iq_set(ito=domain)
+                    query = slixmpp.ET.SubElement(
+                        iq.xml, f"{{{namespace}}}{element}"
+                    )
+                    for key, val in fields.items():
+                        # Children must inherit the payload namespace.  Bare
+                        # names serialise as xmlns="", and Prosody's
+                        # get_child_text(name) only matches children sharing
+                        # the parent's namespace, so the server would see
+                        # every field as missing.
+                        child = slixmpp.ET.SubElement(
+                            query, f"{{{namespace}}}{key}"
+                        )
+                        child.text = str(val)
+                    resp = await iq.send(timeout=max(timeout - 2, 1))
+                    result["success"] = True
+                    # Try to extract a text response.
+                    for child in resp.xml:
+                        if child.text:
+                            result["text"] = child.text
+                            break
+                except IqError as err:
+                    result["reason"] = err.iq["error"].get("text", "Request failed.")
+                except IqTimeout:
+                    result["reason"] = "Request timed out."
+                except Exception as exc:
+                    result["reason"] = str(exc)
+                finally:
+                    # Start the close before releasing the caller, so the
+                    # stream footer goes out before the loop is torn down.
+                    client.disconnect()
+                    done.set()
+                    # Backstop in case "disconnected" never arrives.
+                    loop.call_later(1, loop.stop)
+                # Returning True with restart=True halts feature negotiation,
+                # so slixmpp never tries to authenticate this throwaway stream.
+                return True
+
+            unsupported = (
+                "This server does not support password reset or account "
+                "verification before login."
+            )
+
+            def _check_support(stanza):
+                """Bail out early if the server can't serve pre-auth requests.
+
+                The secure stream's features offer SASL; if they don't also
+                offer urn:thrive:preauth then mod_thrive_reset is missing or
+                predates pre-auth support.  Detecting it here beats waiting
+                for the login we have no password for to fail.
+                """
+                if isinstance(stanza, StreamFeatures):
+                    feats = stanza["features"]
+                    if "mechanisms" in feats and "thrive_preauth" not in feats:
+                        client.abort()
+                        _finish(unsupported)
+                return stanza
+
+            def _on_failed_auth(_event):
+                # Backstop: we only reach SASL when the feature was absent.
+                if not result["reason"]:
+                    result["reason"] = unsupported
+
+            def _on_disconnected(_event):
+                _finish("Connection closed by the server.")
+
+            def _on_connection_failed(event):
+                # One-shot: don't sit in slixmpp's reconnect backoff.
+                client.abort()
+                _finish(str(event) or "Could not reach the server.")
+
+            client.register_feature(
+                "thrive_preauth", _do,
+                restart=True, order=_PREAUTH_FEATURE_ORDER,
+            )
+            client.add_filter("in", _check_support)
+            client.add_event_handler("failed_auth", _on_failed_auth)
+            client.add_event_handler("disconnected", _on_disconnected)
+            client.add_event_handler("connection_failed", _on_connection_failed)
             client.enable_direct_tls = False
             client.enable_starttls = True
-            client.connect(host=self._server_host, port=self._server_port)
-            asyncio.run_coroutine_threadsafe(_do(), loop)
-            done.wait(timeout=timeout)
-            if not done.is_set():
-                return False, "Request timed out."
-        finally:
+            try:
+                client.connect(host=host, port=port)
+                loop.run_forever()
+            except Exception as exc:
+                if not result["reason"]:
+                    result["reason"] = str(exc)
+                done.set()
+            finally:
+                # Cancel slixmpp's leftover tasks before closing, otherwise
+                # asyncio logs "Task was destroyed but it is pending".
+                pending = asyncio.all_tasks(loop)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    gather = asyncio.gather(*pending, return_exceptions=True)
+                    # A queued loop.stop() can cut the drain short; retry
+                    # until the cancellations have actually settled.
+                    for _ in range(5):
+                        try:
+                            loop.run_until_complete(gather)
+                            break
+                        except RuntimeError:
+                            continue
+                loop.close()
+                done.set()
+
+        thread = threading.Thread(target=_thread_fn, daemon=True)
+        thread.start()
+        done.wait(timeout=timeout)
+        if not done.is_set():
+            result["reason"] = "Request timed out."
+        # Always tear the loop down so the worker thread cannot outlive us.
+        try:
             loop.call_soon_threadsafe(loop.stop)
-            thread.join(timeout=5)
+        except RuntimeError:
+            pass  # Loop already stopped and closed by the worker.
+        thread.join(timeout=5)
 
         if result["success"]:
             return True, result["text"]
