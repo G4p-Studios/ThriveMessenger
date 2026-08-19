@@ -660,14 +660,13 @@ class ClientApp(wx.App):
         self.intentional_disconnect = False
         # Track last network activity (recv) timestamp
         self._last_activity = time.time()
-        self._keepalive_stop = threading.Event()
         self.frame = MainFrame(self.username, self.sock); self.frame.Show()
         if self.frame.current_status != "online":
             try: self.sock.sendall((json.dumps({"action": "set_status", "status_text": self.frame.current_status}) + "\n").encode())
             except Exception: pass
         self.play_sound("login.wav"); threading.Thread(target=self.listen_loop, daemon=True).start()
         # Start keepalive monitor thread
-        threading.Thread(target=self._keepalive_monitor, daemon=True).start()
+        self._start_keepalive_monitor(sock)
         self.frame.on_check_updates(silent=True)
 
 
@@ -723,6 +722,7 @@ class ClientApp(wx.App):
     def on_server_disconnect(self):
         if self.intentional_disconnect: return
         self.intentional_disconnect = True
+        self._stop_keepalive_monitor()
         try: self.sock.close()
         except: pass
         username = getattr(self, 'username', '')
@@ -757,12 +757,11 @@ class ClientApp(wx.App):
         self.sock = sock; self.sockfile = sf; self.pending_file_paths = {}
         self.intentional_disconnect = False
         self._last_activity = time.time()
-        self._keepalive_stop = threading.Event()
         self.frame.sock = sock
         for child in self.frame.GetChildren():
             if isinstance(child, (ChatDialog, AdminDialog)): child.sock = sock
         threading.Thread(target=self.listen_loop, daemon=True).start()
-        threading.Thread(target=self._keepalive_monitor, daemon=True).start()
+        self._start_keepalive_monitor(sock)
         if self.frame.current_status != "online":
             try: sock.sendall((json.dumps({"action": "set_status", "status_text": self.frame.current_status}) + "\n").encode())
             except: pass
@@ -772,6 +771,7 @@ class ClientApp(wx.App):
     def _return_to_login(self, message, title):
         if self.intentional_disconnect: return
         self.intentional_disconnect = True
+        self._stop_keepalive_monitor()
         try: self.sock.close()
         except: pass
         self.SetExitOnFrameDelete(False)
@@ -785,27 +785,37 @@ class ClientApp(wx.App):
         if old_frame: old_frame.is_exiting = True; old_frame.Destroy()
         if not result: self.ExitMainLoop()
 
-    def _keepalive_monitor(self):
+    def _start_keepalive_monitor(self, sock):
+        self._stop_keepalive_monitor()
+        stop = threading.Event()
+        self._keepalive_stop = stop
+        threading.Thread(target=self._keepalive_monitor, args=(sock, stop), daemon=True).start()
+
+    def _stop_keepalive_monitor(self):
+        stop = getattr(self, '_keepalive_stop', None)
+        if stop: stop.set()
+
+    def _handle_keepalive_failure(self, sock):
+        if self.sock is sock:
+            self.on_server_disconnect()
+
+    def _keepalive_monitor(self, sock, stop):
         # Runs in background, checks for idle periods and performs a lightweight check
         try:
             while True:
-                stop = getattr(self, '_keepalive_stop', None)
-                if stop and stop.is_set():
+                if stop.is_set() or self.sock is not sock:
                     return
                 last = getattr(self, '_last_activity', None)
                 if last is None:
                     self._last_activity = time.time(); last = self._last_activity
                 idle = time.time() - last
                 if idle >= IDLE_KEEPALIVE_SECONDS:
-                    sock = getattr(self, 'sock', None)
-                    if not sock:
-                        return
                     try:
                         # Send a lightweight request the server already supports and expects to respond to
                         sock.sendall((json.dumps({"action": "get_feature_caps"}) + "\n").encode())
                     except Exception:
                         # Sending failed — treat as disconnect
-                        try: wx.CallAfter(self.on_server_disconnect)
+                        try: wx.CallAfter(self._handle_keepalive_failure, sock)
                         except Exception: pass
                         return
                     # Wait briefly for any activity (the listen loop will update _last_activity)
@@ -817,13 +827,12 @@ class ClientApp(wx.App):
                             break
                     else:
                         # No response — assume connection dead
-                        try: wx.CallAfter(self.on_server_disconnect)
+                        try: wx.CallAfter(self._handle_keepalive_failure, sock)
                         except Exception: pass
                         return
                 # Sleep until next check or stop
                 for _ in range(int(KEEPALIVE_CHECK_INTERVAL)):
-                    stop = getattr(self, '_keepalive_stop', None)
-                    if stop and stop.is_set(): return
+                    if stop.is_set() or self.sock is not sock: return
                     time.sleep(1)
         except Exception:
             return
