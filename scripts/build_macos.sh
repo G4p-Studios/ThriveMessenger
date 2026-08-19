@@ -10,6 +10,7 @@ OUT_DIR="${ROOT_DIR}/dist-macos"
 ARCH_LABEL="${1:-$(uname -m)}"
 VENV_DIR="${ROOT_DIR}/.venv-build"
 PYTHON_BIN="${THRIVE_PYTHON_BIN:-python3}"
+APP_VERSION="${THRIVE_APP_VERSION:-15.10.0}"
 
 ${PYTHON_BIN} -m venv "${VENV_DIR}"
 source "${VENV_DIR}/bin/activate"
@@ -19,7 +20,8 @@ python -m pip install \
   "pyinstaller>=6.18.0" \
   "keyring>=25.7.0" \
   "plyer>=2.1.0" \
-  "wxPython>=4.2.5"
+  "wxPython>=4.2.5" \
+  "sounddevice>=0.5.1"
 
 rm -rf build dist "${OUT_DIR}"
 mkdir -p "${OUT_DIR}"
@@ -34,6 +36,7 @@ pyinstaller \
   --add-data "assets/help:assets/help" \
   --add-data "assets/videos:assets/videos" \
   --add-data "sounds:sounds" \
+  --add-data "README.md:." \
   main.py
 
 APP_PATH="dist/${APP_NAME}.app"
@@ -43,6 +46,18 @@ if [[ ! -d "${APP_PATH}" ]]; then
   echo "Build failed: ${APP_PATH} was not created" >&2
   exit 1
 fi
+
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${APP_VERSION}" "${APP_PATH}/Contents/Info.plist"
+if ! /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${APP_VERSION}" "${APP_PATH}/Contents/Info.plist"; then
+  /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string ${APP_VERSION}" "${APP_PATH}/Contents/Info.plist"
+fi
+
+if [[ -n "${THRIVE_CODESIGN_IDENTITY:-}" ]]; then
+  codesign --force --deep --options runtime --timestamp --sign "${THRIVE_CODESIGN_IDENTITY}" "${APP_PATH}"
+else
+  codesign --force --deep --sign - "${APP_PATH}"
+fi
+codesign --verify --deep --strict "${APP_PATH}"
 
 ditto -c -k --sequesterRsrc --keepParent "${APP_PATH}" "${ZIP_PATH}"
 echo "Created ${ZIP_PATH}"

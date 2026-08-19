@@ -41,7 +41,7 @@ FALLBACK = {
     "main": "<h1>Contacts Help</h1><p>Use Contacts list, menus, and context menus to start chat, send files, block/unblock, and manage contacts.</p>",
     "chat": "<h1>Chat Help</h1><p>Enter sends message, Cmd+Enter inserts a new line, and Ctrl+Enter sends file. Use chat history and file transfer actions from menus.</p>",
     "directory": "<h1>User Directory Help</h1><p>Browse users, filter/sort lists, and add contacts. Multi-server entries display server labels where available.</p>",
-    "admin": "<h1>Admin Commands Help</h1><p>Use Server Side Commands for admin operations like alerts, user management, and restart scheduling.</p>",
+    "admin": "<h1>Admin Commands Help</h1><p>Use Server Side Commands for admin operations like alerts, user management, and restart scheduling.</p><p>In the command text box, type ? or help (with or without a leading slash) to show command usage help.</p>",
     "settings": "<h1>Settings Help</h1><p>Configure audio, accessibility, chat behavior, server/update settings, and administration options.</p>",
     "server_info": "<h1>Server Info Help</h1><p>View host, port, encryption, online users/admins, uptime, and file policy limits.</p>",
     "bot_rules": "<h1>Bot Rules Help</h1><p>Admins can load/edit/save/reset bot rules. Rules can be seeded from agent ZIP rules. Non-admin users can view active rules read-only.</p>",

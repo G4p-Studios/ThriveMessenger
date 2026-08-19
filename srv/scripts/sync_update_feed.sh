@@ -4,11 +4,11 @@ set -euo pipefail
 # Usage:
 #   sync_update_feed.sh [owner/repo] [output_json_path]
 # Example:
-#   sync_update_feed.sh Raywonder/ThriveMessenger /var/www/im.tappedin.fm/updates/latest.json
+#   sync_update_feed.sh G4p-Studios/ThriveMessenger /var/www/im.tappedin.fm/updates/latest.json
 
-PRIMARY_REPO="${1:-Raywonder/ThriveMessenger}"
+PRIMARY_REPO="${1:-G4p-Studios/ThriveMessenger}"
 OUT_PATH="${2:-/var/www/im.tappedin.fm/updates/latest.json}"
-FALLBACK_REPOS="${THRIVE_UPDATE_FALLBACK_REPOS:-G4p-Studios/ThriveMessenger}"
+FALLBACK_REPOS="${THRIVE_UPDATE_FALLBACK_REPOS:-Raywonder/ThriveMessenger}"
 
 TMP_JSON="$(mktemp)"
 TMP_OUT="$(mktemp)"

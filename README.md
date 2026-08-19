@@ -93,6 +93,19 @@ It produces:
 - `thrive_messenger-macos-x86_64.zip`
 - `thrive_messenger-macos-arm64.zip`
 
+### Server auto-deploy workflow (PM2)
+
+This repo includes an optional server deploy flow that can pull latest code and restart a PM2 server process when server-relevant files changed:
+
+- GitHub Actions workflow: `.github/workflows/deploy-server.yml`
+- Deploy script: `srv/scripts/deploy_and_restart.sh`
+- Optional deploy API endpoint: `srv/scripts/deploy_hook_api.py`
+- Shared handoff workflow: `.github/workflows/stage-server-shared.yml`
+
+Setup details are documented in:
+
+- `srv/scripts/DEPLOY.md`
+
 ### Running compiled
 
 If you don't feel like fighting with UV and Python, a pre-compiled release is provided.
@@ -113,6 +126,19 @@ Logging into your Thrive Messenger account is as simple as logging into your com
 2.  Tab to the password field and enter your Thrive Messenger password.
 3.  Optionally, check the boxes to remember your credentials and log in automatically.
 4.  Click Login or Press Alt + L to log into Thrive Messenger. A sound will play to tell you that you're logged in.
+
+### Web3 Domain Support
+
+Server owners can use Web3 DNS domains for server hostnames. In Server Manager or `client.conf`, set the server host to your domain as normal.
+
+Examples:
+
+* `myserver.eth`
+* `voice.crypto`
+* `chat.nft`
+* Freename-managed domains
+
+The client accepts standard hostnames and Web3-style domains for server entries, and link detection/opening in chat/status also supports Web3-style links and bare domains.
 
 ### The Thrive Messenger UI
 
@@ -143,7 +169,7 @@ Note: server owners might place file size limits and certain file type restricti
 
 ### Server side commands
 
-If you see (Admin) beside a contact's online status, it means they are classed as a server admin and can perform server side commands from the client. This is what the aforementioned Use Server Side Commands button is for. Clicking the button will bring up a dialog much like the one that appears when you start a chat with a contact. You will auto focus on the command input field. To run a command, simply type it into the field and press Enter.
+If you see (Admin) beside a contact's online status, it means they are classed as a server admin and can perform server side commands from the client. This is what the aforementioned Use Server Side Commands button is for. Clicking the button will bring up a dialog much like the one that appears when you start a chat with a contact. You will auto focus on the command input field. To run a command, simply type it into the field and press Enter. To get more help in this text box, type `?` or `help` (with or without a leading slash).
 
 Each server side command must start with a forward slash (/). The following server side commands are available.
 
@@ -162,7 +188,7 @@ Shift Tabbing once from the command input field will show a list of outputs for 
 
 ### Bot rules and agent rulesets
 
-Thrive bots can follow a shared agent ruleset loaded from an agent ZIP (for example `/home/devinecr/downloads/*.zip`), and server admins can override rules per bot for their own admin account/server workflow.
+Bots are an **experimental optional server module** and are disabled and hidden by default. Bot operators host their own bot process, authenticate it as a bot identity, and may connect that identity to one or several Thrive servers. Ordinary Thrive clients and Windows installers do not bundle or launch a bot runtime. When the experimental module is installed, bots can follow a server-hosted ruleset and administrators can override rules for their server workflow.
 
 Key behavior:
 
@@ -175,6 +201,18 @@ Key behavior:
 ### Advanced group chat policy controls
 
 Server admins can define advanced group chat/call policies globally and per group.
+
+### Group rooms and voice
+
+The **Groups** tab provides persistent rooms hosted entirely by the connected Thrive server. Room owners can create public or private rooms, invite members, assign owner/admin/moderator/user/guest roles, and configure which roles may view, message, transfer files, join voice, invite, moderate, or manage the room. Room messages are stored in the server database and room files are delivered to online room members.
+
+Rooms can expire after one day, one week, one month, one year, never, or immediately after their final member leaves. Server-level group policy remains authoritative and can disable text, files, or voice even when a room role would otherwise allow it.
+
+Group and direct voice calls are relayed by the Thrive server over the existing encrypted connection. No external voice provider is required. The Audio settings page includes microphone and speaker selection, input/output levels, and calls provide mute and deafen controls. Headphones are recommended because the lightweight built-in relay does not perform acoustic echo cancellation.
+
+### Server modules
+
+Administrators can open **Settings → Administration → Manage Server Modules** to enable or disable bundled Groups, Voice, Server Manager, and Advanced Administration modules. Optional modules such as experimental Bots are installed on the connected Thrive server—not in the client—from administrator-configured HTTPS catalogs hosted on a Thrive site, GitHub, or Gitea. Catalog archives require an allowlisted host when configured, a catalog-provided SHA-256 digest, a matching `module.json` identity, and safe archive paths. Dependencies are enforced automatically: enabling Voice also enables Groups, and disabling Groups also disables Voice.
 
 Managed in client UI:
 
@@ -226,7 +264,7 @@ Thrive Messenger ships with 3 sound packs by default.
 
 #### Creating sound packs
 
-Structurally, a sound pack is simply a folder with a collection of wave files inside it. To create a sound pack, you will need the following 9 files:
+Structurally, a sound pack is simply a folder with a collection of wave files inside it. A complete pack contains these message, presence, file-transfer, and call-state WAV files:
 
 * contact_online
 * contact_offline
@@ -237,6 +275,12 @@ Structurally, a sound pack is simply a folder with a collection of wave files in
 * file_receive
 * file_send
 * file_error
+* incoming_call
+* outgoing_call
+* call_connected
+* call_ended
+* group_call_join
+* group_call_leave
 
 Make a folder inside Thrive Messenger's sounds folder and paste these files into that folder to create your custom sound pack.
 
@@ -254,18 +298,21 @@ The client.conf file controls what server and port the Thrive Messenger client c
 
 The default server is msg.thecubed.cc, running on port 2005.
 
+If your server is published on a Web3 DNS name, set `host` to that domain directly (for example `myserver.eth`).
+
 You can also control update sources in `client.conf`:
 
 ```
 [updates]
 feed_url = https://im.tappedin.fm/updates/latest.json
 preferred_repo = Raywonder/ThriveMessenger
-fallback_repos = G4p-Studios/ThriveMessenger
+fallback_repos =
 ```
 
 - `feed_url` is optional. If set, the client checks your hosted feed first.
 - If feed lookup fails, the client falls back to GitHub repos in order.
 - This allows your custom channel and upstream compatibility at the same time.
+- Portable Windows release ZIPs retain a top-level `thrive_messenger` directory so older installed clients can finish applying the update. New clients accept both nested and flat ZIP layouts and verify hosted SHA-256 values when the feed provides them.
 
 ### Cron-ready update feed sync
 

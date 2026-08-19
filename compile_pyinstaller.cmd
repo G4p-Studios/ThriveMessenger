@@ -1,3 +1,2 @@
 @echo off
-uv run python versionfile.py
-uv run pyinstaller --clean --noconfirm --windowed --upx-dir=C:\UPX --version-file=vdata.txt --name "thrive_messenger" main.py
+powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1

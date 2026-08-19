@@ -1,0 +1,31 @@
+name: ThriveMessenger
+options:
+  bundleIdPrefix: fm.tappedin
+settings:
+  base:
+    DEVELOPMENT_TEAM: G5232LU4Z7
+    CODE_SIGN_STYLE: Automatic
+    ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    MARKETING_VERSION: 15.10.0
+    CURRENT_PROJECT_VERSION: 2
+targets:
+  ThriveMessenger:
+    type: application
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources: [ThriveMessenger]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: fm.tappedin.thrivemessenger
+        PRODUCT_NAME: Thrive Messenger
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: Thrive Messenger
+        INFOPLIST_KEY_NSLocalNetworkUsageDescription: Connects to self-hosted Thrive Messenger servers on your network.
+        INFOPLIST_KEY_NSMicrophoneUsageDescription: Lets you speak in direct and group voice calls.
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad: "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
+        SUPPORTS_MACCATALYST: NO
+        TARGETED_DEVICE_FAMILY: "1,2"
+    scheme:
+      testTargets: []

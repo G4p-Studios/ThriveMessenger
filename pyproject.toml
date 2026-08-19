@@ -13,4 +13,5 @@ dependencies = [
     "pyinstaller-versionfile>=3.0.1",
     "wxpython>=4.2.5",
     "accessible-output2==0.16",
+    "sounddevice>=0.5.1",
 ]

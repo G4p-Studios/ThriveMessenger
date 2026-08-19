@@ -2,9 +2,9 @@
 ; SEE THE DOCUMENTATION FOR DETAILS ON CREATING INNO SETUP SCRIPT FILES!
 
 #define MyAppName "Thrive Messenger"
-#define MyAppVersion "2026 Alpha 16"
+#define MyAppVersion "2026 Alpha 15.10"
 #define MyAppPublisher "G4p Studios"
-#define MyAppURL "https://github.com/G4p-Studios/ThriveMessenger"
+#define MyAppURL "https://github.com/Raywonder/ThriveMessenger"
 #define MyAppExeName "thrive_messenger.exe"
 
 [Setup]
@@ -19,11 +19,11 @@ AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
 AppUpdatesURL={#MyAppURL}
-DefaultDirName={pf}\Thrive\Thrive Messenger
+DefaultDirName={commonpf}\Thrive\Thrive Messenger
 DefaultGroupName=Thrive\Thrive Messenger
 AllowNoIcons=yes
-InfoAfterFile=C:\git\ThriveMessenger\README.md
-OutputDir=C:\Users\seedy\Documents
+InfoAfterFile={#SourcePath}\README.md
+OutputDir={#SourcePath}\dist-windows
 OutputBaseFilename=thrive_messenger_installer
 Compression=lzma
 SolidCompression=yes
@@ -35,8 +35,8 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-Source: "C:\git\ThriveMessenger\dist\thrive_messenger\thrive_messenger.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "C:\git\ThriveMessenger\dist\thrive_messenger\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#SourcePath}\dist-windows\thrive_messenger\thrive_messenger.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourcePath}\dist-windows\thrive_messenger\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
 
 [Icons]

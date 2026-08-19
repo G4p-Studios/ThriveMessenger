@@ -1,7 +1,10 @@
 __pycache__/
 srv/__pycache__/
+.venv/
 build/
 dist/
 dist-macos/
+dist-windows/
 *.spec
+vdata.txt
 assets/videos/.narration_work/
